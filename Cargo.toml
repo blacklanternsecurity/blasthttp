@@ -1,0 +1,52 @@
+[package]
+name = "blasthttp"
+version = "0.1.0"
+edition = "2024"
+description = "Offensive-first HTTP library with Python bindings"
+
+[lib]
+# When building as a Python module, we need a cdylib (shared library).
+# rlib keeps it usable as a normal Rust library too.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The "python" feature gate — enables PyO3 bindings.
+# Off by default: `cargo build` gives pure Rust.
+# Maturin activates it: `maturin build` -> Python module.
+python = ["pyo3"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# HTTP - our single-stack foundation
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# TLS - stock OpenSSL for Phase 1
+openssl = "0.10"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+hyper-tls = "0.6"
+
+# HTTP types (Uri, etc.)
+http = "1"
+
+# Decompression
+flate2 = "1"
+brotli = "7"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Serialization - config in, results out
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Python bindings — optional, only when "python" feature is enabled
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+
+[dev-dependencies]
+# We'll add mock server deps here as we build the test infrastructure
