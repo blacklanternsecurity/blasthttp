@@ -60,6 +60,10 @@ impl OpenSslConnector {
         let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
             .map_err(|e| ClientError { message: format!("SSL setup failed: {}", e) })?;
 
+        // Security level 0: allow all ciphers including RC4, DES, export.
+        // This is an offensive-first tool — we need to connect to anything.
+        builder.set_security_level(0);
+
         if !config.should_verify_certs() {
             builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
         }
@@ -161,8 +165,11 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 
             let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-            ssl_conf.set_hostname(&host)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            // Only set SNI for hostnames, not IP addresses (SNI with IPs is invalid per RFC)
+            if host.parse::<std::net::IpAddr>().is_err() {
+                ssl_conf.set_hostname(&host)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            }
 
             let mut stream = tokio_openssl::SslStream::new(ssl_conf, tcp_stream)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;

@@ -14,6 +14,7 @@
 set -euo pipefail
 
 OPENSSL_VERSION="3.3.2"
+OPENSSL_SHA256="2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281"
 OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +40,17 @@ mkdir -p "$VENDOR_DIR"
 if [ ! -f "$TARBALL" ]; then
     echo "Downloading OpenSSL ${OPENSSL_VERSION}..."
     curl -L -f -o "$TARBALL" "$OPENSSL_URL" || wget -O "$TARBALL" "$OPENSSL_URL"
+fi
+
+# Verify SHA256
+echo "Verifying checksum..."
+ACTUAL_SHA256=$(sha256sum "$TARBALL" | awk '{print $1}')
+if [ "$ACTUAL_SHA256" != "$OPENSSL_SHA256" ]; then
+    echo "ERROR: SHA256 mismatch!"
+    echo "  Expected: ${OPENSSL_SHA256}"
+    echo "  Got:      ${ACTUAL_SHA256}"
+    rm -f "$TARBALL"
+    exit 1
 fi
 
 # Extract

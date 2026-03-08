@@ -17,7 +17,7 @@ python = ["pyo3"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 # HTTP - our single-stack foundation
 hyper = { version = "1", features = ["client", "http1"] }
@@ -48,4 +48,5 @@ serde_json = "1"
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
 [dev-dependencies]
-# We'll add mock server deps here as we build the test infrastructure
+# TLS test server — uses our custom OpenSSL to serve with weak ciphers
+tokio-test = "0.4"
