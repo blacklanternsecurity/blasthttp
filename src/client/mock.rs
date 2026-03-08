@@ -98,6 +98,7 @@ impl HttpClient for MockClient {
             body,
             elapsed_ms: 0,
             redirect_chain: Vec::new(),
+            cert_info: None,
         })
     }
 }

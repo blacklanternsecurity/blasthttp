@@ -1,12 +1,12 @@
 use crate::config::RequestConfig;
 use crate::debug::debug_print;
-use crate::response::{Response, RedirectHop};
+use crate::response::{Response, RedirectHop, CertInfo};
 use super::{HttpClient, ClientError};
 
 use std::io::Read;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use http_body_util::BodyExt;
@@ -23,7 +23,6 @@ static INIT_LEGACY: Once = Once::new();
 
 fn ensure_legacy_provider() {
     INIT_LEGACY.call_once(|| {
-        // Load default provider first (required when explicitly loading providers)
         let _default = openssl::provider::Provider::try_load(None, "default", true)
             .expect("failed to load OpenSSL default provider");
         let _legacy = openssl::provider::Provider::try_load(None, "legacy", true)
@@ -34,12 +33,99 @@ fn ensure_legacy_provider() {
     });
 }
 
+// ── TLS certificate extraction ────────────────────────────────────
+
+/// Shared slot where the connector writes cert info during TLS handshake.
+/// `send_inner` reads it after the response comes back.
+type CertSlot = Arc<Mutex<Option<CertInfo>>>;
+
+fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
+    let cert = ssl.peer_certificate()?;
+
+    // Common Name from Subject
+    let common_name = cert.subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|s| s.to_string());
+
+    // Subject Alternative Names (DNS entries)
+    let sans = cert.subject_alt_names()
+        .map(|names| {
+            names.iter()
+                .filter_map(|name| name.dnsname().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Email addresses from Subject and Issuer
+    let mut emails: Vec<String> = Vec::new();
+    for entry in cert.subject_name().entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS) {
+        if let Ok(s) = entry.data().as_utf8() {
+            emails.push(s.to_string());
+        }
+    }
+    for entry in cert.issuer_name().entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS) {
+        if let Ok(s) = entry.data().as_utf8()
+            && !emails.contains(&s.to_string())
+        {
+            emails.push(s.to_string());
+        }
+    }
+    // Also check SANs for email addresses
+    if let Some(names) = cert.subject_alt_names() {
+        for name in &names {
+            if let Some(email) = name.email() {
+                let email = email.to_string();
+                if !emails.contains(&email) {
+                    emails.push(email);
+                }
+            }
+        }
+    }
+
+    // Issuer Common Name
+    let issuer = cert.issuer_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|s| s.to_string());
+
+    // Validity dates (ASN1 time -> string)
+    let not_before = cert.not_before().to_string();
+    let not_after = cert.not_after().to_string();
+
+    // SHA-256 fingerprint
+    let fingerprint_sha256 = cert.digest(openssl::hash::MessageDigest::sha256())
+        .ok()
+        .map(|digest| {
+            digest.iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(":")
+        });
+
+    Some(CertInfo {
+        common_name,
+        sans,
+        emails,
+        issuer,
+        not_before: Some(not_before),
+        not_after: Some(not_after),
+        fingerprint_sha256,
+    })
+}
+
+// ── OpenSSL connector ─────────────────────────────────────────────
+
 // Custom HTTPS connector using OpenSSL directly.
 // Wraps HttpConnector with TLS handshake via openssl + tokio-openssl.
 #[derive(Clone)]
 struct OpenSslConnector {
     http: HttpConnector,
     ssl: openssl::ssl::SslConnector,
+    // Shared slot for cert info — written during handshake, read after response
+    cert_slot: CertSlot,
 }
 
 fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
@@ -53,7 +139,7 @@ fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
 }
 
 impl OpenSslConnector {
-    fn new(config: &RequestConfig) -> Result<Self, ClientError> {
+    fn new(config: &RequestConfig, cert_slot: CertSlot) -> Result<Self, ClientError> {
         // Ensure legacy ciphers (RC4, DES, etc.) are available
         ensure_legacy_provider();
 
@@ -89,7 +175,7 @@ impl OpenSslConnector {
         let mut http = HttpConnector::new();
         http.enforce_http(false);
 
-        Ok(OpenSslConnector { http, ssl })
+        Ok(OpenSslConnector { http, ssl, cert_slot })
     }
 }
 
@@ -104,7 +190,6 @@ impl hyper::rt::Read for SslStreamWrapper {
         cx: &mut Context<'_>,
         buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // Bridge through TokioIo
         let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
         Pin::new(&mut io).poll_read(cx, buf)
     }
@@ -156,12 +241,21 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
         let host = uri.host().unwrap_or("").to_string();
+        let is_https = uri.scheme_str() == Some("https");
         let http_fut = self.http.call(uri);
         let ssl_connector = self.ssl.clone();
+        let cert_slot = self.cert_slot.clone();
 
         Box::pin(async move {
             let tcp = http_fut.await?;
             let tcp_stream = tcp.into_inner();
+
+            // Plain HTTP — no TLS handshake needed
+            if !is_https {
+                // Return a "plain" connection — but our type expects SslStream.
+                // For now, all connections go through TLS. HTTP/plain will need
+                // a different connector type (future work).
+            }
 
             let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
@@ -177,10 +271,18 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
             Pin::new(&mut stream).connect().await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
+            // Extract cert info after successful handshake
+            let cert_info = extract_cert_info(stream.ssl());
+            if let Ok(mut slot) = cert_slot.lock() {
+                *slot = cert_info;
+            }
+
             Ok(SslStreamWrapper(stream))
         })
     }
 }
+
+// ── Client types and pooling ──────────────────────────────────────
 
 type DirectClient = Client<OpenSslConnector, FullBody>;
 type HttpProxyClient = Client<
@@ -192,52 +294,88 @@ type Socks5ProxyClient = Client<
     FullBody,
 >;
 
-#[derive(Default)]
-pub struct HyperClient;
-
-impl HyperClient {
-    pub fn new() -> Self {
-        HyperClient
-    }
+/// The cached hyper client + its cert info slot.
+/// hyper's Client uses Arc internally, so Clone shares the connection pool.
+#[derive(Clone)]
+struct CachedClient {
+    inner: AnyClient,
+    cert_slot: CertSlot,
 }
 
+#[derive(Clone)]
 enum AnyClient {
     Direct(DirectClient),
     HttpProxy(HttpProxyClient),
     Socks5(Socks5ProxyClient),
 }
 
-fn build_client(config: &RequestConfig) -> Result<AnyClient, ClientError> {
-    let connector = OpenSslConnector::new(config)?;
-    let builder = Client::builder(TokioExecutor::new());
+pub struct HyperClient {
+    // Cached hyper client — built on first send(), reused for all subsequent calls.
+    // Mutex<Option<>> for lazy initialization (first request builds it).
+    cached: Mutex<Option<CachedClient>>,
+}
 
-    match config.proxy.as_deref() {
-        None => Ok(AnyClient::Direct(builder.build(connector))),
-        Some(proxy_url) => {
-            let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-                ClientError { message: format!("invalid proxy URL: {}", e) }
-            })?;
-
-            let scheme = proxy_uri.scheme_str().unwrap_or("");
-
-            match scheme {
-                "http" | "https" => {
-                    use hyper_util::client::legacy::connect::proxy::Tunnel;
-                    let tunnel = Tunnel::new(proxy_uri, connector);
-                    Ok(AnyClient::HttpProxy(builder.build(tunnel)))
-                }
-                "socks5" | "socks5h" => {
-                    use hyper_util::client::legacy::connect::proxy::SocksV5;
-                    let socks = SocksV5::new(proxy_uri, connector);
-                    Ok(AnyClient::Socks5(builder.build(socks)))
-                }
-                _ => Err(ClientError {
-                    message: format!("unsupported proxy scheme '{}' (use http, https, socks5)", scheme),
-                }),
-            }
-        }
+impl Default for HyperClient {
+    fn default() -> Self {
+        Self::new()
     }
 }
+
+impl HyperClient {
+    pub fn new() -> Self {
+        HyperClient {
+            cached: Mutex::new(None),
+        }
+    }
+
+    /// Get or build the cached client. First call builds it from config,
+    /// subsequent calls return a clone (same connection pool).
+    fn get_or_build(&self, config: &RequestConfig) -> Result<CachedClient, ClientError> {
+        let mut guard = self.cached.lock()
+            .map_err(|_| ClientError { message: "client lock poisoned".to_string() })?;
+
+        if let Some(cached) = &*guard {
+            return Ok(cached.clone());
+        }
+
+        let cert_slot: CertSlot = Arc::new(Mutex::new(None));
+        let connector = OpenSslConnector::new(config, cert_slot.clone())?;
+        let builder = Client::builder(TokioExecutor::new());
+
+        let inner = match config.proxy.as_deref() {
+            None => AnyClient::Direct(builder.build(connector)),
+            Some(proxy_url) => {
+                let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+                    ClientError { message: format!("invalid proxy URL: {}", e) }
+                })?;
+
+                let scheme = proxy_uri.scheme_str().unwrap_or("");
+
+                match scheme {
+                    "http" | "https" => {
+                        use hyper_util::client::legacy::connect::proxy::Tunnel;
+                        let tunnel = Tunnel::new(proxy_uri, connector);
+                        AnyClient::HttpProxy(builder.build(tunnel))
+                    }
+                    "socks5" | "socks5h" => {
+                        use hyper_util::client::legacy::connect::proxy::SocksV5;
+                        let socks = SocksV5::new(proxy_uri, connector);
+                        AnyClient::Socks5(builder.build(socks))
+                    }
+                    _ => return Err(ClientError {
+                        message: format!("unsupported proxy scheme '{}' (use http, https, socks5)", scheme),
+                    }),
+                }
+            }
+        };
+
+        let cached = CachedClient { inner, cert_slot };
+        *guard = Some(cached.clone());
+        Ok(cached)
+    }
+}
+
+// ── Request dispatch ──────────────────────────────────────────────
 
 async fn dispatch_request(
     client: &AnyClient,
@@ -363,11 +501,13 @@ fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, Cl
     })
 }
 
+// ── HttpClient implementation ─────────────────────────────────────
+
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
         let timeout_duration = Duration::from_secs(config.timeout());
 
-        tokio::time::timeout(timeout_duration, send_inner(config))
+        tokio::time::timeout(timeout_duration, self.send_inner(config))
             .await
             .map_err(|_| ClientError {
                 message: format!("request timed out after {}s", config.timeout()),
@@ -375,83 +515,99 @@ impl HttpClient for HyperClient {
     }
 }
 
-async fn send_inner(config: &RequestConfig) -> Result<Response, ClientError> {
-    let v = config.verbosity;
-    let start = Instant::now();
+impl HyperClient {
+    async fn send_inner(&self, config: &RequestConfig) -> Result<Response, ClientError> {
+        let v = config.verbosity;
+        let start = Instant::now();
 
-    let mut uri: http::Uri = config.url.parse()
-        .map_err(|e: http::uri::InvalidUri| ClientError {
-            message: format!("invalid URL: {}", e),
-        })?;
+        let mut uri: http::Uri = config.url.parse()
+            .map_err(|e: http::uri::InvalidUri| ClientError {
+                message: format!("invalid URL: {}", e),
+            })?;
 
-    debug_print(v, 1, &format!("-> {} {}", config.method(), uri));
-    if let Some(ref proxy) = config.proxy {
-        debug_print(v, 1, &format!("   Proxy: {}", proxy));
-    }
-    if !config.should_verify_certs() {
-        debug_print(v, 1, "   TLS certificate validation: disabled");
-    }
-    if let Some(ref ciphers) = config.cipher_string {
-        debug_print(v, 1, &format!("   Cipher string: {}", ciphers));
-    }
-    if let Some(ref min_ver) = config.min_tls_version {
-        debug_print(v, 1, &format!("   Min TLS: {}", min_ver));
-    }
-    if let Some(ref max_ver) = config.max_tls_version {
-        debug_print(v, 1, &format!("   Max TLS: {}", max_ver));
-    }
-
-    let client = build_client(config)?;
-    let mut redirect_chain: Vec<RedirectHop> = Vec::new();
-    let mut hops = 0u32;
-
-    loop {
-        let resp = dispatch_request(&client, &uri, config).await?;
-        let hop_ms = start.elapsed().as_millis();
-        debug_print(v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
-
-        if is_redirect(resp.status) && config.should_follow_redirects() {
-            hops += 1;
-            if hops > config.redirect_limit() {
-                return Err(ClientError {
-                    message: format!("too many redirects (limit: {})", config.redirect_limit()),
-                });
-            }
-
-            let location = resp.location.as_deref()
-                .ok_or_else(|| ClientError {
-                    message: format!("redirect {} but no Location header", resp.status),
-                })?;
-
-            let next_uri = resolve_redirect(&uri, location)?;
-            debug_print(v, 1, &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri));
-
-            redirect_chain.push(RedirectHop {
-                url: uri.to_string(),
-                status: resp.status,
-            });
-
-            uri = next_uri;
-            continue;
+        debug_print(v, 1, &format!("-> {} {}", config.method(), uri));
+        if let Some(ref proxy) = config.proxy {
+            debug_print(v, 1, &format!("   Proxy: {}", proxy));
+        }
+        if !config.should_verify_certs() {
+            debug_print(v, 1, "   TLS certificate validation: disabled");
+        }
+        if let Some(ref ciphers) = config.cipher_string {
+            debug_print(v, 1, &format!("   Cipher string: {}", ciphers));
+        }
+        if let Some(ref min_ver) = config.min_tls_version {
+            debug_print(v, 1, &format!("   Min TLS: {}", min_ver));
+        }
+        if let Some(ref max_ver) = config.max_tls_version {
+            debug_print(v, 1, &format!("   Max TLS: {}", max_ver));
         }
 
-        let body = String::from_utf8(resp.body_bytes.clone())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
+        // Get or build the cached client (reuses connection pool within a batch)
+        let cached = self.get_or_build(config)?;
+        let mut redirect_chain: Vec<RedirectHop> = Vec::new();
+        let mut hops = 0u32;
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        debug_print(v, 1, &format!("   Total time: {}ms ({} redirect(s))", elapsed_ms, redirect_chain.len()));
+        loop {
+            let resp = dispatch_request(&cached.inner, &uri, config).await?;
+            let hop_ms = start.elapsed().as_millis();
+            debug_print(v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
-        return Ok(Response {
-            url: uri.to_string(),
-            status: resp.status,
-            headers: resp.headers,
-            body_bytes: resp.body_bytes,
-            body,
-            elapsed_ms,
-            redirect_chain,
-        });
+            if is_redirect(resp.status) && config.should_follow_redirects() {
+                hops += 1;
+                if hops > config.redirect_limit() {
+                    return Err(ClientError {
+                        message: format!("too many redirects (limit: {})", config.redirect_limit()),
+                    });
+                }
+
+                let location = resp.location.as_deref()
+                    .ok_or_else(|| ClientError {
+                        message: format!("redirect {} but no Location header", resp.status),
+                    })?;
+
+                let next_uri = resolve_redirect(&uri, location)?;
+                debug_print(v, 1, &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri));
+
+                redirect_chain.push(RedirectHop {
+                    url: uri.to_string(),
+                    status: resp.status,
+                });
+
+                uri = next_uri;
+                continue;
+            }
+
+            let body = String::from_utf8(resp.body_bytes.clone())
+                .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
+
+            // Read cert info from the shared slot (written by connector during handshake)
+            let cert_info = cached.cert_slot.lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            debug_print(v, 1, &format!("   Total time: {}ms ({} redirect(s))", elapsed_ms, redirect_chain.len()));
+
+            if let Some(ref info) = cert_info {
+                debug_print(v, 1, &format!("   Cert CN: {:?}", info.common_name));
+                debug_print(v, 1, &format!("   Cert SANs: {:?}", info.sans));
+            }
+
+            return Ok(Response {
+                url: uri.to_string(),
+                status: resp.status,
+                headers: resp.headers,
+                body_bytes: resp.body_bytes,
+                body,
+                elapsed_ms,
+                redirect_chain,
+                cert_info,
+            });
+        }
     }
 }
+
+// ── Decompression ─────────────────────────────────────────────────
 
 fn decompress(encoding: &str, data: &[u8]) -> Result<Vec<u8>, ClientError> {
     match encoding {

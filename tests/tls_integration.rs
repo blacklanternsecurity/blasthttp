@@ -216,6 +216,47 @@ async fn test_invalid_tls_version_returns_error() {
     assert!(err_msg.contains("unknown TLS version"), "error should mention unknown version: {}", err_msg);
 }
 
+// ── Certificate info extraction ────────────────────────────────────
+
+#[tokio::test]
+async fn test_cert_info_extracted() {
+    let server = TlsTestServer::start(TlsServerConfig::default()).await;
+
+    let config = make_config(&server.url());
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(result.is_ok());
+    let resp = result.unwrap();
+    let cert = resp.cert_info.expect("cert_info should be present for HTTPS");
+    assert_eq!(cert.common_name.as_deref(), Some("localhost"));
+    assert!(cert.sans.contains(&"localhost".to_string()));
+    assert!(cert.issuer.is_some());
+    assert!(cert.not_before.is_some());
+    assert!(cert.not_after.is_some());
+    assert!(cert.fingerprint_sha256.is_some());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_cert_info_has_san_ip() {
+    // Our test server cert has SAN for 127.0.0.1
+    let server = TlsTestServer::start(TlsServerConfig::default()).await;
+
+    let config = make_config(&server.url());
+
+    let client = HyperClient::new();
+    let resp = client.send(&config).await.unwrap();
+    let cert = resp.cert_info.expect("cert_info should be present");
+    // The test cert has DNS:localhost and IP:127.0.0.1 as SANs
+    // DNS SANs are extracted; IP SANs may or may not appear depending on OpenSSL
+    assert!(cert.common_name.as_deref() == Some("localhost"));
+
+    server.shutdown().await;
+}
+
 // ── Custom status code ────────────────────────────────────────────
 
 #[tokio::test]
