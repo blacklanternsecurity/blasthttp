@@ -4,14 +4,23 @@ use crate::response::{Response, RedirectHop};
 use super::{HttpClient, ClientError};
 
 use std::io::Read;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
-type HyperHttpsClient = Client<
-    hyper_tls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    http_body_util::Full<bytes::Bytes>,
+type HttpsConnector = hyper_tls::HttpsConnector<HttpConnector>;
+type FullBody = http_body_util::Full<bytes::Bytes>;
+
+type DirectClient = Client<HttpsConnector, FullBody>;
+type HttpProxyClient = Client<
+    hyper_util::client::legacy::connect::proxy::Tunnel<HttpsConnector>,
+    FullBody,
+>;
+type Socks5ProxyClient = Client<
+    hyper_util::client::legacy::connect::proxy::SocksV5<HttpsConnector>,
+    FullBody,
 >;
 
 #[derive(Default)]
@@ -23,7 +32,7 @@ impl HyperClient {
     }
 }
 
-fn build_client(config: &RequestConfig) -> Result<HyperHttpsClient, ClientError> {
+fn build_https_connector(config: &RequestConfig) -> Result<HttpsConnector, ClientError> {
     let mut tls_builder = native_tls::TlsConnector::builder();
     if !config.should_verify_certs() {
         tls_builder.danger_accept_invalid_certs(true);
@@ -34,30 +43,56 @@ fn build_client(config: &RequestConfig) -> Result<HyperHttpsClient, ClientError>
     })?;
 
     let tokio_tls: tokio_native_tls::TlsConnector = native_tls_connector.into();
-    let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    let mut http_connector = HttpConnector::new();
     http_connector.enforce_http(false);
-    let https = hyper_tls::HttpsConnector::from((http_connector, tokio_tls));
-
-    Ok(Client::builder(TokioExecutor::new())
-        .build::<_, http_body_util::Full<bytes::Bytes>>(https))
+    Ok(hyper_tls::HttpsConnector::from((http_connector, tokio_tls)))
 }
 
-async fn single_request(
-    client: &HyperHttpsClient,
+enum AnyClient {
+    Direct(DirectClient),
+    HttpProxy(HttpProxyClient),
+    Socks5(Socks5ProxyClient),
+}
+
+fn build_client(config: &RequestConfig) -> Result<AnyClient, ClientError> {
+    let https = build_https_connector(config)?;
+    let builder = Client::builder(TokioExecutor::new());
+
+    match config.proxy.as_deref() {
+        None => Ok(AnyClient::Direct(builder.build(https))),
+        Some(proxy_url) => {
+            let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+                ClientError { message: format!("invalid proxy URL: {}", e) }
+            })?;
+
+            let scheme = proxy_uri.scheme_str().unwrap_or("");
+
+            match scheme {
+                "http" | "https" => {
+                    use hyper_util::client::legacy::connect::proxy::Tunnel;
+                    let tunnel = Tunnel::new(proxy_uri, https);
+                    Ok(AnyClient::HttpProxy(builder.build(tunnel)))
+                }
+                "socks5" | "socks5h" => {
+                    use hyper_util::client::legacy::connect::proxy::SocksV5;
+                    let socks = SocksV5::new(proxy_uri, https);
+                    Ok(AnyClient::Socks5(builder.build(socks)))
+                }
+                _ => Err(ClientError {
+                    message: format!("unsupported proxy scheme '{}' (use http, https, socks5)", scheme),
+                }),
+            }
+        }
+    }
+}
+
+async fn dispatch_request(
+    client: &AnyClient,
     uri: &http::Uri,
     config: &RequestConfig,
 ) -> Result<SingleResponse, ClientError> {
+    let request = build_request(uri, config)?;
     let v = config.verbosity;
-
-    let request = hyper::Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("User-Agent", "blasthttp/0.1.0")
-        .header("Accept-Encoding", "gzip, deflate, br")
-        .body(http_body_util::Full::new(bytes::Bytes::new()))
-        .map_err(|e| ClientError {
-            message: format!("failed to build request: {}", e),
-        })?;
 
     debug_print(v, 1, "   Request headers:");
     for (name, value) in request.headers() {
@@ -65,11 +100,46 @@ async fn single_request(
     }
     debug_print(v, 1, "   Sending request...");
 
-    let hyper_response = client.request(request).await
-        .map_err(|e| ClientError {
-            message: format!("request failed: {}", e),
-        })?;
+    let hyper_response = match client {
+        AnyClient::Direct(c) => c.request(request).await,
+        AnyClient::HttpProxy(c) => c.request(request).await,
+        AnyClient::Socks5(c) => c.request(request).await,
+    }.map_err(|e| ClientError {
+        message: format!("request failed: {}", e),
+    })?;
 
+    parse_response(hyper_response, config).await
+}
+
+fn build_request(
+    uri: &http::Uri,
+    config: &RequestConfig,
+) -> Result<hyper::Request<FullBody>, ClientError> {
+    let mut builder = hyper::Request::builder()
+        .method(config.method())
+        .uri(uri)
+        .header("User-Agent", "blasthttp/0.1.0")
+        .header("Accept-Encoding", "gzip, deflate, br");
+
+    if let Some(ref custom_headers) = config.headers {
+        for (name, value) in custom_headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+    }
+
+    let body_bytes = config.body.as_deref().unwrap_or("").as_bytes().to_vec();
+    builder
+        .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
+        .map_err(|e| ClientError {
+            message: format!("failed to build request: {}", e),
+        })
+}
+
+async fn parse_response(
+    hyper_response: hyper::Response<hyper::body::Incoming>,
+    config: &RequestConfig,
+) -> Result<SingleResponse, ClientError> {
+    let v = config.verbosity;
     let status = hyper_response.status().as_u16();
 
     let location = hyper_response.headers()
@@ -142,69 +212,82 @@ fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, Cl
 
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
-        let v = config.verbosity;
-        let start = Instant::now();
+        let timeout_duration = Duration::from_secs(config.timeout());
 
-        let mut uri: http::Uri = config.url.parse()
-            .map_err(|e: http::uri::InvalidUri| ClientError {
-                message: format!("invalid URL: {}", e),
-            })?;
+        tokio::time::timeout(timeout_duration, send_inner(config))
+            .await
+            .map_err(|_| ClientError {
+                message: format!("request timed out after {}s", config.timeout()),
+            })?
+    }
+}
 
-        debug_print(v, 1, &format!("-> GET {}", uri));
-        if !config.should_verify_certs() {
-            debug_print(v, 1, "   TLS certificate validation: disabled");
-        }
+async fn send_inner(config: &RequestConfig) -> Result<Response, ClientError> {
+    let v = config.verbosity;
+    let start = Instant::now();
 
-        let client = build_client(config)?;
-        let mut redirect_chain: Vec<RedirectHop> = Vec::new();
-        let mut hops = 0u32;
+    let mut uri: http::Uri = config.url.parse()
+        .map_err(|e: http::uri::InvalidUri| ClientError {
+            message: format!("invalid URL: {}", e),
+        })?;
 
-        loop {
-            let resp = single_request(&client, &uri, config).await?;
-            let hop_ms = start.elapsed().as_millis();
-            debug_print(v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
+    debug_print(v, 1, &format!("-> {} {}", config.method(), uri));
+    if let Some(ref proxy) = config.proxy {
+        debug_print(v, 1, &format!("   Proxy: {}", proxy));
+    }
+    if !config.should_verify_certs() {
+        debug_print(v, 1, "   TLS certificate validation: disabled");
+    }
 
-            if is_redirect(resp.status) && config.should_follow_redirects() {
-                hops += 1;
-                if hops > config.redirect_limit() {
-                    return Err(ClientError {
-                        message: format!("too many redirects (limit: {})", config.redirect_limit()),
-                    });
-                }
+    let client = build_client(config)?;
+    let mut redirect_chain: Vec<RedirectHop> = Vec::new();
+    let mut hops = 0u32;
 
-                let location = resp.location.as_deref()
-                    .ok_or_else(|| ClientError {
-                        message: format!("redirect {} but no Location header", resp.status),
-                    })?;
+    loop {
+        let resp = dispatch_request(&client, &uri, config).await?;
+        let hop_ms = start.elapsed().as_millis();
+        debug_print(v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
-                let next_uri = resolve_redirect(&uri, location)?;
-                debug_print(v, 1, &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri));
-
-                redirect_chain.push(RedirectHop {
-                    url: uri.to_string(),
-                    status: resp.status,
+        if is_redirect(resp.status) && config.should_follow_redirects() {
+            hops += 1;
+            if hops > config.redirect_limit() {
+                return Err(ClientError {
+                    message: format!("too many redirects (limit: {})", config.redirect_limit()),
                 });
-
-                uri = next_uri;
-                continue;
             }
 
-            let body = String::from_utf8(resp.body_bytes.clone())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
+            let location = resp.location.as_deref()
+                .ok_or_else(|| ClientError {
+                    message: format!("redirect {} but no Location header", resp.status),
+                })?;
 
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            debug_print(v, 1, &format!("   Total time: {}ms ({} redirect(s))", elapsed_ms, redirect_chain.len()));
+            let next_uri = resolve_redirect(&uri, location)?;
+            debug_print(v, 1, &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri));
 
-            return Ok(Response {
+            redirect_chain.push(RedirectHop {
                 url: uri.to_string(),
                 status: resp.status,
-                headers: resp.headers,
-                body_bytes: resp.body_bytes,
-                body,
-                elapsed_ms,
-                redirect_chain,
             });
+
+            uri = next_uri;
+            continue;
         }
+
+        let body = String::from_utf8(resp.body_bytes.clone())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        debug_print(v, 1, &format!("   Total time: {}ms ({} redirect(s))", elapsed_ms, redirect_chain.len()));
+
+        return Ok(Response {
+            url: uri.to_string(),
+            status: resp.status,
+            headers: resp.headers,
+            body_bytes: resp.body_bytes,
+            body,
+            elapsed_ms,
+            redirect_chain,
+        });
     }
 }
 

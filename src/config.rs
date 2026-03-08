@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestConfig {
     pub url: String,
+    pub method: Option<String>,
+    pub headers: Option<Vec<(String, String)>>,
+    pub body: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub max_body_size: Option<usize>,
     pub follow_redirects: Option<bool>,
     pub max_redirects: Option<u32>,
     pub verify_certs: Option<bool>,
+    pub proxy: Option<String>,
     #[serde(default)]
     pub verbosity: u8,
 }
@@ -16,13 +20,21 @@ impl RequestConfig {
     pub fn new(url: String) -> Self {
         RequestConfig {
             url,
+            method: None,
+            headers: None,
+            body: None,
             timeout_seconds: None,
             max_body_size: None,
             follow_redirects: None,
             max_redirects: None,
             verify_certs: None,
+            proxy: None,
             verbosity: 0,
         }
+    }
+
+    pub fn method(&self) -> &str {
+        self.method.as_deref().unwrap_or("GET")
     }
 
     pub fn timeout(&self) -> u64 {
