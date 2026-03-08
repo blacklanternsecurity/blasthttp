@@ -1,0 +1,6 @@
+# Point openssl-sys at our custom OpenSSL build (with weak ciphers enabled).
+# Run `scripts/build-openssl.sh` first to create vendor/openssl/install/.
+[env]
+OPENSSL_DIR = { value = "vendor/openssl/install", relative = true }
+OPENSSL_STATIC = "1"
+OPENSSL_NO_VENDOR = "1"

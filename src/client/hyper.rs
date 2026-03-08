@@ -4,22 +4,184 @@ use crate::response::{Response, RedirectHop};
 use super::{HttpClient, ClientError};
 
 use std::io::Read;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Once;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
-type HttpsConnector = hyper_tls::HttpsConnector<HttpConnector>;
 type FullBody = http_body_util::Full<bytes::Bytes>;
 
-type DirectClient = Client<HttpsConnector, FullBody>;
+// Load the OpenSSL legacy provider once (for RC4, DES, etc.).
+// The provider is statically compiled into libcrypto via `no-module` build flag.
+// `Once` ensures this runs exactly once even across threads.
+static INIT_LEGACY: Once = Once::new();
+
+fn ensure_legacy_provider() {
+    INIT_LEGACY.call_once(|| {
+        // Load default provider first (required when explicitly loading providers)
+        let _default = openssl::provider::Provider::try_load(None, "default", true)
+            .expect("failed to load OpenSSL default provider");
+        let _legacy = openssl::provider::Provider::try_load(None, "legacy", true)
+            .expect("failed to load OpenSSL legacy provider");
+        // Leak the providers so they stay loaded for the process lifetime
+        std::mem::forget(_default);
+        std::mem::forget(_legacy);
+    });
+}
+
+// Custom HTTPS connector using OpenSSL directly.
+// Wraps HttpConnector with TLS handshake via openssl + tokio-openssl.
+#[derive(Clone)]
+struct OpenSslConnector {
+    http: HttpConnector,
+    ssl: openssl::ssl::SslConnector,
+}
+
+fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
+    match s.to_lowercase().as_str() {
+        "1.0" | "tls1.0" | "tlsv1.0" => Ok(openssl::ssl::SslVersion::TLS1),
+        "1.1" | "tls1.1" | "tlsv1.1" => Ok(openssl::ssl::SslVersion::TLS1_1),
+        "1.2" | "tls1.2" | "tlsv1.2" => Ok(openssl::ssl::SslVersion::TLS1_2),
+        "1.3" | "tls1.3" | "tlsv1.3" => Ok(openssl::ssl::SslVersion::TLS1_3),
+        _ => Err(ClientError { message: format!("unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)", s) }),
+    }
+}
+
+impl OpenSslConnector {
+    fn new(config: &RequestConfig) -> Result<Self, ClientError> {
+        // Ensure legacy ciphers (RC4, DES, etc.) are available
+        ensure_legacy_provider();
+
+        let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
+            .map_err(|e| ClientError { message: format!("SSL setup failed: {}", e) })?;
+
+        if !config.should_verify_certs() {
+            builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+        }
+
+        if let Some(ref ciphers) = config.cipher_string {
+            builder.set_cipher_list(ciphers)
+                .map_err(|e| ClientError { message: format!("invalid cipher string '{}': {}", ciphers, e) })?;
+        }
+
+        if let Some(ref min_ver) = config.min_tls_version {
+            let version = parse_tls_version(min_ver)?;
+            builder.set_min_proto_version(Some(version))
+                .map_err(|e| ClientError { message: format!("failed to set min TLS version: {}", e) })?;
+        }
+
+        if let Some(ref max_ver) = config.max_tls_version {
+            let version = parse_tls_version(max_ver)?;
+            builder.set_max_proto_version(Some(version))
+                .map_err(|e| ClientError { message: format!("failed to set max TLS version: {}", e) })?;
+        }
+
+        let ssl = builder.build();
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+
+        Ok(OpenSslConnector { http, ssl })
+    }
+}
+
+// hyper-util's Client needs a Service<Uri> that returns an async connection.
+// We implement this by connecting TCP first, then layering TLS on top.
+// Newtype wrapper so we can impl Connection (orphan rule workaround)
+struct SslStreamWrapper(tokio_openssl::SslStream<tokio::net::TcpStream>);
+
+impl hyper::rt::Read for SslStreamWrapper {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Bridge through TokioIo
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        Pin::new(&mut io).poll_read(cx, buf)
+    }
+}
+
+impl hyper::rt::Write for SslStreamWrapper {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        Pin::new(&mut io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        Pin::new(&mut io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        Pin::new(&mut io).poll_shutdown(cx)
+    }
+}
+
+impl hyper_util::client::legacy::connect::Connection for SslStreamWrapper {
+    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+        hyper_util::client::legacy::connect::Connected::new()
+    }
+}
+
+impl Unpin for SslStreamWrapper {}
+
+impl tower_service::Service<http::Uri> for OpenSslConnector {
+    type Response = SslStreamWrapper;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.http.poll_ready(cx).map_err(|e| Box::new(e) as _)
+    }
+
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let host = uri.host().unwrap_or("").to_string();
+        let http_fut = self.http.call(uri);
+        let ssl_connector = self.ssl.clone();
+
+        Box::pin(async move {
+            let tcp = http_fut.await?;
+            let tcp_stream = tcp.into_inner();
+
+            let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            ssl_conf.set_hostname(&host)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            let mut stream = tokio_openssl::SslStream::new(ssl_conf, tcp_stream)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            Pin::new(&mut stream).connect().await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            Ok(SslStreamWrapper(stream))
+        })
+    }
+}
+
+type DirectClient = Client<OpenSslConnector, FullBody>;
 type HttpProxyClient = Client<
-    hyper_util::client::legacy::connect::proxy::Tunnel<HttpsConnector>,
+    hyper_util::client::legacy::connect::proxy::Tunnel<OpenSslConnector>,
     FullBody,
 >;
 type Socks5ProxyClient = Client<
-    hyper_util::client::legacy::connect::proxy::SocksV5<HttpsConnector>,
+    hyper_util::client::legacy::connect::proxy::SocksV5<OpenSslConnector>,
     FullBody,
 >;
 
@@ -32,22 +194,6 @@ impl HyperClient {
     }
 }
 
-fn build_https_connector(config: &RequestConfig) -> Result<HttpsConnector, ClientError> {
-    let mut tls_builder = native_tls::TlsConnector::builder();
-    if !config.should_verify_certs() {
-        tls_builder.danger_accept_invalid_certs(true);
-        tls_builder.danger_accept_invalid_hostnames(true);
-    }
-    let native_tls_connector = tls_builder.build().map_err(|e| ClientError {
-        message: format!("TLS setup failed: {}", e),
-    })?;
-
-    let tokio_tls: tokio_native_tls::TlsConnector = native_tls_connector.into();
-    let mut http_connector = HttpConnector::new();
-    http_connector.enforce_http(false);
-    Ok(hyper_tls::HttpsConnector::from((http_connector, tokio_tls)))
-}
-
 enum AnyClient {
     Direct(DirectClient),
     HttpProxy(HttpProxyClient),
@@ -55,11 +201,11 @@ enum AnyClient {
 }
 
 fn build_client(config: &RequestConfig) -> Result<AnyClient, ClientError> {
-    let https = build_https_connector(config)?;
+    let connector = OpenSslConnector::new(config)?;
     let builder = Client::builder(TokioExecutor::new());
 
     match config.proxy.as_deref() {
-        None => Ok(AnyClient::Direct(builder.build(https))),
+        None => Ok(AnyClient::Direct(builder.build(connector))),
         Some(proxy_url) => {
             let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
                 ClientError { message: format!("invalid proxy URL: {}", e) }
@@ -70,12 +216,12 @@ fn build_client(config: &RequestConfig) -> Result<AnyClient, ClientError> {
             match scheme {
                 "http" | "https" => {
                     use hyper_util::client::legacy::connect::proxy::Tunnel;
-                    let tunnel = Tunnel::new(proxy_uri, https);
+                    let tunnel = Tunnel::new(proxy_uri, connector);
                     Ok(AnyClient::HttpProxy(builder.build(tunnel)))
                 }
                 "socks5" | "socks5h" => {
                     use hyper_util::client::legacy::connect::proxy::SocksV5;
-                    let socks = SocksV5::new(proxy_uri, https);
+                    let socks = SocksV5::new(proxy_uri, connector);
                     Ok(AnyClient::Socks5(builder.build(socks)))
                 }
                 _ => Err(ClientError {
@@ -237,6 +383,15 @@ async fn send_inner(config: &RequestConfig) -> Result<Response, ClientError> {
     }
     if !config.should_verify_certs() {
         debug_print(v, 1, "   TLS certificate validation: disabled");
+    }
+    if let Some(ref ciphers) = config.cipher_string {
+        debug_print(v, 1, &format!("   Cipher string: {}", ciphers));
+    }
+    if let Some(ref min_ver) = config.min_tls_version {
+        debug_print(v, 1, &format!("   Min TLS: {}", min_ver));
+    }
+    if let Some(ref max_ver) = config.max_tls_version {
+        debug_print(v, 1, &format!("   Max TLS: {}", max_ver));
     }
 
     let client = build_client(config)?;

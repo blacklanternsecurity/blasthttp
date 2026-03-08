@@ -56,6 +56,18 @@ struct Cli {
     #[arg(short = 'x', long)]
     proxy: Option<String>,
 
+    /// OpenSSL cipher string (e.g. "ALL", "HIGH", "RC4-SHA")
+    #[arg(long)]
+    ciphers: Option<String>,
+
+    /// Minimum TLS version (1.0, 1.1, 1.2, 1.3)
+    #[arg(long)]
+    min_tls: Option<String>,
+
+    /// Maximum TLS version (1.0, 1.1, 1.2, 1.3)
+    #[arg(long)]
+    max_tls: Option<String>,
+
     /// Verbosity: -v pretty print + debug, -vv includes body
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -97,6 +109,9 @@ fn build_config(cli: &Cli, url: String) -> RequestConfig {
     config.timeout_seconds = cli.timeout;
     config.max_body_size = cli.max_body_size;
     config.proxy = cli.proxy.clone();
+    config.cipher_string = cli.ciphers.clone();
+    config.min_tls_version = cli.min_tls.clone();
+    config.max_tls_version = cli.max_tls.clone();
     config.verbosity = cli.verbose;
     config
 }

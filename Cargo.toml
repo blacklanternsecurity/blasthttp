@@ -25,11 +25,10 @@ hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "ht
 http-body-util = "0.1"
 bytes = "1"
 
-# TLS - stock OpenSSL for Phase 1
+# TLS - direct OpenSSL for full cipher/version control
 openssl = "0.10"
-native-tls = "0.2"
-tokio-native-tls = "0.3"
-hyper-tls = "0.6"
+tokio-openssl = "0.6"
+tower-service = "0.3"
 
 # HTTP types (Uri, etc.)
 http = "1"

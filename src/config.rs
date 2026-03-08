@@ -12,6 +12,9 @@ pub struct RequestConfig {
     pub max_redirects: Option<u32>,
     pub verify_certs: Option<bool>,
     pub proxy: Option<String>,
+    pub cipher_string: Option<String>,
+    pub min_tls_version: Option<String>,
+    pub max_tls_version: Option<String>,
     #[serde(default)]
     pub verbosity: u8,
 }
@@ -29,6 +32,9 @@ impl RequestConfig {
             max_redirects: None,
             verify_certs: None,
             proxy: None,
+            cipher_string: None,
+            min_tls_version: None,
+            max_tls_version: None,
             verbosity: 0,
         }
     }
