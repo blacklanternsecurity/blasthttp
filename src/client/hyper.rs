@@ -171,6 +171,11 @@ impl OpenSslConnector {
                 .map_err(|e| ClientError { message: format!("failed to set max TLS version: {}", e) })?;
         }
 
+        // ALPN: advertise HTTP/2 and HTTP/1.1 support during TLS handshake.
+        // The wire format is length-prefixed: [2, b'h', b'2', 8, b'h', b't', ...].
+        builder.set_alpn_protos(b"\x02h2\x08http/1.1")
+            .map_err(|e| ClientError { message: format!("failed to set ALPN: {}", e) })?;
+
         let ssl = builder.build();
         let mut http = HttpConnector::new();
         http.enforce_http(false);
@@ -181,8 +186,12 @@ impl OpenSslConnector {
 
 // hyper-util's Client needs a Service<Uri> that returns an async connection.
 // We implement this by connecting TCP first, then layering TLS on top.
-// Newtype wrapper so we can impl Connection (orphan rule workaround)
-struct SslStreamWrapper(tokio_openssl::SslStream<tokio::net::TcpStream>);
+// Newtype wrapper so we can impl Connection (orphan rule workaround).
+// Tracks whether HTTP/2 was negotiated via ALPN.
+struct SslStreamWrapper {
+    stream: tokio_openssl::SslStream<tokio::net::TcpStream>,
+    alpn_h2: bool,
+}
 
 impl hyper::rt::Read for SslStreamWrapper {
     fn poll_read(
@@ -190,7 +199,7 @@ impl hyper::rt::Read for SslStreamWrapper {
         cx: &mut Context<'_>,
         buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
         Pin::new(&mut io).poll_read(cx, buf)
     }
 }
@@ -201,7 +210,7 @@ impl hyper::rt::Write for SslStreamWrapper {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
         Pin::new(&mut io).poll_write(cx, buf)
     }
 
@@ -209,7 +218,7 @@ impl hyper::rt::Write for SslStreamWrapper {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
         Pin::new(&mut io).poll_flush(cx)
     }
 
@@ -217,14 +226,18 @@ impl hyper::rt::Write for SslStreamWrapper {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.0);
+        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
         Pin::new(&mut io).poll_shutdown(cx)
     }
 }
 
 impl hyper_util::client::legacy::connect::Connection for SslStreamWrapper {
     fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
-        hyper_util::client::legacy::connect::Connected::new()
+        let mut connected = hyper_util::client::legacy::connect::Connected::new();
+        if self.alpn_h2 {
+            connected = connected.negotiated_h2();
+        }
+        connected
     }
 }
 
@@ -277,7 +290,10 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
                 *slot = cert_info;
             }
 
-            Ok(SslStreamWrapper(stream))
+            // Check if HTTP/2 was negotiated via ALPN
+            let alpn_h2 = stream.ssl().selected_alpn_protocol() == Some(b"h2");
+
+            Ok(SslStreamWrapper { stream, alpn_h2 })
         })
     }
 }

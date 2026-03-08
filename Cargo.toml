@@ -20,8 +20,8 @@ python = ["pyo3"]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 # HTTP - our single-stack foundation
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 
