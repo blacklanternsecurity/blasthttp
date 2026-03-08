@@ -109,6 +109,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "murmur3",
  "openssl",
  "pyo3",
  "serde",
@@ -491,6 +492,12 @@ dependencies = [
  "wasi",
  "windows-sys",
 ]
+
+[[package]]
+name = "murmur3"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9252111cf132ba0929b6f8e030cac2a24b507f3a4d6db6fb2896f27b354c714b"
 
 [[package]]
 name = "once_cell"

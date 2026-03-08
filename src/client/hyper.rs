@@ -609,6 +609,9 @@ impl HyperClient {
                 debug_print(v, 1, &format!("   Cert SANs: {:?}", info.sans));
             }
 
+            // Compute content hashes for fingerprinting (matches BBOT's format)
+            let hash = crate::response::ResponseHash::compute(&resp.body_bytes, &resp.headers);
+
             return Ok(Response {
                 url: uri.to_string(),
                 status: resp.status,
@@ -618,6 +621,7 @@ impl HyperClient {
                 elapsed_ms,
                 redirect_chain,
                 cert_info,
+                hash,
             });
         }
     }

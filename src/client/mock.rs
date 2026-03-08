@@ -90,15 +90,18 @@ impl HttpClient for MockClient {
             self.body.clone()
         };
 
+        let body_bytes = body.as_bytes().to_vec();
+        let hash = crate::response::ResponseHash::compute(&body_bytes, &self.headers);
         Ok(Response {
             url: config.url.clone(),
             status: self.status,
             headers: self.headers.clone(),
-            body_bytes: body.as_bytes().to_vec(),
+            body_bytes,
             body,
             elapsed_ms: 0,
             redirect_chain: Vec::new(),
             cert_info: None,
+            hash,
         })
     }
 }

@@ -9,8 +9,9 @@ Offensive-first HTTP library written in Rust with Python bindings. Built for [BB
 - **SSL cert info on every request** — extracts CN, SANs, and issuer during the TLS handshake that's already happening, eliminating the need for a separate sslcert connection
 - **All TLS ciphers available by default** — custom-compiled OpenSSL 3.3.2 with legacy provider baked in (RC4, 3DES, export ciphers, SSLv3) so you can connect to anything
 - **No cert validation by default** — offensive-first: connects to self-signed, expired, and misconfigured TLS without extra config
-- **HTTP/2 support** — modern servers that require h2 just work (TODO)
+- **HTTP/2 support** — automatic via ALPN negotiation, falls back to HTTP/1.1
+- **Response hashing built-in** — MD5, SHA256, and MurmurHash3 computed in Rust for both body and headers, ready for fingerprinting
 
 ## Status
 
-Work in progress. Phase 2 complete (batch mode, concurrency, proxy, custom OpenSSL). Targeting BBOT integration.
+Work in progress. Targeting BBOT integration.
