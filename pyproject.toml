@@ -10,3 +10,7 @@ requires-python = ">=3.9"
 
 [tool.maturin]
 features = ["python"]
+
+[tool.uv]
+# maturin manages the package install — don't let uv overwrite it
+managed = false
