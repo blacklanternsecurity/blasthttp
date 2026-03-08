@@ -1,5 +1,5 @@
 use crate::config::RequestConfig;
-use crate::debug::debug_print;
+use crate::debug::{DebugLog, new_debug_log, debug_record};
 use crate::response::{Response, RedirectHop, CertInfo};
 use super::{HttpClient, ClientError};
 
@@ -134,7 +134,7 @@ fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
         "1.1" | "tls1.1" | "tlsv1.1" => Ok(openssl::ssl::SslVersion::TLS1_1),
         "1.2" | "tls1.2" | "tlsv1.2" => Ok(openssl::ssl::SslVersion::TLS1_2),
         "1.3" | "tls1.3" | "tlsv1.3" => Ok(openssl::ssl::SslVersion::TLS1_3),
-        _ => Err(ClientError { message: format!("unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)", s) }),
+        _ => Err(ClientError::other(format!("unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)", s))),
     }
 }
 
@@ -144,7 +144,7 @@ impl OpenSslConnector {
         ensure_legacy_provider();
 
         let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
-            .map_err(|e| ClientError { message: format!("SSL setup failed: {}", e) })?;
+            .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
         // Security level 0: allow all ciphers including RC4, DES, export.
         // This is an offensive-first tool — we need to connect to anything.
@@ -156,25 +156,25 @@ impl OpenSslConnector {
 
         if let Some(ref ciphers) = config.cipher_string {
             builder.set_cipher_list(ciphers)
-                .map_err(|e| ClientError { message: format!("invalid cipher string '{}': {}", ciphers, e) })?;
+                .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
         }
 
         if let Some(ref min_ver) = config.min_tls_version {
             let version = parse_tls_version(min_ver)?;
             builder.set_min_proto_version(Some(version))
-                .map_err(|e| ClientError { message: format!("failed to set min TLS version: {}", e) })?;
+                .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
         }
 
         if let Some(ref max_ver) = config.max_tls_version {
             let version = parse_tls_version(max_ver)?;
             builder.set_max_proto_version(Some(version))
-                .map_err(|e| ClientError { message: format!("failed to set max TLS version: {}", e) })?;
+                .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
         }
 
         // ALPN: advertise HTTP/2 and HTTP/1.1 support during TLS handshake.
         // The wire format is length-prefixed: [2, b'h', b'2', 8, b'h', b't', ...].
         builder.set_alpn_protos(b"\x02h2\x08http/1.1")
-            .map_err(|e| ClientError { message: format!("failed to set ALPN: {}", e) })?;
+            .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
         let ssl = builder.build();
         let mut http = HttpConnector::new();
@@ -348,7 +348,7 @@ impl HyperClient {
     /// subsequent calls return a clone (same connection pool).
     fn get_or_build(&self, config: &RequestConfig) -> Result<CachedClient, ClientError> {
         let mut guard = self.cached.lock()
-            .map_err(|_| ClientError { message: "client lock poisoned".to_string() })?;
+            .map_err(|_| ClientError::other("client lock poisoned".to_string()))?;
 
         if let Some(cached) = &*guard {
             return Ok(cached.clone());
@@ -362,7 +362,7 @@ impl HyperClient {
             None => AnyClient::Direct(builder.build(connector)),
             Some(proxy_url) => {
                 let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-                    ClientError { message: format!("invalid proxy URL: {}", e) }
+                    ClientError::invalid_url(format!("invalid proxy URL: {}", e))
                 })?;
 
                 let scheme = proxy_uri.scheme_str().unwrap_or("");
@@ -378,9 +378,9 @@ impl HyperClient {
                         let socks = SocksV5::new(proxy_uri, connector);
                         AnyClient::Socks5(builder.build(socks))
                     }
-                    _ => return Err(ClientError {
-                        message: format!("unsupported proxy scheme '{}' (use http, https, socks5)", scheme),
-                    }),
+                    _ => return Err(ClientError::other(
+                        format!("unsupported proxy scheme '{}' (use http, https, socks5)", scheme),
+                    )),
                 }
             }
         };
@@ -397,25 +397,32 @@ async fn dispatch_request(
     client: &AnyClient,
     uri: &http::Uri,
     config: &RequestConfig,
+    log: &DebugLog,
 ) -> Result<SingleResponse, ClientError> {
     let request = build_request(uri, config)?;
     let v = config.verbosity;
 
-    debug_print(v, 1, "   Request headers:");
+    debug_record(log, v, 1, "   Request headers:");
     for (name, value) in request.headers() {
-        debug_print(v, 1, &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")));
+        debug_record(log, v, 1, &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")));
     }
-    debug_print(v, 1, "   Sending request...");
+    debug_record(log, v, 1, "   Sending request...");
 
     let hyper_response = match client {
         AnyClient::Direct(c) => c.request(request).await,
         AnyClient::HttpProxy(c) => c.request(request).await,
         AnyClient::Socks5(c) => c.request(request).await,
-    }.map_err(|e| ClientError {
-        message: format!("request failed: {}", e),
+    }.map_err(|e| {
+        let msg = format!("request failed: {}", e);
+        let err_str = e.to_string().to_lowercase();
+        if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
+            ClientError::tls(msg)
+        } else {
+            ClientError::connection(msg)
+        }
     })?;
 
-    parse_response(hyper_response, config).await
+    parse_response(hyper_response, config, log).await
 }
 
 fn build_request(
@@ -437,14 +444,13 @@ fn build_request(
     let body_bytes = config.body.as_deref().unwrap_or("").as_bytes().to_vec();
     builder
         .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
-        .map_err(|e| ClientError {
-            message: format!("failed to build request: {}", e),
-        })
+        .map_err(|e| ClientError::other(format!("failed to build request: {}", e)))
 }
 
 async fn parse_response(
     hyper_response: hyper::Response<hyper::body::Incoming>,
     config: &RequestConfig,
+    log: &DebugLog,
 ) -> Result<SingleResponse, ClientError> {
     let v = config.verbosity;
     let status = hyper_response.status().as_u16();
@@ -455,10 +461,10 @@ async fn parse_response(
         .map(|s| s.to_string());
 
     let mut headers: Vec<(String, String)> = Vec::new();
-    debug_print(v, 1, "   Response headers:");
+    debug_record(log, v, 1, "   Response headers:");
     for (name, value) in hyper_response.headers() {
         let val_str = value.to_str().unwrap_or("<binary>").to_string();
-        debug_print(v, 1, &format!("     {}: {}", name, val_str));
+        debug_record(log, v, 1, &format!("     {}: {}", name, val_str));
         headers.push((name.to_string(), val_str));
     }
 
@@ -470,18 +476,18 @@ async fn parse_response(
 
     let max_body = config.max_body();
     let raw_bytes = read_body(hyper_response.into_body(), max_body).await?;
-    debug_print(v, 1, &format!("   Raw body: {} bytes", raw_bytes.len()));
+    debug_record(log, v, 1, &format!("   Raw body: {} bytes", raw_bytes.len()));
 
     let body_bytes = if content_encoding.is_empty() {
         raw_bytes
     } else {
         let decompressed = decompress(&content_encoding, &raw_bytes)?;
-        debug_print(v, 1, &format!("   Decompressed ({}): {} -> {} bytes", content_encoding, raw_bytes.len(), decompressed.len()));
+        debug_record(log, v, 1, &format!("   Decompressed ({}): {} -> {} bytes", content_encoding, raw_bytes.len(), decompressed.len()));
         decompressed
     };
 
     if body_bytes.len() >= max_body {
-        debug_print(v, 1, &format!("   Body truncated at {} bytes", max_body));
+        debug_record(log, v, 1, &format!("   Body truncated at {} bytes", max_body));
     }
 
     Ok(SingleResponse { status, headers, body_bytes, location })
@@ -507,82 +513,130 @@ fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, Cl
 
     let scheme = current.scheme_str().unwrap_or("https");
     let authority = current.authority()
-        .ok_or_else(|| ClientError {
-            message: format!("no authority in current URL to resolve relative redirect: {}", location),
-        })?;
+        .ok_or_else(|| ClientError::invalid_url(
+            format!("no authority in current URL to resolve relative redirect: {}", location),
+        ))?;
 
     let absolute = format!("{}://{}{}", scheme, authority, location);
-    absolute.parse().map_err(|e: http::uri::InvalidUri| ClientError {
-        message: format!("invalid redirect URL '{}': {}", absolute, e),
-    })
+    absolute.parse().map_err(|e: http::uri::InvalidUri| ClientError::invalid_url(
+        format!("invalid redirect URL '{}': {}", absolute, e),
+    ))
 }
 
 // ── HttpClient implementation ─────────────────────────────────────
 
+/// Compute exponential backoff: min(2^attempt × min_wait, max_wait)
+fn retry_backoff(attempt: u32, min_wait: Duration, max_wait: Duration) -> Duration {
+    let factor = 2u64.saturating_pow(attempt);
+    let backoff = min_wait.saturating_mul(factor as u32);
+    std::cmp::min(backoff, max_wait)
+}
+
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
         let timeout_duration = Duration::from_secs(config.timeout());
+        let max_retries = config.max_retries();
+        let min_wait = config.retry_wait_min();
+        let max_wait = config.retry_wait_max();
+        let log = new_debug_log();
 
-        tokio::time::timeout(timeout_duration, self.send_inner(config))
-            .await
-            .map_err(|_| ClientError {
-                message: format!("request timed out after {}s", config.timeout()),
-            })?
+        let mut last_err = None;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let backoff = retry_backoff(attempt - 1, min_wait, max_wait);
+                debug_record(&log, config.verbosity, 1, &format!(
+                    "   Retry {}/{} after {}ms", attempt, max_retries, backoff.as_millis(),
+                ));
+                tokio::time::sleep(backoff).await;
+            }
+
+            match tokio::time::timeout(timeout_duration, self.send_inner(config, &log)).await {
+                Ok(Ok(response)) => {
+                    let status = response.status;
+                    if super::ErrorKind::Status(status).is_retryable() && attempt < max_retries {
+                        debug_record(&log, config.verbosity, 1, &format!(
+                            "   Retryable status {} from {}", status, config.url,
+                        ));
+                        last_err = Some(ClientError::status(
+                            status,
+                            format!("server returned {} for {}", status, config.url),
+                        ));
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Ok(Err(e)) => {
+                    if e.kind.is_retryable() && attempt < max_retries {
+                        debug_record(&log, config.verbosity, 1, &format!(
+                            "   Retryable error: {}", e.message,
+                        ));
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(_) => {
+                    return Err(ClientError::timeout(
+                        format!("request timed out after {}s", config.timeout()),
+                    ));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| ClientError::other("all retries exhausted".to_string())))
     }
 }
 
 impl HyperClient {
-    async fn send_inner(&self, config: &RequestConfig) -> Result<Response, ClientError> {
+    async fn send_inner(&self, config: &RequestConfig, log: &DebugLog) -> Result<Response, ClientError> {
         let v = config.verbosity;
         let start = Instant::now();
 
         let mut uri: http::Uri = config.url.parse()
-            .map_err(|e: http::uri::InvalidUri| ClientError {
-                message: format!("invalid URL: {}", e),
-            })?;
+            .map_err(|e: http::uri::InvalidUri| ClientError::invalid_url(format!("invalid URL: {}", e)))?;
 
-        debug_print(v, 1, &format!("-> {} {}", config.method(), uri));
+        debug_record(log, v, 1, &format!("-> {} {}", config.method(), uri));
         if let Some(ref proxy) = config.proxy {
-            debug_print(v, 1, &format!("   Proxy: {}", proxy));
+            debug_record(log, v, 1, &format!("   Proxy: {}", proxy));
         }
         if !config.should_verify_certs() {
-            debug_print(v, 1, "   TLS certificate validation: disabled");
+            debug_record(log, v, 1, "   TLS certificate validation: disabled");
         }
         if let Some(ref ciphers) = config.cipher_string {
-            debug_print(v, 1, &format!("   Cipher string: {}", ciphers));
+            debug_record(log, v, 1, &format!("   Cipher string: {}", ciphers));
         }
         if let Some(ref min_ver) = config.min_tls_version {
-            debug_print(v, 1, &format!("   Min TLS: {}", min_ver));
+            debug_record(log, v, 1, &format!("   Min TLS: {}", min_ver));
         }
         if let Some(ref max_ver) = config.max_tls_version {
-            debug_print(v, 1, &format!("   Max TLS: {}", max_ver));
+            debug_record(log, v, 1, &format!("   Max TLS: {}", max_ver));
         }
 
-        // Get or build the cached client (reuses connection pool within a batch)
         let cached = self.get_or_build(config)?;
         let mut redirect_chain: Vec<RedirectHop> = Vec::new();
         let mut hops = 0u32;
 
         loop {
-            let resp = dispatch_request(&cached.inner, &uri, config).await?;
+            let resp = dispatch_request(&cached.inner, &uri, config, log).await?;
             let hop_ms = start.elapsed().as_millis();
-            debug_print(v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
+            debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
             if is_redirect(resp.status) && config.should_follow_redirects() {
                 hops += 1;
                 if hops > config.redirect_limit() {
-                    return Err(ClientError {
-                        message: format!("too many redirects (limit: {})", config.redirect_limit()),
-                    });
+                    return Err(ClientError::too_many_redirects(
+                        format!("too many redirects (limit: {})", config.redirect_limit()),
+                    ));
                 }
 
                 let location = resp.location.as_deref()
-                    .ok_or_else(|| ClientError {
-                        message: format!("redirect {} but no Location header", resp.status),
-                    })?;
+                    .ok_or_else(|| ClientError::other(
+                        format!("redirect {} but no Location header", resp.status),
+                    ))?;
 
                 let next_uri = resolve_redirect(&uri, location)?;
-                debug_print(v, 1, &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri));
+                debug_record(log, v, 1, &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri));
 
                 redirect_chain.push(RedirectHop {
                     url: uri.to_string(),
@@ -596,21 +650,24 @@ impl HyperClient {
             let body = String::from_utf8(resp.body_bytes.clone())
                 .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
 
-            // Read cert info from the shared slot (written by connector during handshake)
             let cert_info = cached.cert_slot.lock()
                 .ok()
                 .and_then(|guard| guard.clone());
 
             let elapsed_ms = start.elapsed().as_millis() as u64;
-            debug_print(v, 1, &format!("   Total time: {}ms ({} redirect(s))", elapsed_ms, redirect_chain.len()));
+            debug_record(log, v, 1, &format!("   Total time: {}ms ({} redirect(s))", elapsed_ms, redirect_chain.len()));
 
             if let Some(ref info) = cert_info {
-                debug_print(v, 1, &format!("   Cert CN: {:?}", info.common_name));
-                debug_print(v, 1, &format!("   Cert SANs: {:?}", info.sans));
+                debug_record(log, v, 1, &format!("   Cert CN: {:?}", info.common_name));
+                debug_record(log, v, 1, &format!("   Cert SANs: {:?}", info.sans));
             }
 
-            // Compute content hashes for fingerprinting (matches BBOT's format)
             let hash = crate::response::ResponseHash::compute(&resp.body_bytes, &resp.headers);
+
+            // Extract collected debug messages
+            let debug_log = log.lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
 
             return Ok(Response {
                 url: uri.to_string(),
@@ -622,6 +679,7 @@ impl HyperClient {
                 redirect_chain,
                 cert_info,
                 hash,
+                debug_log,
             });
         }
     }
@@ -634,25 +692,22 @@ fn decompress(encoding: &str, data: &[u8]) -> Result<Vec<u8>, ClientError> {
         "gzip" => {
             let mut decoder = flate2::read::GzDecoder::new(data);
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf).map_err(|e| ClientError {
-                message: format!("gzip decompression failed: {}", e),
-            })?;
+            decoder.read_to_end(&mut buf)
+                .map_err(|e| ClientError::other(format!("gzip decompression failed: {}", e)))?;
             Ok(buf)
         }
         "deflate" => {
             let mut decoder = flate2::read::DeflateDecoder::new(data);
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf).map_err(|e| ClientError {
-                message: format!("deflate decompression failed: {}", e),
-            })?;
+            decoder.read_to_end(&mut buf)
+                .map_err(|e| ClientError::other(format!("deflate decompression failed: {}", e)))?;
             Ok(buf)
         }
         "br" => {
             let mut decoder = brotli::Decompressor::new(data, 4096);
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf).map_err(|e| ClientError {
-                message: format!("brotli decompression failed: {}", e),
-            })?;
+            decoder.read_to_end(&mut buf)
+                .map_err(|e| ClientError::other(format!("brotli decompression failed: {}", e)))?;
             Ok(buf)
         }
         _ => Ok(data.to_vec()),
@@ -665,9 +720,7 @@ where
     B::Error: std::fmt::Display,
 {
     let collected = body.collect().await
-        .map_err(|e| ClientError {
-            message: format!("failed to read body: {}", e),
-        })?;
+        .map_err(|e| ClientError::connection(format!("failed to read body: {}", e)))?;
 
     let bytes = collected.to_bytes();
 
@@ -675,5 +728,52 @@ where
         Ok(bytes[..max_size].to_vec())
     } else {
         Ok(bytes.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backoff_attempt_0() {
+        let min = Duration::from_secs(1);
+        let max = Duration::from_secs(30);
+        // 2^0 × 1s = 1s
+        assert_eq!(retry_backoff(0, min, max), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_backoff_attempt_1() {
+        let min = Duration::from_secs(1);
+        let max = Duration::from_secs(30);
+        // 2^1 × 1s = 2s
+        assert_eq!(retry_backoff(1, min, max), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_backoff_attempt_2() {
+        let min = Duration::from_secs(1);
+        let max = Duration::from_secs(30);
+        // 2^2 × 1s = 4s
+        assert_eq!(retry_backoff(2, min, max), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn test_backoff_caps_at_max() {
+        let min = Duration::from_secs(1);
+        let max = Duration::from_secs(30);
+        // 2^10 × 1s = 1024s, capped at 30s
+        assert_eq!(retry_backoff(10, min, max), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_backoff_custom_min() {
+        let min = Duration::from_millis(500);
+        let max = Duration::from_secs(30);
+        // 2^0 × 500ms = 500ms
+        assert_eq!(retry_backoff(0, min, max), Duration::from_millis(500));
+        // 2^1 × 500ms = 1000ms
+        assert_eq!(retry_backoff(1, min, max), Duration::from_millis(1000));
     }
 }

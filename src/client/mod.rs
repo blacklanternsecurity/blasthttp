@@ -5,9 +5,71 @@ pub trait HttpClient {
     fn send(&self, config: &RequestConfig) -> impl std::future::Future<Output = Result<Response, ClientError>> + Send;
 }
 
-#[derive(Debug)]
+/// What kind of error occurred — used by retry logic to decide
+/// whether another attempt is worth it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Connection refused, reset, DNS failure — retryable
+    Connection,
+    /// Request timed out — NOT retryable (already waited the full duration)
+    Timeout,
+    /// TLS handshake failure, cert error — NOT retryable
+    Tls,
+    /// Malformed URL — NOT retryable
+    InvalidUrl,
+    /// Too many redirects — NOT retryable
+    TooManyRedirects,
+    /// Got an HTTP response but status indicates server error — retryable for 429, 500-599 (except 501)
+    Status(u16),
+    /// Anything else — NOT retryable by default
+    Other,
+}
+
+impl ErrorKind {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            ErrorKind::Connection => true,
+            ErrorKind::Status(429) => true,
+            ErrorKind::Status(s) if (500..=599).contains(s) && *s != 501 => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ClientError {
     pub message: String,
+    pub kind: ErrorKind,
+}
+
+impl ClientError {
+    pub fn connection(message: String) -> Self {
+        ClientError { message, kind: ErrorKind::Connection }
+    }
+
+    pub fn timeout(message: String) -> Self {
+        ClientError { message, kind: ErrorKind::Timeout }
+    }
+
+    pub fn tls(message: String) -> Self {
+        ClientError { message, kind: ErrorKind::Tls }
+    }
+
+    pub fn invalid_url(message: String) -> Self {
+        ClientError { message, kind: ErrorKind::InvalidUrl }
+    }
+
+    pub fn too_many_redirects(message: String) -> Self {
+        ClientError { message, kind: ErrorKind::TooManyRedirects }
+    }
+
+    pub fn status(status: u16, message: String) -> Self {
+        ClientError { message, kind: ErrorKind::Status(status) }
+    }
+
+    pub fn other(message: String) -> Self {
+        ClientError { message, kind: ErrorKind::Other }
+    }
 }
 
 impl std::fmt::Display for ClientError {
@@ -136,5 +198,100 @@ mod tests {
         assert_eq!(config.timeout(), 30);
         assert!(config.should_verify_certs());
         assert!(config.should_follow_redirects());
+    }
+
+    // ── ErrorKind tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_connection_error_is_retryable() {
+        assert!(ErrorKind::Connection.is_retryable());
+    }
+
+    #[test]
+    fn test_timeout_error_is_not_retryable() {
+        assert!(!ErrorKind::Timeout.is_retryable());
+    }
+
+    #[test]
+    fn test_tls_error_is_not_retryable() {
+        assert!(!ErrorKind::Tls.is_retryable());
+    }
+
+    #[test]
+    fn test_invalid_url_is_not_retryable() {
+        assert!(!ErrorKind::InvalidUrl.is_retryable());
+    }
+
+    #[test]
+    fn test_too_many_redirects_is_not_retryable() {
+        assert!(!ErrorKind::TooManyRedirects.is_retryable());
+    }
+
+    #[test]
+    fn test_status_429_is_retryable() {
+        assert!(ErrorKind::Status(429).is_retryable());
+    }
+
+    #[test]
+    fn test_status_500_is_retryable() {
+        assert!(ErrorKind::Status(500).is_retryable());
+    }
+
+    #[test]
+    fn test_status_502_is_retryable() {
+        assert!(ErrorKind::Status(502).is_retryable());
+    }
+
+    #[test]
+    fn test_status_503_is_retryable() {
+        assert!(ErrorKind::Status(503).is_retryable());
+    }
+
+    #[test]
+    fn test_status_501_is_not_retryable() {
+        assert!(!ErrorKind::Status(501).is_retryable());
+    }
+
+    #[test]
+    fn test_status_404_is_not_retryable() {
+        assert!(!ErrorKind::Status(404).is_retryable());
+    }
+
+    #[test]
+    fn test_status_200_is_not_retryable() {
+        assert!(!ErrorKind::Status(200).is_retryable());
+    }
+
+    #[test]
+    fn test_other_error_is_not_retryable() {
+        assert!(!ErrorKind::Other.is_retryable());
+    }
+
+    // ── Retry config defaults ────────────────────────────────────
+
+    #[test]
+    fn test_retry_defaults() {
+        let config = RequestConfig::new("https://example.com".to_string());
+        assert_eq!(config.max_retries(), 1);
+        assert_eq!(config.retry_wait_min(), std::time::Duration::from_secs(1));
+        assert_eq!(config.retry_wait_max(), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_retry_config_overrides() {
+        let mut config = RequestConfig::new("https://example.com".to_string());
+        config.retries = Some(3);
+        config.retry_wait_min_ms = Some(500);
+        config.retry_wait_max_ms = Some(5000);
+        assert_eq!(config.max_retries(), 3);
+        assert_eq!(config.retry_wait_min(), std::time::Duration::from_millis(500));
+        assert_eq!(config.retry_wait_max(), std::time::Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn test_zero_retries() {
+        let mut config = RequestConfig::new("https://example.com".to_string());
+        config.retries = Some(0);
+        assert_eq!(config.max_retries(), 0);
     }
 }

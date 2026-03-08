@@ -1,34 +1,34 @@
+"""Quick manual test — batch requests with native API."""
 import blasthttp
-import json
-import sys
 import time
 
 client = blasthttp.BlastHTTP()
 
-urls = [
-    "https://example.com",
-    "https://httpbin.org/get",
-    "https://www.google.com",
-    "https://example.org",
+configs = [
+    blasthttp.BatchConfig("https://example.com"),
+    blasthttp.BatchConfig("https://httpbin.org/get"),
+    blasthttp.BatchConfig("https://www.google.com"),
+    blasthttp.BatchConfig("https://example.org"),
 ]
-
-configs = [{"url": url} for url in urls]
 
 print(f"Sending {len(configs)} requests in batch...")
 start = time.time()
-results = json.loads(client.send_batch(json.dumps(configs)))
+results = client.request_batch(configs)
 elapsed = time.time() - start
 
-print(f"Got {len(results)} responses in {elapsed:.2f}s\n")
+print(f"Got {len(results)} results in {elapsed:.2f}s\n")
 
-for resp in results:
-    print(f"  {resp['status']} {resp['url']} ({resp['elapsed_ms']}ms)")
+for r in results:
+    if r.success:
+        print(f"  {r.response.status} {r.url} ({r.response.elapsed_ms}ms)")
+    else:
+        print(f"  ERROR {r.url}: {r.error}")
 
 # Compare with sequential
 print(f"\nSending {len(configs)} requests sequentially...")
 start = time.time()
-for config in configs:
-    json.loads(client.send(json.dumps(config)))
+for cfg in configs:
+    client.request(cfg.url)
 elapsed_seq = time.time() - start
 
 print(f"Sequential: {elapsed_seq:.2f}s")

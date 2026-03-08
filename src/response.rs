@@ -16,6 +16,9 @@ pub struct Response {
     pub cert_info: Option<CertInfo>,
     /// Content hashes for fingerprinting (matches BBOT's hash format)
     pub hash: ResponseHash,
+    /// Debug messages collected during the request (for Python-side inspection)
+    #[serde(skip_serializing)]
+    pub debug_log: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

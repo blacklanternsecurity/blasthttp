@@ -180,7 +180,7 @@ async fn run_batch(cli: &Cli, file_path: &str) {
         .collect();
 
     let client = Arc::new(HyperClient::new());
-    let results = batch::send_batch(client, configs, cli.concurrency).await;
+    let results = batch::send_batch(client, configs, cli.concurrency, None).await;
 
     for r in results {
         match r.result {

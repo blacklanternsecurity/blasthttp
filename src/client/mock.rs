@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::config::RequestConfig;
 use crate::response::Response;
-use super::{HttpClient, ClientError};
+use super::{HttpClient, ClientError, ErrorKind};
 
 pub struct MockClient {
     status: u16,
@@ -64,10 +64,85 @@ impl MockClient {
     }
 }
 
+/// Mock that returns a specific ErrorKind (for testing retry classification)
+pub struct ErrorKindMockClient {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl HttpClient for ErrorKindMockClient {
+    async fn send(&self, _config: &RequestConfig) -> Result<Response, ClientError> {
+        Err(ClientError {
+            message: self.message.clone(),
+            kind: self.kind.clone(),
+        })
+    }
+}
+
+/// Mock that returns different results on each call.
+/// Used to test retry logic: fail N times then succeed.
+pub struct SequenceMockClient {
+    /// Sequence of results. Each call pops from front.
+    /// When exhausted, returns the last result repeatedly.
+    call_count: AtomicU32,
+    /// Number of initial calls that return an error
+    fail_count: u32,
+    /// Error kind to return for failed calls
+    fail_kind: ErrorKind,
+    /// Status code to return on success
+    success_status: u16,
+}
+
+impl SequenceMockClient {
+    /// Create a mock that fails `fail_count` times with `fail_kind`, then succeeds with `success_status`.
+    pub fn new(fail_count: u32, fail_kind: ErrorKind, success_status: u16) -> Self {
+        SequenceMockClient {
+            call_count: AtomicU32::new(0),
+            fail_count,
+            fail_kind,
+            success_status,
+        }
+    }
+
+    pub fn total_calls(&self) -> u32 {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+impl HttpClient for SequenceMockClient {
+    async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
+        let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+
+        if call < self.fail_count {
+            return Err(ClientError {
+                message: format!("mock error on call {}", call),
+                kind: self.fail_kind.clone(),
+            });
+        }
+
+        let body = "ok".to_string();
+        let body_bytes = body.as_bytes().to_vec();
+        let headers = Vec::new();
+        let hash = crate::response::ResponseHash::compute(&body_bytes, &headers);
+        Ok(Response {
+            url: config.url.clone(),
+            status: self.success_status,
+            headers,
+            body_bytes,
+            body,
+            elapsed_ms: 0,
+            redirect_chain: Vec::new(),
+            cert_info: None,
+            hash,
+            debug_log: Vec::new(),
+        })
+    }
+}
+
 impl HttpClient for MockClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
         if let Some(ref msg) = self.error {
-            return Err(ClientError { message: msg.clone() });
+            return Err(ClientError::connection(msg.clone()));
         }
 
         let current = self.concurrent_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -102,6 +177,7 @@ impl HttpClient for MockClient {
             redirect_chain: Vec::new(),
             cert_info: None,
             hash,
+            debug_log: Vec::new(),
         })
     }
 }

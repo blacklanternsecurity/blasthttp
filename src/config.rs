@@ -15,6 +15,12 @@ pub struct RequestConfig {
     pub cipher_string: Option<String>,
     pub min_tls_version: Option<String>,
     pub max_tls_version: Option<String>,
+    /// Number of retries on retryable errors (default: 1)
+    pub retries: Option<u32>,
+    /// Minimum backoff between retries in milliseconds (default: 1000)
+    pub retry_wait_min_ms: Option<u64>,
+    /// Maximum backoff between retries in milliseconds (default: 30000)
+    pub retry_wait_max_ms: Option<u64>,
     #[serde(default)]
     pub verbosity: u8,
 }
@@ -35,6 +41,9 @@ impl RequestConfig {
             cipher_string: None,
             min_tls_version: None,
             max_tls_version: None,
+            retries: None,
+            retry_wait_min_ms: None,
+            retry_wait_max_ms: None,
             verbosity: 0,
         }
     }
@@ -61,5 +70,17 @@ impl RequestConfig {
 
     pub fn should_verify_certs(&self) -> bool {
         self.verify_certs.unwrap_or(false)
+    }
+
+    pub fn max_retries(&self) -> u32 {
+        self.retries.unwrap_or(1)
+    }
+
+    pub fn retry_wait_min(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.retry_wait_min_ms.unwrap_or(1000))
+    }
+
+    pub fn retry_wait_max(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.retry_wait_max_ms.unwrap_or(30000))
     }
 }

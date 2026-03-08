@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::client::{HttpClient, ClientError};
 use crate::config::RequestConfig;
@@ -9,15 +10,49 @@ pub struct BatchResult {
     pub result: Result<Response, ClientError>,
 }
 
+// ── Rate limiter ──────────────────────────────────────────────────
+
+/// Simple async rate limiter using a permit-dispenser pattern.
+/// Uses tokio::sync::Mutex because we await (sleep) while holding the lock.
+struct RateLimiter {
+    interval: Duration,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl RateLimiter {
+    fn new(requests_per_second: f64) -> Self {
+        let interval = Duration::from_secs_f64(1.0 / requests_per_second);
+        RateLimiter {
+            interval,
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+
+    async fn acquire(&self) {
+        let mut next = self.next.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = tokio::time::Instant::now() + self.interval;
+    }
+}
+
+// ── Batch dispatch ────────────────────────────────────────────────
+
 pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
     client: Arc<C>,
     configs: Vec<RequestConfig>,
     concurrency: usize,
+    rate_limit: Option<f64>,
 ) -> Vec<BatchResult> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let limiter = rate_limit.map(|rps| Arc::new(RateLimiter::new(rps)));
     let mut handles = Vec::new();
 
     for config in configs {
+        // Rate limit: pace dispatch before spawning the task
+        if let Some(ref limiter) = limiter {
+            limiter.acquire().await;
+        }
+
         let client = client.clone();
         let permit = semaphore.clone();
         let url = config.url.clone();
@@ -36,7 +71,7 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
             Ok(batch_result) => results.push(batch_result),
             Err(e) => results.push(BatchResult {
                 url: String::from("<unknown>"),
-                result: Err(ClientError { message: format!("task panicked: {}", e) }),
+                result: Err(ClientError::other(format!("task panicked: {}", e))),
             }),
         }
     }
@@ -58,7 +93,7 @@ mod tests {
             RequestConfig::new("https://c.com".to_string()),
         ];
 
-        let results = send_batch(client, configs, 10).await;
+        let results = send_batch(client, configs, 10, None).await;
         assert_eq!(results.len(), 3);
         for r in &results {
             assert!(r.result.is_ok());
@@ -74,7 +109,7 @@ mod tests {
             RequestConfig::new("https://second.com".to_string()),
         ];
 
-        let results = send_batch(client, configs, 10).await;
+        let results = send_batch(client, configs, 10, None).await;
         let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
         assert!(urls.contains(&"https://first.com"));
         assert!(urls.contains(&"https://second.com"));
@@ -83,7 +118,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_empty_input() {
         let client = Arc::new(MockClient::new(200, "ok".to_string()));
-        let results = send_batch(client, Vec::new(), 10).await;
+        let results = send_batch(client, Vec::new(), 10, None).await;
         assert!(results.is_empty());
     }
 
@@ -95,7 +130,7 @@ mod tests {
             RequestConfig::new("https://b.com".to_string()),
         ];
 
-        let results = send_batch(client, configs, 10).await;
+        let results = send_batch(client, configs, 10, None).await;
         assert_eq!(results.len(), 2);
         for r in &results {
             assert!(r.result.is_err());
@@ -114,12 +149,10 @@ mod tests {
             .collect();
 
         let start = Instant::now();
-        let results = send_batch(client.clone(), configs, 5).await;
+        let results = send_batch(client.clone(), configs, 5, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
-        // 5 requests with 100ms delay each, all concurrent = ~100ms total
-        // Sequential would be ~500ms. Allow generous margin.
         assert!(elapsed < Duration::from_millis(300),
             "batch took {:?}, expected < 300ms (concurrent)", elapsed);
         assert_eq!(client.peak_concurrent(), 5);
@@ -136,10 +169,9 @@ mod tests {
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
             .collect();
 
-        let results = send_batch(client.clone(), configs, 2).await;
+        let results = send_batch(client.clone(), configs, 2, None).await;
 
         assert_eq!(results.len(), 10);
-        // With concurrency=2, peak should never exceed 2
         assert!(client.peak_concurrent() <= 2,
             "peak concurrent was {}, expected <= 2", client.peak_concurrent());
     }
@@ -156,13 +188,91 @@ mod tests {
             .collect();
 
         let start = Instant::now();
-        let results = send_batch(client.clone(), configs, 1).await;
+        let results = send_batch(client.clone(), configs, 1, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 4);
         assert_eq!(client.peak_concurrent(), 1);
-        // 4 requests * 50ms each, sequential = ~200ms minimum
         assert!(elapsed >= Duration::from_millis(180),
             "batch took {:?}, expected >= 180ms (sequential)", elapsed);
+    }
+
+    // ── Rate limiting tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_rate_limit_none_is_unlimited() {
+        let client = Arc::new(MockClient::new(200, "ok".to_string()));
+        let configs: Vec<RequestConfig> = (0..5)
+            .map(|i| RequestConfig::new(format!("https://{}.com", i)))
+            .collect();
+
+        let start = Instant::now();
+        let results = send_batch(client, configs, 50, None).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 5);
+        // No rate limit + no delay = nearly instant
+        assert!(elapsed < Duration::from_millis(100),
+            "unlimited batch took {:?}, expected < 100ms", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_paces_dispatch() {
+        // 10 requests/sec = 100ms between each dispatch
+        let client = Arc::new(MockClient::new(200, "ok".to_string()));
+        let configs: Vec<RequestConfig> = (0..5)
+            .map(|i| RequestConfig::new(format!("https://{}.com", i)))
+            .collect();
+
+        let start = Instant::now();
+        let results = send_batch(client, configs, 50, Some(10.0)).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 5);
+        // 5 requests at 10/sec = 4 intervals × 100ms = ~400ms minimum
+        assert!(elapsed >= Duration::from_millis(350),
+            "rate-limited batch took {:?}, expected >= 350ms", elapsed);
+        // But shouldn't be wildly over either
+        assert!(elapsed < Duration::from_millis(700),
+            "rate-limited batch took {:?}, expected < 700ms", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_one_per_second() {
+        // 1 request/sec — very slow, but easy to verify
+        let client = Arc::new(MockClient::new(200, "ok".to_string()));
+        let configs: Vec<RequestConfig> = (0..3)
+            .map(|i| RequestConfig::new(format!("https://{}.com", i)))
+            .collect();
+
+        let start = Instant::now();
+        let results = send_batch(client, configs, 50, Some(1.0)).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 3);
+        // 3 requests at 1/sec = 2 intervals × 1s = ~2s minimum
+        assert!(elapsed >= Duration::from_millis(1800),
+            "1/sec batch took {:?}, expected >= 1800ms", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_with_concurrency() {
+        // Rate limit AND concurrency together
+        // 20 req/s = 50ms intervals, concurrency=2, 4 requests with 100ms delay each
+        let client = Arc::new(
+            MockClient::new(200, "ok".to_string())
+                .with_delay(Duration::from_millis(100))
+        );
+
+        let configs: Vec<RequestConfig> = (0..4)
+            .map(|i| RequestConfig::new(format!("https://{}.com", i)))
+            .collect();
+
+        let results = send_batch(client.clone(), configs, 2, Some(20.0)).await;
+        assert_eq!(results.len(), 4);
+        // All should succeed
+        for r in &results {
+            assert!(r.result.is_ok());
+        }
     }
 }
