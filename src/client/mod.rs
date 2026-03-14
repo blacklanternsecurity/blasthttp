@@ -29,8 +29,11 @@ impl ErrorKind {
     pub fn is_retryable(&self) -> bool {
         match self {
             ErrorKind::Connection => true,
+            // 429 = rate limited, retry makes sense
             ErrorKind::Status(429) => true,
-            ErrorKind::Status(s) if (500..=599).contains(s) && *s != 501 => true,
+            // 5xx: don't retry at the transport level — let the caller decide.
+            // This matches httpx behavior and avoids double-retries when
+            // Python-level retry logic (e.g. API key cycling) is in play.
             _ => false,
         }
     }
@@ -233,18 +236,18 @@ mod tests {
     }
 
     #[test]
-    fn test_status_500_is_retryable() {
-        assert!(ErrorKind::Status(500).is_retryable());
+    fn test_status_500_is_not_retryable() {
+        assert!(!ErrorKind::Status(500).is_retryable());
     }
 
     #[test]
-    fn test_status_502_is_retryable() {
-        assert!(ErrorKind::Status(502).is_retryable());
+    fn test_status_502_is_not_retryable() {
+        assert!(!ErrorKind::Status(502).is_retryable());
     }
 
     #[test]
-    fn test_status_503_is_retryable() {
-        assert!(ErrorKind::Status(503).is_retryable());
+    fn test_status_503_is_not_retryable() {
+        assert!(!ErrorKind::Status(503).is_retryable());
     }
 
     #[test]

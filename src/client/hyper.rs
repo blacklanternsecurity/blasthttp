@@ -16,6 +16,45 @@ use hyper_util::rt::TokioExecutor;
 
 type FullBody = http_body_util::Full<bytes::Bytes>;
 
+/// Percent-encode characters that are invalid in `http::Uri` but preserve
+/// already-encoded `%XX` sequences and valid URI characters.
+/// This makes blasthttp accept "messy" URLs that tools like httpx tolerate
+/// (e.g. `<`, `>`, `{`, `}`, `|`, `^`, `` ` ``, spaces).
+fn sanitize_uri(url: &str) -> String {
+    // Minimally invasive: only percent-encode bytes that http::Uri actually
+    // rejects (space, angle brackets, curly braces, control characters).
+    // Everything else passes through as-is so offensive payloads like `\`
+    // reach the server literally.
+    fn must_encode(b: u8) -> bool {
+        matches!(b, b' ' | b'"' | b'<' | b'>' | b'{' | b'}' | 0..=0x1F | 0x7F)
+    }
+
+    let bytes = url.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            // Already-encoded %XX — pass through unchanged
+            out.push(bytes[i] as char);
+            out.push(bytes[i + 1] as char);
+            out.push(bytes[i + 2] as char);
+            i += 3;
+        } else if must_encode(b) {
+            // Percent-encode this byte
+            out.push_str(&format!("%{:02X}", b));
+            i += 1;
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 // Load the OpenSSL legacy provider once (for RC4, DES, etc.).
 // The provider is statically compiled into libcrypto via `no-module` build flag.
 // `Once` ensures this runs exactly once even across threads.
@@ -185,66 +224,100 @@ impl OpenSslConnector {
 }
 
 // hyper-util's Client needs a Service<Uri> that returns an async connection.
-// We implement this by connecting TCP first, then layering TLS on top.
-// Newtype wrapper so we can impl Connection (orphan rule workaround).
-// Tracks whether HTTP/2 was negotiated via ALPN.
-struct SslStreamWrapper {
-    stream: tokio_openssl::SslStream<tokio::net::TcpStream>,
-    alpn_h2: bool,
+// We implement this by connecting TCP first, then optionally layering TLS on top.
+// ConnectionStream is an enum that handles both plain HTTP and HTTPS connections.
+enum ConnectionStream {
+    Plain(tokio::net::TcpStream),
+    Tls {
+        stream: tokio_openssl::SslStream<tokio::net::TcpStream>,
+        alpn_h2: bool,
+    },
 }
 
-impl hyper::rt::Read for SslStreamWrapper {
+impl hyper::rt::Read for ConnectionStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
-        Pin::new(&mut io).poll_read(cx, buf)
+        match &mut *self {
+            ConnectionStream::Plain(tcp) => {
+                let mut io = hyper_util::rt::TokioIo::new(tcp);
+                Pin::new(&mut io).poll_read(cx, buf)
+            }
+            ConnectionStream::Tls { stream, .. } => {
+                let mut io = hyper_util::rt::TokioIo::new(stream);
+                Pin::new(&mut io).poll_read(cx, buf)
+            }
+        }
     }
 }
 
-impl hyper::rt::Write for SslStreamWrapper {
+impl hyper::rt::Write for ConnectionStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
-        Pin::new(&mut io).poll_write(cx, buf)
+        match &mut *self {
+            ConnectionStream::Plain(tcp) => {
+                let mut io = hyper_util::rt::TokioIo::new(tcp);
+                Pin::new(&mut io).poll_write(cx, buf)
+            }
+            ConnectionStream::Tls { stream, .. } => {
+                let mut io = hyper_util::rt::TokioIo::new(stream);
+                Pin::new(&mut io).poll_write(cx, buf)
+            }
+        }
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
-        Pin::new(&mut io).poll_flush(cx)
+        match &mut *self {
+            ConnectionStream::Plain(tcp) => {
+                let mut io = hyper_util::rt::TokioIo::new(tcp);
+                Pin::new(&mut io).poll_flush(cx)
+            }
+            ConnectionStream::Tls { stream, .. } => {
+                let mut io = hyper_util::rt::TokioIo::new(stream);
+                Pin::new(&mut io).poll_flush(cx)
+            }
+        }
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut io = hyper_util::rt::TokioIo::new(&mut self.stream);
-        Pin::new(&mut io).poll_shutdown(cx)
+        match &mut *self {
+            ConnectionStream::Plain(tcp) => {
+                let mut io = hyper_util::rt::TokioIo::new(tcp);
+                Pin::new(&mut io).poll_shutdown(cx)
+            }
+            ConnectionStream::Tls { stream, .. } => {
+                let mut io = hyper_util::rt::TokioIo::new(stream);
+                Pin::new(&mut io).poll_shutdown(cx)
+            }
+        }
     }
 }
 
-impl hyper_util::client::legacy::connect::Connection for SslStreamWrapper {
+impl hyper_util::client::legacy::connect::Connection for ConnectionStream {
     fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
         let mut connected = hyper_util::client::legacy::connect::Connected::new();
-        if self.alpn_h2 {
+        if let ConnectionStream::Tls { alpn_h2: true, .. } = self {
             connected = connected.negotiated_h2();
         }
         connected
     }
 }
 
-impl Unpin for SslStreamWrapper {}
+impl Unpin for ConnectionStream {}
 
 impl tower_service::Service<http::Uri> for OpenSslConnector {
-    type Response = SslStreamWrapper;
+    type Response = ConnectionStream;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -263,11 +336,9 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
             let tcp = http_fut.await?;
             let tcp_stream = tcp.into_inner();
 
-            // Plain HTTP — no TLS handshake needed
+            // Plain HTTP — return raw TCP stream, no TLS handshake
             if !is_https {
-                // Return a "plain" connection — but our type expects SslStream.
-                // For now, all connections go through TLS. HTTP/plain will need
-                // a different connector type (future work).
+                return Ok(ConnectionStream::Plain(tcp_stream));
             }
 
             let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
@@ -293,15 +364,23 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
             // Check if HTTP/2 was negotiated via ALPN
             let alpn_h2 = stream.ssl().selected_alpn_protocol() == Some(b"h2");
 
-            Ok(SslStreamWrapper { stream, alpn_h2 })
+            Ok(ConnectionStream::Tls { stream, alpn_h2 })
         })
     }
 }
 
 // ── Client types and pooling ──────────────────────────────────────
+//
+// HTTP proxy modes:
+// - Forward proxy (HTTP targets): connect to proxy, send absolute-form URI
+//   `GET http://target/path HTTP/1.1`. Uses raw http1::SendRequest to bypass
+//   hyper Client's URI normalization (which strips scheme+authority).
+// - CONNECT tunnel (HTTPS targets): proxy opens a raw TCP tunnel via CONNECT.
+//   Uses hyper_util's Tunnel connector.
+// - SOCKS5: works for both HTTP and HTTPS targets.
 
 type DirectClient = Client<OpenSslConnector, FullBody>;
-type HttpProxyClient = Client<
+type TunnelProxyClient = Client<
     hyper_util::client::legacy::connect::proxy::Tunnel<OpenSslConnector>,
     FullBody,
 >;
@@ -321,14 +400,28 @@ struct CachedClient {
 #[derive(Clone)]
 enum AnyClient {
     Direct(DirectClient),
-    HttpProxy(HttpProxyClient),
+    Tunnel(TunnelProxyClient),
     Socks5(Socks5ProxyClient),
 }
 
+/// Which connection mode to use for a given request.
+#[derive(Clone, Hash, Eq, PartialEq)]
+enum ConnMode {
+    /// No proxy — connect directly to target.
+    Direct,
+    /// HTTP proxy + HTTP target — forward proxy (absolute-form URI to proxy).
+    ForwardProxy(String),
+    /// HTTP proxy + HTTPS target — CONNECT tunnel through proxy.
+    Tunnel(String),
+    /// SOCKS5 proxy — works for both HTTP and HTTPS targets.
+    Socks5(String),
+}
+
 pub struct HyperClient {
-    // Cached hyper client — built on first send(), reused for all subsequent calls.
-    // Mutex<Option<>> for lazy initialization (first request builds it).
-    cached: Mutex<Option<CachedClient>>,
+    // Clients cached by connection mode. A scan using an HTTP proxy may need
+    // both a ForwardProxy client (for HTTP targets) and a Tunnel client (for
+    // HTTPS targets), so we cache per-mode rather than a single client.
+    cached: Mutex<std::collections::HashMap<ConnMode, CachedClient>>,
 }
 
 impl Default for HyperClient {
@@ -340,17 +433,44 @@ impl Default for HyperClient {
 impl HyperClient {
     pub fn new() -> Self {
         HyperClient {
-            cached: Mutex::new(None),
+            cached: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// Get or build the cached client. First call builds it from config,
-    /// subsequent calls return a clone (same connection pool).
-    fn get_or_build(&self, config: &RequestConfig) -> Result<CachedClient, ClientError> {
+    /// Determine the connection mode for a given request config + target URI.
+    fn conn_mode(config: &RequestConfig, target_uri: &http::Uri) -> Result<ConnMode, ClientError> {
+        match config.proxy.as_deref() {
+            None => Ok(ConnMode::Direct),
+            Some(proxy_url) => {
+                let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+                    ClientError::invalid_url(format!("invalid proxy URL: {}", e))
+                })?;
+                let proxy_scheme = proxy_uri.scheme_str().unwrap_or("");
+                match proxy_scheme {
+                    "http" | "https" => {
+                        // HTTP proxy: use forward proxy for HTTP targets, tunnel for HTTPS
+                        let target_is_https = target_uri.scheme_str() == Some("https");
+                        if target_is_https {
+                            Ok(ConnMode::Tunnel(proxy_url.to_string()))
+                        } else {
+                            Ok(ConnMode::ForwardProxy(proxy_url.to_string()))
+                        }
+                    }
+                    "socks5" | "socks5h" => Ok(ConnMode::Socks5(proxy_url.to_string())),
+                    _ => Err(ClientError::other(
+                        format!("unsupported proxy scheme '{}' (use http, https, socks5)", proxy_scheme),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Get or build a cached client for the given connection mode.
+    fn get_or_build(&self, config: &RequestConfig, mode: &ConnMode) -> Result<CachedClient, ClientError> {
         let mut guard = self.cached.lock()
             .map_err(|_| ClientError::other("client lock poisoned".to_string()))?;
 
-        if let Some(cached) = &*guard {
+        if let Some(cached) = guard.get(mode) {
             return Ok(cached.clone());
         }
 
@@ -358,35 +478,34 @@ impl HyperClient {
         let connector = OpenSslConnector::new(config, cert_slot.clone())?;
         let builder = Client::builder(TokioExecutor::new());
 
-        let inner = match config.proxy.as_deref() {
-            None => AnyClient::Direct(builder.build(connector)),
-            Some(proxy_url) => {
+        let inner = match mode {
+            ConnMode::Direct => AnyClient::Direct(builder.build(connector)),
+            ConnMode::ForwardProxy(_) => {
+                // Forward proxy doesn't use a cached hyper Client — it dispatches
+                // directly via http1::SendRequest in send_inner. This branch should
+                // never be reached.
+                unreachable!("ForwardProxy uses dispatch_forward_proxy, not get_or_build")
+            }
+            ConnMode::Tunnel(proxy_url) => {
                 let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
                     ClientError::invalid_url(format!("invalid proxy URL: {}", e))
                 })?;
-
-                let scheme = proxy_uri.scheme_str().unwrap_or("");
-
-                match scheme {
-                    "http" | "https" => {
-                        use hyper_util::client::legacy::connect::proxy::Tunnel;
-                        let tunnel = Tunnel::new(proxy_uri, connector);
-                        AnyClient::HttpProxy(builder.build(tunnel))
-                    }
-                    "socks5" | "socks5h" => {
-                        use hyper_util::client::legacy::connect::proxy::SocksV5;
-                        let socks = SocksV5::new(proxy_uri, connector);
-                        AnyClient::Socks5(builder.build(socks))
-                    }
-                    _ => return Err(ClientError::other(
-                        format!("unsupported proxy scheme '{}' (use http, https, socks5)", scheme),
-                    )),
-                }
+                use hyper_util::client::legacy::connect::proxy::Tunnel;
+                let tunnel = Tunnel::new(proxy_uri, connector);
+                AnyClient::Tunnel(builder.build(tunnel))
+            }
+            ConnMode::Socks5(proxy_url) => {
+                let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+                    ClientError::invalid_url(format!("invalid proxy URL: {}", e))
+                })?;
+                use hyper_util::client::legacy::connect::proxy::SocksV5;
+                let socks = SocksV5::new(proxy_uri, connector);
+                AnyClient::Socks5(builder.build(socks))
             }
         };
 
         let cached = CachedClient { inner, cert_slot };
-        *guard = Some(cached.clone());
+        guard.insert(mode.clone(), cached.clone());
         Ok(cached)
     }
 }
@@ -410,7 +529,7 @@ async fn dispatch_request(
 
     let hyper_response = match client {
         AnyClient::Direct(c) => c.request(request).await,
-        AnyClient::HttpProxy(c) => c.request(request).await,
+        AnyClient::Tunnel(c) => c.request(request).await,
         AnyClient::Socks5(c) => c.request(request).await,
     }.map_err(|e| {
         let msg = format!("request failed: {}", e);
@@ -425,15 +544,85 @@ async fn dispatch_request(
     parse_response(hyper_response, config, log).await
 }
 
+/// Forward proxy dispatch: connect to proxy via TCP, send request with
+/// absolute-form URI (e.g. `GET http://target/path HTTP/1.1`).
+///
+/// Uses hyper's low-level http1::SendRequest instead of Client, because
+/// Client normalizes URIs to origin form (stripping scheme+authority).
+async fn dispatch_forward_proxy(
+    proxy_url: &str,
+    target_uri: &http::Uri,
+    config: &RequestConfig,
+    log: &DebugLog,
+) -> Result<SingleResponse, ClientError> {
+    let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+        ClientError::invalid_url(format!("invalid proxy URL: {}", e))
+    })?;
+    let proxy_host = proxy_uri.host().ok_or_else(|| {
+        ClientError::other("proxy URL has no host".to_string())
+    })?;
+    let proxy_port = proxy_uri.port_u16().unwrap_or(8080);
+    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+
+    debug_record(log, config.verbosity, 1, &format!(
+        "   Forward proxy: connecting to {}", proxy_addr,
+    ));
+
+    // TCP connect to the proxy
+    let tcp = tokio::net::TcpStream::connect(&proxy_addr).await.map_err(|e| {
+        ClientError::connection(format!("failed to connect to proxy {}: {}", proxy_addr, e))
+    })?;
+    let io = hyper_util::rt::TokioIo::new(tcp);
+
+    // HTTP/1.1 handshake — gives us a SendRequest that preserves the URI as-is
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.map_err(|e| {
+        ClientError::connection(format!("proxy handshake failed: {}", e))
+    })?;
+
+    // Drive the connection in the background
+    tokio::spawn(async move { let _ = conn.await; });
+
+    // Build request with absolute-form URI (SendRequest does NOT normalize it)
+    let request = build_request(target_uri, config)?;
+    let v = config.verbosity;
+
+    debug_record(log, v, 1, "   Request headers:");
+    for (name, value) in request.headers() {
+        debug_record(log, v, 1, &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")));
+    }
+    debug_record(log, v, 1, "   Sending request via forward proxy...");
+
+    let hyper_response = sender.send_request(request).await.map_err(|e| {
+        let msg = format!("forward proxy request failed: {}", e);
+        ClientError::connection(msg)
+    })?;
+
+    parse_response(hyper_response, config, log).await
+}
+
 fn build_request(
     uri: &http::Uri,
     config: &RequestConfig,
 ) -> Result<hyper::Request<FullBody>, ClientError> {
     let mut builder = hyper::Request::builder()
         .method(config.method())
-        .uri(uri)
-        .header("User-Agent", "blasthttp/0.1.0")
-        .header("Accept-Encoding", "gzip, deflate, br");
+        .uri(uri);
+
+    // Check if custom headers include User-Agent and Accept-Encoding
+    let has_custom_ua = config.headers.as_ref()
+        .map(|h| h.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")))
+        .unwrap_or(false);
+    let has_custom_ae = config.headers.as_ref()
+        .map(|h| h.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding")))
+        .unwrap_or(false);
+
+    // Only add defaults if not overridden by caller
+    if !has_custom_ua {
+        builder = builder.header("User-Agent", "blasthttp/0.1.0");
+    }
+    if !has_custom_ae {
+        builder = builder.header("Accept-Encoding", "gzip, deflate, br");
+    }
 
     if let Some(ref custom_headers) = config.headers {
         for (name, value) in custom_headers {
@@ -505,7 +694,8 @@ fn is_redirect(status: u16) -> bool {
 }
 
 fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, ClientError> {
-    if let Ok(uri) = location.parse::<http::Uri>()
+    let sanitized = sanitize_uri(location);
+    if let Ok(uri) = sanitized.parse::<http::Uri>()
         && uri.scheme().is_some()
     {
         return Ok(uri);
@@ -517,7 +707,7 @@ fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, Cl
             format!("no authority in current URL to resolve relative redirect: {}", location),
         ))?;
 
-    let absolute = format!("{}://{}{}", scheme, authority, location);
+    let absolute = format!("{}://{}{}", scheme, authority, sanitized);
     absolute.parse().map_err(|e: http::uri::InvalidUri| ClientError::invalid_url(
         format!("invalid redirect URL '{}': {}", absolute, e),
     ))
@@ -593,7 +783,8 @@ impl HyperClient {
         let v = config.verbosity;
         let start = Instant::now();
 
-        let mut uri: http::Uri = config.url.parse()
+        let sanitized_url = sanitize_uri(&config.url);
+        let mut uri: http::Uri = sanitized_url.parse()
             .map_err(|e: http::uri::InvalidUri| ClientError::invalid_url(format!("invalid URL: {}", e)))?;
 
         debug_record(log, v, 1, &format!("-> {} {}", config.method(), uri));
@@ -613,12 +804,33 @@ impl HyperClient {
             debug_record(log, v, 1, &format!("   Max TLS: {}", max_ver));
         }
 
-        let cached = self.get_or_build(config)?;
+        let mode = Self::conn_mode(config, &uri)?;
+
+        // Forward proxy: dispatch directly via TCP + http1::SendRequest
+        // (bypasses hyper Client's URI normalization to preserve absolute-form)
+        let is_forward_proxy = matches!(&mode, ConnMode::ForwardProxy(_));
+        let proxy_url_for_fwd = if let ConnMode::ForwardProxy(ref url) = mode {
+            Some(url.clone())
+        } else {
+            None
+        };
+
+        // For non-forward-proxy modes, get the cached hyper Client
+        let cached = if is_forward_proxy {
+            None
+        } else {
+            Some(self.get_or_build(config, &mode)?)
+        };
+
         let mut redirect_chain: Vec<RedirectHop> = Vec::new();
         let mut hops = 0u32;
 
         loop {
-            let resp = dispatch_request(&cached.inner, &uri, config, log).await?;
+            let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
+                dispatch_forward_proxy(proxy_url, &uri, config, log).await?
+            } else {
+                dispatch_request(&cached.as_ref().unwrap().inner, &uri, config, log).await?
+            };
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
@@ -650,8 +862,8 @@ impl HyperClient {
             let body = String::from_utf8(resp.body_bytes.clone())
                 .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
 
-            let cert_info = cached.cert_slot.lock()
-                .ok()
+            let cert_info = cached.as_ref()
+                .and_then(|c| c.cert_slot.lock().ok())
                 .and_then(|guard| guard.clone());
 
             let elapsed_ms = start.elapsed().as_millis() as u64;

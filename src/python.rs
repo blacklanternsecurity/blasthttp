@@ -230,10 +230,12 @@ impl BlastHTTP {
         retries=None,
         retry_wait_min_ms=None,
         retry_wait_max_ms=None,
+        max_body_size=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn request(
         &self,
+        py: Python<'_>,
         url: String,
         method: Option<String>,
         headers: Option<Vec<(String, String)>>,
@@ -249,6 +251,7 @@ impl BlastHTTP {
         retries: Option<u32>,
         retry_wait_min_ms: Option<u64>,
         retry_wait_max_ms: Option<u64>,
+        max_body_size: Option<usize>,
     ) -> PyResult<PyResponse> {
         let config = RequestConfig {
             url,
@@ -256,7 +259,7 @@ impl BlastHTTP {
             headers,
             body,
             timeout_seconds: timeout,
-            max_body_size: None,
+            max_body_size,
             follow_redirects,
             max_redirects,
             verify_certs,
@@ -270,8 +273,12 @@ impl BlastHTTP {
             verbosity: 0,
         };
 
-        let response = self.runtime.block_on(self.client.send(&config))
-            .map_err(|e| PyRuntimeError::new_err(e.message))?;
+        // Release the GIL during block_on so Python threads (e.g. test httpservers)
+        // can run while we wait for the Rust async runtime.
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(self.client.send(&config))
+                .map_err(|e| PyRuntimeError::new_err(e.message))
+        })?;
 
         Ok(PyResponse { inner: response })
     }
@@ -282,6 +289,7 @@ impl BlastHTTP {
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch(
         &self,
+        py: Python<'_>,
         configs: Vec<PyBatchConfig>,
         concurrency: usize,
         rate_limit: Option<f64>,
@@ -290,9 +298,11 @@ impl BlastHTTP {
             .map(|c| c.into_request_config())
             .collect();
 
-        let results = self.runtime.block_on(
-            batch::send_batch(self.client.clone(), request_configs, concurrency, rate_limit)
-        );
+        let results = py.allow_threads(|| {
+            self.runtime.block_on(
+                batch::send_batch(self.client.clone(), request_configs, concurrency, rate_limit)
+            )
+        });
 
         Ok(results.into_iter().map(|r| {
             let (response, error) = match r.result {
@@ -319,6 +329,7 @@ impl BlastHTTP {
     #[allow(clippy::too_many_arguments)]
     fn download(
         &self,
+        py: Python<'_>,
         url: String,
         path: String,
         max_size: Option<usize>,
@@ -348,8 +359,10 @@ impl BlastHTTP {
             verbosity: 0,
         };
 
-        let response = self.runtime.block_on(self.client.send(&config))
-            .map_err(|e| PyRuntimeError::new_err(e.message))?;
+        let response = py.allow_threads(|| {
+            self.runtime.block_on(self.client.send(&config))
+                .map_err(|e| PyRuntimeError::new_err(e.message))
+        })?;
 
         // Write body bytes to file
         let mut file = std::fs::File::create(&path)

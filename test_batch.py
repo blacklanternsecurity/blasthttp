@@ -2,6 +2,8 @@
 import blasthttp
 import time
 
+ROUNDS = 10
+
 client = blasthttp.BlastHTTP()
 
 configs = [
@@ -9,28 +11,40 @@ configs = [
     blasthttp.BatchConfig("https://httpbin.org/get"),
     blasthttp.BatchConfig("https://www.google.com"),
     blasthttp.BatchConfig("https://example.org"),
+    blasthttp.BatchConfig("https://www.blacklanternsecurity.com"),
+    blasthttp.BatchConfig("https://blog.blacklanternsecurity.com"),
+    blasthttp.BatchConfig("https://www.google.com"),
 ]
 
-print(f"Sending {len(configs)} requests in batch...")
-start = time.time()
-results = client.request_batch(configs)
-elapsed = time.time() - start
+batch_times = []
+seq_times = []
 
-print(f"Got {len(results)} results in {elapsed:.2f}s\n")
+for i in range(ROUNDS):
+    # Batch
+    start = time.time()
+    results = client.request_batch(configs)
+    batch_elapsed = time.time() - start
+    batch_times.append(batch_elapsed)
 
-for r in results:
-    if r.success:
-        print(f"  {r.response.status} {r.url} ({r.response.elapsed_ms}ms)")
-    else:
-        print(f"  ERROR {r.url}: {r.error}")
+    errors = [r for r in results if not r.success]
 
-# Compare with sequential
-print(f"\nSending {len(configs)} requests sequentially...")
-start = time.time()
-for cfg in configs:
-    client.request(cfg.url)
-elapsed_seq = time.time() - start
+    # Sequential
+    start = time.time()
+    for cfg in configs:
+        client.request(cfg.url)
+    seq_elapsed = time.time() - start
+    seq_times.append(seq_elapsed)
 
-print(f"Sequential: {elapsed_seq:.2f}s")
-print(f"Batch:      {elapsed:.2f}s")
-print(f"Speedup:    {elapsed_seq / elapsed:.1f}x")
+    speedup = seq_elapsed / batch_elapsed if batch_elapsed > 0 else float("inf")
+    print(f"  Round {i+1:2d}: batch={batch_elapsed:.3f}s  seq={seq_elapsed:.3f}s  speedup={speedup:.1f}x  errors={len(errors)}")
+
+avg_batch = sum(batch_times) / ROUNDS
+avg_seq = sum(seq_times) / ROUNDS
+avg_speedup = avg_seq / avg_batch if avg_batch > 0 else float("inf")
+
+print(f"\n{'='*60}")
+print(f"  {ROUNDS} rounds × {len(configs)} requests")
+print(f"  Avg batch:      {avg_batch:.3f}s")
+print(f"  Avg sequential: {avg_seq:.3f}s")
+print(f"  Avg speedup:    {avg_speedup:.1f}x")
+print(f"{'='*60}")

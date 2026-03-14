@@ -1,2 +1,19 @@
 /target
+/dist
+
+# Vendored OpenSSL source + build artifacts
 /vendor/openssl/
+
+# OpenSSL build artifacts that leak into the project root
+/apps/
+/crypto/
+/doc/
+/engines/
+/exporters/
+/fuzz/
+/include/
+/providers/
+/ssl/
+/test/
+/tools/
+/util/
