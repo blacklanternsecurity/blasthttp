@@ -544,6 +544,138 @@ async fn dispatch_request(
     parse_response(hyper_response, config, log).await
 }
 
+/// Raw dispatch for requests needing resolve_ip and/or request_target.
+///
+/// Opens a fresh TCP connection (optionally to a resolved IP instead of DNS),
+/// performs TLS if HTTPS (with SNI set to the original hostname), then sends
+/// the request via HTTP/1.1. If request_target is set, it overrides the URI
+/// in the request line.
+///
+/// This bypasses the cached HyperClient connection pool — fine for low-volume
+/// specialized requests (host_header, generic_ssrf, virtualhost discovery).
+async fn dispatch_raw(
+    target_uri: &http::Uri,
+    config: &RequestConfig,
+    log: &DebugLog,
+) -> Result<(SingleResponse, Option<CertInfo>), ClientError> {
+    let v = config.verbosity;
+    let host = target_uri.host().unwrap_or("").to_string();
+    let is_https = target_uri.scheme_str() == Some("https");
+    let default_port = if is_https { 443 } else { 80 };
+    let port = target_uri.port_u16().unwrap_or(default_port);
+
+    // Determine TCP connect address
+    let connect_addr = if let Some(ref ip) = config.resolve_ip {
+        format!("{}:{}", ip, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
+
+    debug_record(log, v, 1, &format!(
+        "   dispatch_raw: connecting to {} (host={})", connect_addr, host,
+    ));
+
+    let tcp = tokio::net::TcpStream::connect(&connect_addr).await.map_err(|e| {
+        ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
+    })?;
+
+    let mut cert_info: Option<CertInfo> = None;
+
+    let io: hyper_util::rt::TokioIo<Box<dyn IoReadWrite + Send + Unpin>> = if is_https {
+        // TLS handshake with SNI set to the original hostname
+        ensure_legacy_provider();
+
+        let mut ssl_builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
+            .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
+
+        ssl_builder.set_security_level(0);
+
+        if !config.should_verify_certs() {
+            ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+        }
+        if let Some(ref ciphers) = config.cipher_string {
+            ssl_builder.set_cipher_list(ciphers)
+                .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
+        }
+        if let Some(ref min_ver) = config.min_tls_version {
+            let version = parse_tls_version(min_ver)?;
+            ssl_builder.set_min_proto_version(Some(version))
+                .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
+        }
+        if let Some(ref max_ver) = config.max_tls_version {
+            let version = parse_tls_version(max_ver)?;
+            ssl_builder.set_max_proto_version(Some(version))
+                .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
+        }
+        // HTTP/1.1 only for raw dispatch (request_target doesn't apply to h2)
+        ssl_builder.set_alpn_protos(b"\x08http/1.1")
+            .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
+
+        let ssl_connector = ssl_builder.build();
+        let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
+            .map_err(|e| ClientError::tls(format!("SSL conf failed: {}", e)))?;
+
+        // SNI = original hostname, NOT the resolved IP
+        if host.parse::<std::net::IpAddr>().is_err() {
+            ssl_conf.set_hostname(&host)
+                .map_err(|e| ClientError::tls(format!("SNI setup failed: {}", e)))?;
+        }
+
+        let mut tls_stream = tokio_openssl::SslStream::new(ssl_conf, tcp)
+            .map_err(|e| ClientError::tls(format!("TLS stream setup failed: {}", e)))?;
+
+        Pin::new(&mut tls_stream).connect().await
+            .map_err(|e| ClientError::tls(format!("TLS handshake failed: {}", e)))?;
+
+        cert_info = extract_cert_info(tls_stream.ssl());
+
+        hyper_util::rt::TokioIo::new(Box::new(tls_stream) as Box<dyn IoReadWrite + Send + Unpin>)
+    } else {
+        hyper_util::rt::TokioIo::new(Box::new(tcp) as Box<dyn IoReadWrite + Send + Unpin>)
+    };
+
+    // HTTP/1.1 handshake
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.map_err(|e| {
+        ClientError::connection(format!("HTTP handshake failed: {}", e))
+    })?;
+    tokio::spawn(async move { let _ = conn.await; });
+
+    // Build request — use request_target as URI if set, otherwise use target_uri
+    let request_uri = if let Some(ref rt) = config.request_target {
+        rt.parse::<http::Uri>().map_err(|e: http::uri::InvalidUri| {
+            ClientError::invalid_url(format!("invalid request_target '{}': {}", rt, e))
+        })?
+    } else {
+        target_uri.clone()
+    };
+
+    let request = build_request(&request_uri, config)?;
+
+    debug_record(log, v, 1, "   Request headers:");
+    for (name, value) in request.headers() {
+        debug_record(log, v, 1, &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")));
+    }
+    debug_record(log, v, 1, "   Sending request via dispatch_raw...");
+
+    let hyper_response = sender.send_request(request).await.map_err(|e| {
+        let msg = format!("dispatch_raw request failed: {}", e);
+        let err_str = e.to_string().to_lowercase();
+        if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
+            ClientError::tls(msg)
+        } else {
+            ClientError::connection(msg)
+        }
+    })?;
+
+    let resp = parse_response(hyper_response, config, log).await?;
+    Ok((resp, cert_info))
+}
+
+/// Trait alias for streams usable in dispatch_raw (both TcpStream and SslStream).
+trait IoReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+impl IoReadWrite for tokio::net::TcpStream {}
+impl IoReadWrite for tokio_openssl::SslStream<tokio::net::TcpStream> {}
+
 /// Forward proxy dispatch: connect to proxy via TCP, send request with
 /// absolute-form URI (e.g. `GET http://target/path HTTP/1.1`).
 ///
@@ -802,6 +934,46 @@ impl HyperClient {
         }
         if let Some(ref max_ver) = config.max_tls_version {
             debug_record(log, v, 1, &format!("   Max TLS: {}", max_ver));
+        }
+        if let Some(ref resolve_ip) = config.resolve_ip {
+            debug_record(log, v, 1, &format!("   Resolve IP: {}", resolve_ip));
+        }
+        if let Some(ref rt) = config.request_target {
+            debug_record(log, v, 1, &format!("   Request target: {}", rt));
+        }
+
+        // dispatch_raw: used when resolve_ip or request_target is set.
+        // Bypasses the cached connection pool — opens a fresh TCP connection.
+        if config.resolve_ip.is_some() || config.request_target.is_some() {
+            let redirect_chain: Vec<RedirectHop> = Vec::new();
+            let (resp, cert_info) = dispatch_raw(&uri, config, log).await?;
+            let hop_ms = start.elapsed().as_millis();
+            debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
+
+            // No redirect following for dispatch_raw — these are specialized
+            // requests (host_header, SSRF) that need exact control.
+            let body = String::from_utf8(resp.body_bytes.clone())
+                .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let hash = crate::response::ResponseHash::compute(&resp.body_bytes, &resp.headers);
+
+            let debug_log = log.lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+
+            return Ok(Response {
+                url: uri.to_string(),
+                status: resp.status,
+                headers: resp.headers,
+                body_bytes: resp.body_bytes,
+                body,
+                elapsed_ms,
+                redirect_chain,
+                cert_info,
+                hash,
+                debug_log,
+            });
         }
 
         let mode = Self::conn_mode(config, &uri)?;

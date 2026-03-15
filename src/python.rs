@@ -231,6 +231,9 @@ impl BlastHTTP {
         retry_wait_min_ms=None,
         retry_wait_max_ms=None,
         max_body_size=None,
+        raw_path=None,
+        request_target=None,
+        resolve_ip=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn request(
@@ -252,6 +255,9 @@ impl BlastHTTP {
         retry_wait_min_ms: Option<u64>,
         retry_wait_max_ms: Option<u64>,
         max_body_size: Option<usize>,
+        raw_path: Option<bool>,
+        request_target: Option<String>,
+        resolve_ip: Option<String>,
     ) -> PyResult<PyResponse> {
         let config = RequestConfig {
             url,
@@ -270,6 +276,9 @@ impl BlastHTTP {
             retries,
             retry_wait_min_ms,
             retry_wait_max_ms,
+            raw_path,
+            request_target,
+            resolve_ip,
             verbosity: 0,
         };
 
@@ -356,6 +365,9 @@ impl BlastHTTP {
             retries,
             retry_wait_min_ms: None,
             retry_wait_max_ms: None,
+            raw_path: None,
+            request_target: None,
+            resolve_ip: None,
             verbosity: 0,
         };
 
@@ -411,6 +423,12 @@ struct PyBatchConfig {
     retry_wait_min_ms: Option<u64>,
     #[pyo3(get, set)]
     retry_wait_max_ms: Option<u64>,
+    #[pyo3(get, set)]
+    raw_path: Option<bool>,
+    #[pyo3(get, set)]
+    request_target: Option<String>,
+    #[pyo3(get, set)]
+    resolve_ip: Option<String>,
 }
 
 #[pymethods]
@@ -432,6 +450,9 @@ impl PyBatchConfig {
         retries=None,
         retry_wait_min_ms=None,
         retry_wait_max_ms=None,
+        raw_path=None,
+        request_target=None,
+        resolve_ip=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -450,12 +471,16 @@ impl PyBatchConfig {
         retries: Option<u32>,
         retry_wait_min_ms: Option<u64>,
         retry_wait_max_ms: Option<u64>,
+        raw_path: Option<bool>,
+        request_target: Option<String>,
+        resolve_ip: Option<String>,
     ) -> Self {
         PyBatchConfig {
             url, method, headers, body, timeout,
             follow_redirects, max_redirects, verify_certs,
             proxy, cipher_string, min_tls_version, max_tls_version,
             retries, retry_wait_min_ms, retry_wait_max_ms,
+            raw_path, request_target, resolve_ip,
         }
     }
 }
@@ -479,6 +504,9 @@ impl PyBatchConfig {
             retries: self.retries,
             retry_wait_min_ms: self.retry_wait_min_ms,
             retry_wait_max_ms: self.retry_wait_max_ms,
+            raw_path: self.raw_path,
+            request_target: self.request_target,
+            resolve_ip: self.resolve_ip,
             verbosity: 0,
         }
     }

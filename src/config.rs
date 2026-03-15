@@ -21,6 +21,14 @@ pub struct RequestConfig {
     pub retry_wait_min_ms: Option<u64>,
     /// Maximum backoff between retries in milliseconds (default: 30000)
     pub retry_wait_max_ms: Option<u64>,
+    /// No-op — paths are already sent raw. Kept for API compat with curl --path-as-is.
+    pub raw_path: Option<bool>,
+    /// Override the HTTP request-line target (like curl --request-target).
+    /// Only applies to HTTP/1.1. Bypasses the cached connection pool.
+    pub request_target: Option<String>,
+    /// Connect TCP to this IP instead of resolving the hostname via DNS
+    /// (like curl --resolve). SNI is still set to the original hostname.
+    pub resolve_ip: Option<String>,
     #[serde(default)]
     pub verbosity: u8,
 }
@@ -44,6 +52,9 @@ impl RequestConfig {
             retries: None,
             retry_wait_min_ms: None,
             retry_wait_max_ms: None,
+            raw_path: None,
+            request_target: None,
+            resolve_ip: None,
             verbosity: 0,
         }
     }
