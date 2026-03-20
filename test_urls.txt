@@ -1,5 +1,0 @@
-# Test URLs for batch mode
-https://example.com
-https://httpbin.org/get
-https://example.org
-https://www.google.com
