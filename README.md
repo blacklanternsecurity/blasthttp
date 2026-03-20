@@ -12,6 +12,78 @@ Offensive-first HTTP library written in Rust with Python bindings. Built for [BB
 - **HTTP/2 support** — automatic via ALPN negotiation, falls back to HTTP/1.1
 - **Response hashing built-in** — MD5, SHA256, and MurmurHash3 computed in Rust for both body and headers, ready for fingerprinting
 
+## CLI Usage
+
+```bash
+# Single request
+blasthttp https://example.com
+
+# POST with headers and body
+blasthttp https://example.com -X POST -H "Content-Type: application/json" -d '{"key":"value"}'
+
+# Batch mode — read URLs from a file, 100 concurrent
+blasthttp -l urls.txt -c 100
+
+# Follow redirects
+blasthttp https://example.com -L
+
+# Through a proxy
+blasthttp https://example.com -x http://127.0.0.1:8080
+
+# Force specific TLS versions/ciphers
+blasthttp https://legacy-server.com --min-tls 1.0 --ciphers "RC4-SHA"
+
+# Verbose output (pretty JSON + debug info, -vv includes body)
+blasthttp https://example.com -v
+```
+
+Output is JSON (one object per response), including status, headers, redirect chain, TLS cert info, and content hashes:
+
+```json
+{
+  "url": "https://example.com",
+  "status": 200,
+  "headers": [["content-type", "text/html"], ...],
+  "elapsed_ms": 120,
+  "redirect_chain": [],
+  "cert_info": {
+    "common_name": "example.com",
+    "sans": ["example.com", "www.example.com"],
+    "issuer": "DigiCert Global G2",
+    "fingerprint_sha256": "a0b1c2..."
+  },
+  "hash": {
+    "body_md5": "...",
+    "body_mmh3": 1234567,
+    "body_sha256": "...",
+    "header_md5": "...",
+    "header_mmh3": -987654,
+    "header_sha256": "..."
+  }
+}
+```
+
+### Options
+
+| Flag | Description | Default |
+|---|---|---|
+| `URL` | Target URL (omit when using `-l`) | |
+| `-X, --method` | HTTP method | `GET` |
+| `-H, --header` | Custom header (repeatable) | |
+| `-d, --data` | Request body | |
+| `-l, --list` | File of URLs for batch mode | |
+| `-c, --concurrency` | Max concurrent requests (batch) | `50` |
+| `-L, --follow-redirects` | Follow redirects | off |
+| `--max-redirects` | Max redirect hops | `10` |
+| `-t, --timeout` | Request timeout (seconds) | `10` |
+| `--max-body-size` | Max response body (bytes) | 10 MB |
+| `--verify` | Enable TLS cert validation | off |
+| `-x, --proxy` | HTTP/SOCKS proxy URL | |
+| `--ciphers` | OpenSSL cipher string | all |
+| `--min-tls` | Minimum TLS version (1.0–1.3) | |
+| `--max-tls` | Maximum TLS version (1.0–1.3) | |
+| `-v, --verbose` | Verbose output (-vv includes body) | |
+
 ## Building
 
 ### Prerequisites
