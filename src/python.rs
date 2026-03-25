@@ -11,7 +11,7 @@ use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
 use crate::config::RequestConfig;
 use crate::response::{Response, CertInfo, ResponseHash, RedirectHop};
-use crate::batch;
+use crate::batch::{self, RateLimiter};
 
 use std::io::Write;
 
@@ -198,6 +198,7 @@ impl PyBatchResult {
 struct BlastHTTP {
     client: Arc<HyperClient>,
     runtime: Arc<tokio::runtime::Runtime>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 #[pymethods]
@@ -210,7 +211,18 @@ impl BlastHTTP {
         Ok(BlastHTTP {
             client: Arc::new(HyperClient::new()),
             runtime: Arc::new(runtime),
+            rate_limiter: None,
         })
+    }
+
+    /// Set a global rate limit (requests per second) for this client.
+    /// Applies to both request() and request_batch().
+    /// Set to 0 or None to disable.
+    #[pyo3(signature = (rate_limit=None))]
+    fn set_rate_limit(&mut self, rate_limit: Option<f64>) {
+        self.rate_limiter = rate_limit
+            .filter(|&r| r > 0.0)
+            .map(|r| Arc::new(RateLimiter::new(r)));
     }
 
     /// Send a single HTTP request. Returns a Response object.
@@ -284,9 +296,16 @@ impl BlastHTTP {
 
         // Release the GIL during block_on so Python threads (e.g. test httpservers)
         // can run while we wait for the Rust async runtime.
+        let limiter = self.rate_limiter.clone();
+        let client = self.client.clone();
         let response = py.allow_threads(|| {
-            self.runtime.block_on(self.client.send(&config))
-                .map_err(|e| PyRuntimeError::new_err(e.message))
+            self.runtime.block_on(async move {
+                if let Some(ref limiter) = limiter {
+                    limiter.acquire().await;
+                }
+                client.send(&config).await
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.message))
         })?;
 
         Ok(PyResponse { inner: response })
@@ -294,7 +313,8 @@ impl BlastHTTP {
 
     /// Send a batch of requests concurrently. Returns list of BatchResult objects.
     /// Each result has .url, .response (or None), and .error (or None).
-    /// rate_limit: max requests per second (None = unlimited)
+    /// rate_limit: max requests per second (None = unlimited).
+    /// If set_rate_limit() was called on this client, that takes precedence.
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch(
         &self,
@@ -307,9 +327,10 @@ impl BlastHTTP {
             .map(|c| c.into_request_config())
             .collect();
 
+        let shared_limiter = self.rate_limiter.clone();
         let results = py.allow_threads(|| {
             self.runtime.block_on(
-                batch::send_batch(self.client.clone(), request_configs, concurrency, rate_limit)
+                batch::send_batch(self.client.clone(), request_configs, concurrency, rate_limit, shared_limiter)
             )
         });
 
@@ -371,9 +392,16 @@ impl BlastHTTP {
             verbosity: 0,
         };
 
+        let limiter = self.rate_limiter.clone();
+        let client = self.client.clone();
         let response = py.allow_threads(|| {
-            self.runtime.block_on(self.client.send(&config))
-                .map_err(|e| PyRuntimeError::new_err(e.message))
+            self.runtime.block_on(async move {
+                if let Some(ref limiter) = limiter {
+                    limiter.acquire().await;
+                }
+                client.send(&config).await
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.message))
         })?;
 
         // Write body bytes to file
