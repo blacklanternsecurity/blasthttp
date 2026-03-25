@@ -544,6 +544,7 @@ impl PyBatchConfig {
 
 #[pymodule]
 fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<BlastHTTP>()?;
     m.add_class::<PyBatchConfig>()?;
     // Response types are returned by methods, but register them
