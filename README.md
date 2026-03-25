@@ -89,6 +89,9 @@ Output is JSON (one object per response), including status, headers, redirect ch
 ```python
 import blasthttp
 
+# Check version
+print(blasthttp.__version__)  # e.g. "0.1.0"
+
 client = blasthttp.BlastHTTP()
 
 # Single request
