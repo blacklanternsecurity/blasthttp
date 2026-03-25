@@ -84,6 +84,54 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `--max-tls` | Maximum TLS version (1.0–1.3) | |
 | `-v, --verbose` | Verbose output (-vv includes body) | |
 
+## Python API
+
+```python
+import blasthttp
+
+client = blasthttp.BlastHTTP()
+
+# Single request
+response = client.request("https://example.com")
+print(response.status, len(response.body))
+
+# Batch requests
+configs = [
+    {"url": "https://a.com"},
+    {"url": "https://b.com", "method": "POST", "body": "data"},
+]
+results = client.request_batch(configs, concurrency=50)
+for r in results:
+    if r.success:
+        print(r.url, r.response.status)
+
+# Download to file
+client.download("https://example.com/file.zip", "/tmp/file.zip")
+```
+
+### Global Rate Limiting
+
+Set a client-level rate limit (requests per second) that applies to **all** request methods — `request()`, `request_batch()`, and `download()`:
+
+```python
+client = blasthttp.BlastHTTP()
+client.set_rate_limit(50)  # 50 requests/sec across all callers
+
+# All of these respect the 50 rps limit:
+client.request("https://example.com")
+client.request_batch(configs, concurrency=100)
+client.download("https://example.com/file", "/tmp/file")
+
+# Disable rate limiting
+client.set_rate_limit(0)
+# or
+client.set_rate_limit(None)
+```
+
+When multiple callers share the same `BlastHTTP` instance, the rate limiter is global — two concurrent `request_batch()` calls will collectively stay under the limit.
+
+The client-level rate limit takes precedence over the per-call `rate_limit` parameter on `request_batch()`.
+
 ## Building
 
 ### Prerequisites
