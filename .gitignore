@@ -17,3 +17,7 @@
 /test/
 /tools/
 /util/
+test.py
+test_batch.py
+test_python_bindings.py
+test_urls.txt
