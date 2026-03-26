@@ -46,14 +46,19 @@ jobs:
       - name: Build custom OpenSSL
         run: ./scripts/build-openssl.sh
 
-      - name: Install maturin
-        run: pip install maturin
+      - name: Create virtualenv
+        run: python -m venv .venv
 
       - name: Build Python extension
-        run: maturin develop --release
+        run: |
+          source .venv/bin/activate
+          pip install maturin
+          maturin develop --release
 
       - name: Verify module
-        run: python -c "import blasthttp; print(f'blasthttp {blasthttp.__version__}')"
+        run: |
+          source .venv/bin/activate
+          python -c "import blasthttp; print(f'blasthttp {blasthttp.__version__}')"
 
   linux-build:
     needs: python-tests
