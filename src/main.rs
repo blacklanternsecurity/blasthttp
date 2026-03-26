@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use blasthttp::config::RequestConfig;
+use blasthttp::batch;
 use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
+use blasthttp::config::RequestConfig;
 use blasthttp::response::Response;
-use blasthttp::batch;
 use clap::Parser;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "blasthttp", about = "Offensive-first HTTP client")]
@@ -95,11 +95,7 @@ fn build_config(cli: &Cli, url: String) -> RequestConfig {
     config.method = Some(cli.method.clone());
 
     if !cli.headers.is_empty() {
-        config.headers = Some(
-            cli.headers.iter()
-                .filter_map(|h| parse_header(h))
-                .collect()
-        );
+        config.headers = Some(cli.headers.iter().filter_map(|h| parse_header(h)).collect());
     }
 
     config.body = cli.data.clone();
@@ -137,15 +133,13 @@ async fn run_single(cli: &Cli) {
     let client = HyperClient::new();
 
     match client.send(&config).await {
-        Ok(response) => {
-            match serialize_response(&response, cli.verbose) {
-                Ok(json) => println!("{}", json),
-                Err(e) => {
-                    eprintln!("Error serializing response: {}", e);
-                    std::process::exit(1);
-                }
+        Ok(response) => match serialize_response(&response, cli.verbose) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing response: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -173,9 +167,14 @@ async fn run_batch(cli: &Cli, file_path: &str) {
         std::process::exit(1);
     }
 
-    eprintln!("Sending {} requests (concurrency: {})...", urls.len(), cli.concurrency);
+    eprintln!(
+        "Sending {} requests (concurrency: {})...",
+        urls.len(),
+        cli.concurrency
+    );
 
-    let configs: Vec<RequestConfig> = urls.iter()
+    let configs: Vec<RequestConfig> = urls
+        .iter()
         .map(|url| build_config(cli, url.to_string()))
         .collect();
 

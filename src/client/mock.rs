@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use super::{ClientError, ErrorKind, HttpClient};
 use crate::config::RequestConfig;
 use crate::response::Response;
-use super::{HttpClient, ClientError, ErrorKind};
 
 pub struct MockClient {
     status: u16,

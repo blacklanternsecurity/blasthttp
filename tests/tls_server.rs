@@ -2,13 +2,13 @@
 // Accepts one connection, does TLS handshake, sends a hardcoded HTTP response,
 // then shuts down. Configurable cipher list and TLS version range.
 
-use openssl::ssl::{SslAcceptor, SslMethod, SslVersion, SslOptions};
-use openssl::pkey::PKey;
-use openssl::x509::X509;
-use openssl::rsa::Rsa;
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
 use openssl::hash::MessageDigest;
+use openssl::pkey::PKey;
+use openssl::rsa::Rsa;
+use openssl::ssl::{SslAcceptor, SslMethod, SslOptions, SslVersion};
+use openssl::x509::X509;
 use openssl::x509::extension::SubjectAlternativeName;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,7 +49,9 @@ fn generate_self_signed() -> (PKey<openssl::pkey::Private>, X509) {
     builder.set_version(2).unwrap();
 
     let serial = BigNum::from_u32(1).unwrap();
-    builder.set_serial_number(&serial.to_asn1_integer().unwrap()).unwrap();
+    builder
+        .set_serial_number(&serial.to_asn1_integer().unwrap())
+        .unwrap();
 
     let mut name = openssl::x509::X509NameBuilder::new().unwrap();
     name.append_entry_by_text("CN", "localhost").unwrap();
@@ -90,11 +92,22 @@ fn build_acceptor(config: &TlsServerConfig) -> SslAcceptor {
     builder.set_min_proto_version(None).unwrap();
     builder.set_max_proto_version(None).unwrap();
     // Remove any SSL options that might disable specific TLS versions
-    builder.clear_options(SslOptions::NO_TLSV1_3 | SslOptions::NO_TLSV1_2 | SslOptions::NO_TLSV1_1 | SslOptions::NO_TLSV1);
+    builder.clear_options(
+        SslOptions::NO_TLSV1_3
+            | SslOptions::NO_TLSV1_2
+            | SslOptions::NO_TLSV1_1
+            | SslOptions::NO_TLSV1,
+    );
     // Accept all ciphers by default
-    builder.set_cipher_list("ALL:COMPLEMENTOFALL:eNULL").unwrap();
+    builder
+        .set_cipher_list("ALL:COMPLEMENTOFALL:eNULL")
+        .unwrap();
     // TLS 1.3 ciphersuites are configured separately in OpenSSL 3.x
-    builder.set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256").unwrap();
+    builder
+        .set_ciphersuites(
+            "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
+        )
+        .unwrap();
 
     let (pkey, cert) = generate_self_signed();
     builder.set_private_key(&pkey).unwrap();

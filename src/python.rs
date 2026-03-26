@@ -3,15 +3,15 @@
 // Kept separate from Rust structs so the Python API can diverge freely
 // (e.g. complex request builders for Phase 4 raw byte control).
 
-use std::sync::Arc;
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use std::sync::Arc;
 
+use crate::batch::{self, RateLimiter};
 use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
 use crate::config::RequestConfig;
-use crate::response::{Response, CertInfo, ResponseHash, RedirectHop};
-use crate::batch::{self, RateLimiter};
+use crate::response::{CertInfo, RedirectHop, Response, ResponseHash};
 
 use std::io::Write;
 
@@ -25,17 +25,29 @@ struct PyResponseHash {
 #[pymethods]
 impl PyResponseHash {
     #[getter]
-    fn body_md5(&self) -> String { self.inner.body_md5.clone() }
+    fn body_md5(&self) -> String {
+        self.inner.body_md5.clone()
+    }
     #[getter]
-    fn body_mmh3(&self) -> i32 { self.inner.body_mmh3 }
+    fn body_mmh3(&self) -> i32 {
+        self.inner.body_mmh3
+    }
     #[getter]
-    fn body_sha256(&self) -> String { self.inner.body_sha256.clone() }
+    fn body_sha256(&self) -> String {
+        self.inner.body_sha256.clone()
+    }
     #[getter]
-    fn header_md5(&self) -> String { self.inner.header_md5.clone() }
+    fn header_md5(&self) -> String {
+        self.inner.header_md5.clone()
+    }
     #[getter]
-    fn header_mmh3(&self) -> i32 { self.inner.header_mmh3 }
+    fn header_mmh3(&self) -> i32 {
+        self.inner.header_mmh3
+    }
     #[getter]
-    fn header_sha256(&self) -> String { self.inner.header_sha256.clone() }
+    fn header_sha256(&self) -> String {
+        self.inner.header_sha256.clone()
+    }
 
     fn __repr__(&self) -> String {
         format!(
@@ -55,19 +67,33 @@ struct PyCertInfo {
 #[pymethods]
 impl PyCertInfo {
     #[getter]
-    fn common_name(&self) -> Option<String> { self.inner.common_name.clone() }
+    fn common_name(&self) -> Option<String> {
+        self.inner.common_name.clone()
+    }
     #[getter]
-    fn sans(&self) -> Vec<String> { self.inner.sans.clone() }
+    fn sans(&self) -> Vec<String> {
+        self.inner.sans.clone()
+    }
     #[getter]
-    fn emails(&self) -> Vec<String> { self.inner.emails.clone() }
+    fn emails(&self) -> Vec<String> {
+        self.inner.emails.clone()
+    }
     #[getter]
-    fn issuer(&self) -> Option<String> { self.inner.issuer.clone() }
+    fn issuer(&self) -> Option<String> {
+        self.inner.issuer.clone()
+    }
     #[getter]
-    fn not_before(&self) -> Option<String> { self.inner.not_before.clone() }
+    fn not_before(&self) -> Option<String> {
+        self.inner.not_before.clone()
+    }
     #[getter]
-    fn not_after(&self) -> Option<String> { self.inner.not_after.clone() }
+    fn not_after(&self) -> Option<String> {
+        self.inner.not_after.clone()
+    }
     #[getter]
-    fn fingerprint_sha256(&self) -> Option<String> { self.inner.fingerprint_sha256.clone() }
+    fn fingerprint_sha256(&self) -> Option<String> {
+        self.inner.fingerprint_sha256.clone()
+    }
 
     fn __repr__(&self) -> String {
         format!(
@@ -87,12 +113,19 @@ struct PyRedirectHop {
 #[pymethods]
 impl PyRedirectHop {
     #[getter]
-    fn url(&self) -> String { self.inner.url.clone() }
+    fn url(&self) -> String {
+        self.inner.url.clone()
+    }
     #[getter]
-    fn status(&self) -> u16 { self.inner.status }
+    fn status(&self) -> u16 {
+        self.inner.status
+    }
 
     fn __repr__(&self) -> String {
-        format!("RedirectHop(url='{}', status={})", self.inner.url, self.inner.status)
+        format!(
+            "RedirectHop(url='{}', status={})",
+            self.inner.url, self.inner.status
+        )
     }
 }
 
@@ -106,39 +139,58 @@ struct PyResponse {
 #[pymethods]
 impl PyResponse {
     #[getter]
-    fn url(&self) -> String { self.inner.url.clone() }
+    fn url(&self) -> String {
+        self.inner.url.clone()
+    }
     #[getter]
-    fn status(&self) -> u16 { self.inner.status }
+    fn status(&self) -> u16 {
+        self.inner.status
+    }
     #[getter]
-    fn body(&self) -> String { self.inner.body.clone() }
+    fn body(&self) -> String {
+        self.inner.body.clone()
+    }
     #[getter]
-    fn elapsed_ms(&self) -> u64 { self.inner.elapsed_ms }
+    fn elapsed_ms(&self) -> u64 {
+        self.inner.elapsed_ms
+    }
 
     /// Raw body as Python bytes (avoids UTF-8 decode for binary responses)
     #[getter]
-    fn body_bytes(&self) -> &[u8] { &self.inner.body_bytes }
+    fn body_bytes(&self) -> &[u8] {
+        &self.inner.body_bytes
+    }
 
     /// Response headers as list of (name, value) tuples.
     /// List, not dict — HTTP allows duplicate header names (e.g. Set-Cookie).
     #[getter]
-    fn headers(&self) -> Vec<(String, String)> { self.inner.headers.clone() }
+    fn headers(&self) -> Vec<(String, String)> {
+        self.inner.headers.clone()
+    }
 
     /// TLS certificate info (None for plain HTTP)
     #[getter]
     fn cert_info(&self) -> Option<PyCertInfo> {
-        self.inner.cert_info.clone().map(|c| PyCertInfo { inner: c })
+        self.inner
+            .cert_info
+            .clone()
+            .map(|c| PyCertInfo { inner: c })
     }
 
     /// Content hashes for fingerprinting
     #[getter]
     fn hash(&self) -> PyResponseHash {
-        PyResponseHash { inner: self.inner.hash.clone() }
+        PyResponseHash {
+            inner: self.inner.hash.clone(),
+        }
     }
 
     /// Redirect chain (empty if no redirects followed)
     #[getter]
     fn redirect_chain(&self) -> Vec<PyRedirectHop> {
-        self.inner.redirect_chain.iter()
+        self.inner
+            .redirect_chain
+            .iter()
             .map(|hop| PyRedirectHop { inner: hop.clone() })
             .collect()
     }
@@ -146,10 +198,15 @@ impl PyResponse {
     /// Debug messages collected during the request.
     /// Always populated — Python side can log/display as needed.
     #[getter]
-    fn debug_log(&self) -> Vec<String> { self.inner.debug_log.clone() }
+    fn debug_log(&self) -> Vec<String> {
+        self.inner.debug_log.clone()
+    }
 
     fn __repr__(&self) -> String {
-        format!("Response(url='{}', status={})", self.inner.url, self.inner.status)
+        format!(
+            "Response(url='{}', status={})",
+            self.inner.url, self.inner.status
+        )
     }
 }
 
@@ -167,7 +224,9 @@ struct PyBatchResult {
 #[pymethods]
 impl PyBatchResult {
     #[getter]
-    fn url(&self) -> String { self.url.clone() }
+    fn url(&self) -> String {
+        self.url.clone()
+    }
 
     /// The response object (None if the request failed)
     #[getter]
@@ -177,11 +236,15 @@ impl PyBatchResult {
 
     /// Error message (None if the request succeeded)
     #[getter]
-    fn error(&self) -> Option<String> { self.error.clone() }
+    fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
 
     /// True if the request succeeded
     #[getter]
-    fn success(&self) -> bool { self.response.is_some() }
+    fn success(&self) -> bool {
+        self.response.is_some()
+    }
 
     fn __repr__(&self) -> String {
         if let Some(ref resp) = self.response {
@@ -299,13 +362,14 @@ impl BlastHTTP {
         let limiter = self.rate_limiter.clone();
         let client = self.client.clone();
         let response = py.allow_threads(|| {
-            self.runtime.block_on(async move {
-                if let Some(ref limiter) = limiter {
-                    limiter.acquire().await;
-                }
-                client.send(&config).await
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.message))
+            self.runtime
+                .block_on(async move {
+                    if let Some(ref limiter) = limiter {
+                        limiter.acquire().await;
+                    }
+                    client.send(&config).await
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.message))
         })?;
 
         Ok(PyResponse { inner: response })
@@ -323,24 +387,36 @@ impl BlastHTTP {
         concurrency: usize,
         rate_limit: Option<f64>,
     ) -> PyResult<Vec<PyBatchResult>> {
-        let request_configs: Vec<RequestConfig> = configs.into_iter()
+        let request_configs: Vec<RequestConfig> = configs
+            .into_iter()
             .map(|c| c.into_request_config())
             .collect();
 
         let shared_limiter = self.rate_limiter.clone();
         let results = py.allow_threads(|| {
-            self.runtime.block_on(
-                batch::send_batch(self.client.clone(), request_configs, concurrency, rate_limit, shared_limiter)
-            )
+            self.runtime.block_on(batch::send_batch(
+                self.client.clone(),
+                request_configs,
+                concurrency,
+                rate_limit,
+                shared_limiter,
+            ))
         });
 
-        Ok(results.into_iter().map(|r| {
-            let (response, error) = match r.result {
-                Ok(resp) => (Some(resp), None),
-                Err(e) => (None, Some(e.message)),
-            };
-            PyBatchResult { url: r.url, response, error }
-        }).collect())
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let (response, error) = match r.result {
+                    Ok(resp) => (Some(resp), None),
+                    Err(e) => (None, Some(e.message)),
+                };
+                PyBatchResult {
+                    url: r.url,
+                    response,
+                    error,
+                }
+            })
+            .collect())
     }
 
     /// Download a URL directly to a local file.
@@ -395,20 +471,23 @@ impl BlastHTTP {
         let limiter = self.rate_limiter.clone();
         let client = self.client.clone();
         let response = py.allow_threads(|| {
-            self.runtime.block_on(async move {
-                if let Some(ref limiter) = limiter {
-                    limiter.acquire().await;
-                }
-                client.send(&config).await
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.message))
+            self.runtime
+                .block_on(async move {
+                    if let Some(ref limiter) = limiter {
+                        limiter.acquire().await;
+                    }
+                    client.send(&config).await
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.message))
         })?;
 
         // Write body bytes to file
-        let mut file = std::fs::File::create(&path)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create file '{}': {}", path, e)))?;
-        file.write_all(&response.body_bytes)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to write to '{}': {}", path, e)))?;
+        let mut file = std::fs::File::create(&path).map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to create file '{}': {}", path, e))
+        })?;
+        file.write_all(&response.body_bytes).map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to write to '{}': {}", path, e))
+        })?;
 
         Ok(path)
     }
@@ -504,11 +583,24 @@ impl PyBatchConfig {
         resolve_ip: Option<String>,
     ) -> Self {
         PyBatchConfig {
-            url, method, headers, body, timeout,
-            follow_redirects, max_redirects, verify_certs,
-            proxy, cipher_string, min_tls_version, max_tls_version,
-            retries, retry_wait_min_ms, retry_wait_max_ms,
-            raw_path, request_target, resolve_ip,
+            url,
+            method,
+            headers,
+            body,
+            timeout,
+            follow_redirects,
+            max_redirects,
+            verify_certs,
+            proxy,
+            cipher_string,
+            min_tls_version,
+            max_tls_version,
+            retries,
+            retry_wait_min_ms,
+            retry_wait_max_ms,
+            raw_path,
+            request_target,
+            resolve_ip,
         }
     }
 }

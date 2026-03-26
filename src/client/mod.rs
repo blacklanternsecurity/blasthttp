@@ -2,7 +2,10 @@ use crate::config::RequestConfig;
 use crate::response::Response;
 
 pub trait HttpClient {
-    fn send(&self, config: &RequestConfig) -> impl std::future::Future<Output = Result<Response, ClientError>> + Send;
+    fn send(
+        &self,
+        config: &RequestConfig,
+    ) -> impl std::future::Future<Output = Result<Response, ClientError>> + Send;
 }
 
 /// What kind of error occurred — used by retry logic to decide
@@ -47,31 +50,52 @@ pub struct ClientError {
 
 impl ClientError {
     pub fn connection(message: String) -> Self {
-        ClientError { message, kind: ErrorKind::Connection }
+        ClientError {
+            message,
+            kind: ErrorKind::Connection,
+        }
     }
 
     pub fn timeout(message: String) -> Self {
-        ClientError { message, kind: ErrorKind::Timeout }
+        ClientError {
+            message,
+            kind: ErrorKind::Timeout,
+        }
     }
 
     pub fn tls(message: String) -> Self {
-        ClientError { message, kind: ErrorKind::Tls }
+        ClientError {
+            message,
+            kind: ErrorKind::Tls,
+        }
     }
 
     pub fn invalid_url(message: String) -> Self {
-        ClientError { message, kind: ErrorKind::InvalidUrl }
+        ClientError {
+            message,
+            kind: ErrorKind::InvalidUrl,
+        }
     }
 
     pub fn too_many_redirects(message: String) -> Self {
-        ClientError { message, kind: ErrorKind::TooManyRedirects }
+        ClientError {
+            message,
+            kind: ErrorKind::TooManyRedirects,
+        }
     }
 
     pub fn status(status: u16, message: String) -> Self {
-        ClientError { message, kind: ErrorKind::Status(status) }
+        ClientError {
+            message,
+            kind: ErrorKind::Status(status),
+        }
     }
 
     pub fn other(message: String) -> Self {
-        ClientError { message, kind: ErrorKind::Other }
+        ClientError {
+            message,
+            kind: ErrorKind::Other,
+        }
     }
 }
 
@@ -168,11 +192,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_returns_headers() {
-        let client = MockClient::new(200, "ok".to_string())
-            .with_headers(vec![
-                ("content-type".to_string(), "application/json".to_string()),
-                ("x-custom".to_string(), "test".to_string()),
-            ]);
+        let client = MockClient::new(200, "ok".to_string()).with_headers(vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-custom".to_string(), "test".to_string()),
+        ]);
         let config = RequestConfig::new("https://example.com".to_string());
         let response = client.send(&config).await.unwrap();
         assert_eq!(response.headers.len(), 2);
@@ -287,8 +310,14 @@ mod tests {
         config.retry_wait_min_ms = Some(500);
         config.retry_wait_max_ms = Some(5000);
         assert_eq!(config.max_retries(), 3);
-        assert_eq!(config.retry_wait_min(), std::time::Duration::from_millis(500));
-        assert_eq!(config.retry_wait_max(), std::time::Duration::from_millis(5000));
+        assert_eq!(
+            config.retry_wait_min(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            config.retry_wait_max(),
+            std::time::Duration::from_millis(5000)
+        );
     }
 
     #[test]
