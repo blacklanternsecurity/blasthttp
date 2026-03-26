@@ -67,8 +67,9 @@ jobs:
         run: |
           LOCAL_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
           echo "local=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
-          PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/blasthttp" | python3 -c "import sys,json; vs=[v['num'] for v in json.load(sys.stdin).get('versions',[])]; print('yes' if '$LOCAL_VERSION' in vs else 'no')" 2>/dev/null || echo "no")
+          PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/blasthttp/$LOCAL_VERSION" && echo "yes" || echo "no")
           echo "already_published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+          echo "Version $LOCAL_VERSION — already published: $PUBLISHED"
 
       - name: Publish to crates.io
         if: steps.version-check.outputs.already_published != 'yes'
