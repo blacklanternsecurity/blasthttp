@@ -1,0 +1,71 @@
+name: Rust Tests
+
+on:
+  push:
+    branches: [stable]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cache OpenSSL build
+        uses: actions/cache@v4
+        with:
+          path: vendor/openssl/install
+          key: openssl-3.3.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-openssl.sh') }}
+
+      - name: Build custom OpenSSL
+        run: ./scripts/build-openssl.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --verbose
+
+  # TODO: Uncomment when ready to publish to crates.io
+  # rust-publish:
+  #   needs: rust-tests
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+  #
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #
+  #     - name: Install Rust toolchain
+  #       uses: actions-rust-lang/setup-rust-toolchain@v1
+  #
+  #     - name: Cache OpenSSL build
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: vendor/openssl/install
+  #         key: openssl-3.3.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-openssl.sh') }}
+  #
+  #     - name: Build custom OpenSSL
+  #       run: ./scripts/build-openssl.sh
+  #
+  #     - name: Publish to crates.io
+  #       env:
+  #         OPENSSL_DIR: ${{ github.workspace }}/vendor/openssl/install
+  #         OPENSSL_STATIC: "1"
+  #         OPENSSL_NO_VENDOR: "1"
+  #       run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
