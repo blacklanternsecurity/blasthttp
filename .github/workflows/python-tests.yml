@@ -208,6 +208,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
       - name: Generate artifact attestation
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'wheels-*/*'
