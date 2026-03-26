@@ -62,9 +62,30 @@ jobs:
           source .venv/bin/activate
           python -c "import blasthttp; print(f'blasthttp {blasthttp.__version__}')"
 
-  linux-build:
+  version-check:
     needs: python-tests
     if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.check.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check if version already on PyPI
+        id: check
+        run: |
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION"
+          if curl -sf -o /dev/null "https://pypi.org/pypi/blasthttp/$VERSION/json"; then
+            echo "new_version=no" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION already on PyPI — skipping wheel builds"
+          else
+            echo "new_version=yes" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION not on PyPI — will build and publish"
+          fi
+
+  linux-build:
+    needs: version-check
+    if: needs.version-check.outputs.new_version == 'yes'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -123,8 +144,8 @@ jobs:
           path: dist
 
   musllinux-build:
-    needs: python-tests
-    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+    needs: version-check
+    if: needs.version-check.outputs.new_version == 'yes'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -178,9 +199,9 @@ jobs:
           path: dist
 
   sdist-build:
-    needs: python-tests
+    needs: version-check
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+    if: needs.version-check.outputs.new_version == 'yes'
     steps:
       - uses: actions/checkout@v6
       - name: Build sdist
