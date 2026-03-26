@@ -159,12 +159,18 @@ if [ -n "$openssl_target" ]; then
     CROSS_CC=$(find_cross_cc "$TARGET")
     echo "Configuring with: ./Configure $openssl_target (CC=$CROSS_CC)"
 
+    # s390x cross-assembler may lack newer instructions (e.g. cijne) — disable asm
+    EXTRA_ARGS=()
+    case "$TARGET" in
+        s390x-*) EXTRA_ARGS+=(no-asm) ;;
+    esac
+
     # Derive --cross-compile-prefix from CC name (e.g. aarch64-linux-gnu-gcc -> aarch64-linux-gnu-)
     if [[ "$CROSS_CC" == *-gcc ]]; then
         cross_compile_prefix="${CROSS_CC%-gcc}-"
-        ./Configure "$openssl_target" "${COMMON_ARGS[@]}" --cross-compile-prefix="$cross_compile_prefix"
+        ./Configure "$openssl_target" "${COMMON_ARGS[@]}" "${EXTRA_ARGS[@]}" --cross-compile-prefix="$cross_compile_prefix"
     else
-        CC="$CROSS_CC" ./Configure "$openssl_target" "${COMMON_ARGS[@]}"
+        CC="$CROSS_CC" ./Configure "$openssl_target" "${COMMON_ARGS[@]}" "${EXTRA_ARGS[@]}"
     fi
 else
     echo "Configuring with: ./config (native auto-detect)"
