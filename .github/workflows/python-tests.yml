@@ -105,6 +105,15 @@ jobs:
             fi
             # Build custom OpenSSL with weak cipher support
             ./scripts/build-openssl.sh
+            # Override target-specific OPENSSL_DIR env vars set by maturin containers
+            # (openssl-sys checks <TARGET>_OPENSSL_DIR before OPENSSL_DIR)
+            OPENSSL_INSTALL="$(pwd)/vendor/openssl/install"
+            export OPENSSL_DIR="$OPENSSL_INSTALL"
+            export OPENSSL_STATIC=1
+            export OPENSSL_NO_VENDOR=1
+            for var in $(env | grep '_OPENSSL_DIR=' | cut -d= -f1); do
+              export "$var=$OPENSSL_INSTALL"
+            done
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
@@ -150,6 +159,14 @@ jobs:
             fi
             # Build custom OpenSSL with weak cipher support
             ./scripts/build-openssl.sh
+            # Override target-specific OPENSSL_DIR env vars set by maturin containers
+            OPENSSL_INSTALL="$(pwd)/vendor/openssl/install"
+            export OPENSSL_DIR="$OPENSSL_INSTALL"
+            export OPENSSL_STATIC=1
+            export OPENSSL_NO_VENDOR=1
+            for var in $(env | grep '_OPENSSL_DIR=' | cut -d= -f1); do
+              export "$var=$OPENSSL_INSTALL"
+            done
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
