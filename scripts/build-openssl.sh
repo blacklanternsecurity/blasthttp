@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build OpenSSL from source with weak cipher support enabled.
-# Run this once before `cargo build`. The output is cached in vendor/openssl/.
+# Supports cross-compilation via CARGO_BUILD_TARGET env var.
 #
 # Usage: ./scripts/build-openssl.sh
 #
@@ -25,14 +25,45 @@ INSTALL_DIR="${VENDOR_DIR}/install"
 TARBALL="${VENDOR_DIR}/openssl-${OPENSSL_VERSION}.tar.gz"
 MARKER="${INSTALL_DIR}/.blasthttp-built"
 
-# Skip if already built
+# --- Cross-compilation support ---
+TARGET="${CARGO_BUILD_TARGET:-}"
+
+# Map Rust target triple to OpenSSL ./Configure target
+openssl_target=""
+case "$TARGET" in
+    aarch64-unknown-linux-gnu*|aarch64-unknown-linux-musl*)
+        openssl_target="linux-aarch64" ;;
+    armv7-unknown-linux-gnueabihf|armv7-unknown-linux-musleabihf)
+        openssl_target="linux-armv4" ;;
+    i686-unknown-linux-gnu*|i686-unknown-linux-musl*)
+        openssl_target="linux-x86" ;;
+    s390x-unknown-linux-gnu*)
+        openssl_target="linux64-s390x" ;;
+    powerpc64le-unknown-linux-gnu*)
+        openssl_target="linux-ppc64le" ;;
+    x86_64-*|"")
+        ;; # native — use ./config auto-detection
+    *)
+        echo "WARNING: Unknown target '$TARGET', falling back to native build"
+        ;;
+esac
+
+# Skip if already built for the same target
 if [ -f "$MARKER" ]; then
-    echo "=== OpenSSL ${OPENSSL_VERSION} already built at ${INSTALL_DIR} ==="
-    echo "=== Delete ${INSTALL_DIR} to force rebuild ==="
-    exit 0
+    BUILT_TARGET=$(cat "$MARKER" 2>/dev/null || true)
+    if [ "$BUILT_TARGET" = "$TARGET" ]; then
+        echo "=== OpenSSL ${OPENSSL_VERSION} already built for '${TARGET:-native}' at ${INSTALL_DIR} ==="
+        echo "=== Delete ${INSTALL_DIR} to force rebuild ==="
+        exit 0
+    fi
+    echo "=== Rebuilding OpenSSL: target changed from '${BUILT_TARGET:-native}' to '${TARGET:-native}' ==="
+    rm -rf "$INSTALL_DIR"
 fi
 
 echo "=== Building OpenSSL ${OPENSSL_VERSION} with weak cipher support ==="
+if [ -n "$openssl_target" ]; then
+    echo "=== Cross-compiling for: $openssl_target (Rust target: $TARGET) ==="
+fi
 
 mkdir -p "$VENDOR_DIR"
 
@@ -60,17 +91,85 @@ fi
 echo "Extracting..."
 tar xzf "$TARBALL" -C "$VENDOR_DIR"
 
+# --- Find cross-compiler if needed ---
+find_cross_cc() {
+    local target="$1"
+
+    # Check target-specific CC_<target> env var (set by maturin cross containers)
+    local target_env="${target//-/_}"
+    local cc_var="CC_${target_env}"
+    if [ -n "${!cc_var:-}" ]; then
+        echo "${!cc_var}"
+        return 0
+    fi
+
+    # Check generic CC (if it looks like a cross-compiler, not just "gcc")
+    if [ -n "${CC:-}" ] && [[ "$CC" == *-gcc ]] ; then
+        echo "$CC"
+        return 0
+    fi
+
+    # Try common cross-compiler names
+    local candidates=()
+    case "$target" in
+        aarch64-unknown-linux-gnu*)
+            candidates=(aarch64-linux-gnu-gcc aarch64-unknown-linux-gnu-gcc) ;;
+        aarch64-unknown-linux-musl*)
+            candidates=(aarch64-linux-musl-gcc aarch64-alpine-linux-musl-gcc aarch64-unknown-linux-musl-gcc) ;;
+        armv7-unknown-linux-gnueabihf)
+            candidates=(arm-linux-gnueabihf-gcc armv7-unknown-linux-gnueabihf-gcc) ;;
+        armv7-unknown-linux-musleabihf)
+            candidates=(arm-linux-musleabihf-gcc armv7-alpine-linux-musleabihf-gcc armv7-unknown-linux-musleabihf-gcc) ;;
+        i686-unknown-linux-gnu*)
+            candidates=(i686-linux-gnu-gcc i686-unknown-linux-gnu-gcc i386-linux-gnu-gcc) ;;
+        i686-unknown-linux-musl*)
+            candidates=(i686-linux-musl-gcc i686-alpine-linux-musl-gcc i686-unknown-linux-musl-gcc) ;;
+        s390x-unknown-linux-gnu*)
+            candidates=(s390x-linux-gnu-gcc s390x-ibm-linux-gnu-gcc s390x-unknown-linux-gnu-gcc) ;;
+        powerpc64le-unknown-linux-gnu*)
+            candidates=(powerpc64le-linux-gnu-gcc powerpc64le-unknown-linux-gnu-gcc) ;;
+    esac
+
+    for cc in "${candidates[@]}"; do
+        if command -v "$cc" >/dev/null 2>&1; then
+            echo "$cc"
+            return 0
+        fi
+    done
+
+    # Final fallback: use plain gcc (may work if container already targets the right arch)
+    echo "gcc"
+    return 0
+}
+
 # Configure
-echo "Configuring with weak cipher support..."
 cd "$SOURCE_DIR"
-./config \
-    --prefix="$INSTALL_DIR" \
-    enable-weak-ssl-ciphers \
-    enable-ssl3 \
-    no-shared \
-    no-module \
-    no-tests \
+
+COMMON_ARGS=(
+    --prefix="$INSTALL_DIR"
+    enable-weak-ssl-ciphers
+    enable-ssl3
+    no-shared
+    no-module
+    no-tests
     -fPIC
+)
+
+if [ -n "$openssl_target" ]; then
+    CROSS_CC=$(find_cross_cc "$TARGET")
+    echo "Configuring with: ./Configure $openssl_target (CC=$CROSS_CC)"
+
+    # Derive --cross-compile-prefix from CC name (e.g. aarch64-linux-gnu-gcc -> aarch64-linux-gnu-)
+    if [[ "$CROSS_CC" == *-gcc ]]; then
+        cross_compile_prefix="${CROSS_CC%-gcc}-"
+        ./Configure "$openssl_target" "${COMMON_ARGS[@]}" --cross-compile-prefix="$cross_compile_prefix"
+    else
+        CC="$CROSS_CC" ./Configure "$openssl_target" "${COMMON_ARGS[@]}"
+    fi
+else
+    echo "Configuring with: ./config (native auto-detect)"
+    ./config "${COMMON_ARGS[@]}"
+fi
 
 # Build
 NUM_JOBS=$(nproc 2>/dev/null || echo 4)
@@ -81,8 +180,9 @@ make -j"$NUM_JOBS"
 echo "Installing..."
 make install_sw
 
-# Mark as complete
-touch "$MARKER"
+# Mark as complete (store target for cache invalidation)
+mkdir -p "$INSTALL_DIR"
+echo "$TARGET" > "$MARKER"
 
 echo ""
 echo "=== OpenSSL ${OPENSSL_VERSION} built successfully ==="
