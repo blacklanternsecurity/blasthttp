@@ -4,9 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "blasthttp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offensive-first HTTP library"
-requires-python = ">=3.9"
+license = "GPL-3.0"
+requires-python = ">=3.10"
 
 [tool.maturin]
 features = ["python"]

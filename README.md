@@ -1,6 +1,24 @@
 # blasthttp
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-black.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
+[![Crates.io](https://img.shields.io/crates/v/blasthttp.svg?color=orange)](https://crates.io/crates/blasthttp)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI version](https://img.shields.io/pypi/v/blasthttp.svg?color=blue)](https://pypi.org/project/blasthttp/)
+[![Rust Tests](https://github.com/blacklanternsecurity/blasthttp/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blasthttp/actions/workflows/rust-tests.yml)
+[![Python Tests](https://github.com/blacklanternsecurity/blasthttp/actions/workflows/python-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blasthttp/actions/workflows/python-tests.yml)
+
 Offensive-first HTTP library written in Rust with Python bindings. Built for [BBOT](https://github.com/blacklanternsecurity/bbot).
+
+## Installation
+
+```bash
+# Python
+pip install blasthttp
+
+# Rust
+cargo add blasthttp
+```
 
 ## Key Advantages
 
@@ -140,7 +158,7 @@ The client-level rate limit takes precedence over the per-call `rate_limit` para
 ### Prerequisites
 
 - Rust (2024 edition) — install via [rustup](https://rustup.rs/)
-- Python 3.9+ (for Python bindings)
+- Python 3.10+ (for Python bindings)
 - Standard C build tools (`build-essential` / `gcc`, `make`, `perl`)
 - `curl` or `wget` (for OpenSSL download)
 

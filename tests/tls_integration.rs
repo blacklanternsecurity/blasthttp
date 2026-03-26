@@ -8,7 +8,7 @@ use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
 use blasthttp::config::RequestConfig;
 use openssl::ssl::SslVersion;
-use tls_server::{TlsTestServer, TlsServerConfig};
+use tls_server::{TlsServerConfig, TlsTestServer};
 
 fn make_config(url: &str) -> RequestConfig {
     let mut config = RequestConfig::new(url.to_string());
@@ -26,7 +26,8 @@ async fn test_rc4_cipher_succeeds() {
         cipher_list: Some("RC4-SHA".to_string()),
         max_tls_version: Some(SslVersion::TLS1_2), // RC4 not in TLS 1.3
         ..Default::default()
-    }).await;
+    })
+    .await;
 
     let mut config = make_config(&server.url());
     config.cipher_string = Some("RC4-SHA".to_string());
@@ -35,7 +36,11 @@ async fn test_rc4_cipher_succeeds() {
     let client = HyperClient::new();
     let result = client.send(&config).await;
 
-    assert!(result.is_ok(), "RC4 connection should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "RC4 connection should succeed: {:?}",
+        result.err()
+    );
     assert_eq!(result.unwrap().status, 200);
 
     server.shutdown().await;
@@ -48,7 +53,8 @@ async fn test_rc4_cipher_mismatch_fails() {
         cipher_list: Some("RC4-SHA".to_string()),
         max_tls_version: Some(SslVersion::TLS1_2),
         ..Default::default()
-    }).await;
+    })
+    .await;
 
     let mut config = make_config(&server.url());
     config.cipher_string = Some("AES128-SHA".to_string());
@@ -70,7 +76,8 @@ async fn test_3des_cipher_succeeds() {
         cipher_list: Some("DES-CBC3-SHA".to_string()),
         max_tls_version: Some(SslVersion::TLS1_2),
         ..Default::default()
-    }).await;
+    })
+    .await;
 
     let mut config = make_config(&server.url());
     config.cipher_string = Some("DES-CBC3-SHA".to_string());
@@ -79,7 +86,11 @@ async fn test_3des_cipher_succeeds() {
     let client = HyperClient::new();
     let result = client.send(&config).await;
 
-    assert!(result.is_ok(), "3DES connection should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "3DES connection should succeed: {:?}",
+        result.err()
+    );
     assert_eq!(result.unwrap().status, 200);
 
     server.shutdown().await;
@@ -94,7 +105,8 @@ async fn test_tls12_only_succeeds() {
         min_tls_version: Some(SslVersion::TLS1_2),
         max_tls_version: Some(SslVersion::TLS1_2),
         ..Default::default()
-    }).await;
+    })
+    .await;
 
     let mut config = make_config(&server.url());
     config.min_tls_version = Some("1.2".to_string());
@@ -103,7 +115,11 @@ async fn test_tls12_only_succeeds() {
     let client = HyperClient::new();
     let result = client.send(&config).await;
 
-    assert!(result.is_ok(), "TLS 1.2 pinned connection should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "TLS 1.2 pinned connection should succeed: {:?}",
+        result.err()
+    );
 
     server.shutdown().await;
 }
@@ -115,7 +131,8 @@ async fn test_tls_version_mismatch_fails() {
         min_tls_version: Some(SslVersion::TLS1_2),
         max_tls_version: Some(SslVersion::TLS1_2),
         ..Default::default()
-    }).await;
+    })
+    .await;
 
     let mut config = make_config(&server.url());
     config.min_tls_version = Some("1.3".to_string());
@@ -141,7 +158,11 @@ async fn test_tls13_succeeds() {
     let client = HyperClient::new();
     let result = client.send(&config).await;
 
-    assert!(result.is_ok(), "TLS 1.3 connection should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "TLS 1.3 connection should succeed: {:?}",
+        result.err()
+    );
 
     server.shutdown().await;
 }
@@ -158,7 +179,11 @@ async fn test_default_ciphers_succeed() {
     let client = HyperClient::new();
     let result = client.send(&config).await;
 
-    assert!(result.is_ok(), "default ciphers should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "default ciphers should succeed: {:?}",
+        result.err()
+    );
     assert_eq!(result.unwrap().status, 200);
 
     server.shutdown().await;
@@ -171,7 +196,8 @@ async fn test_server_response_body_received() {
     let server = TlsTestServer::start(TlsServerConfig {
         response_body: "hello from test server".to_string(),
         ..Default::default()
-    }).await;
+    })
+    .await;
 
     let config = make_config(&server.url());
 
@@ -198,7 +224,11 @@ async fn test_invalid_cipher_string_returns_error() {
 
     assert!(result.is_err(), "bogus cipher should error");
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("invalid cipher string"), "error should mention invalid cipher: {}", err_msg);
+    assert!(
+        err_msg.contains("invalid cipher string"),
+        "error should mention invalid cipher: {}",
+        err_msg
+    );
 }
 
 // ── Invalid TLS version ───────────────────────────────────────────
@@ -213,7 +243,11 @@ async fn test_invalid_tls_version_returns_error() {
 
     assert!(result.is_err(), "invalid TLS version should error");
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("unknown TLS version"), "error should mention unknown version: {}", err_msg);
+    assert!(
+        err_msg.contains("unknown TLS version"),
+        "error should mention unknown version: {}",
+        err_msg
+    );
 }
 
 // ── Certificate info extraction ────────────────────────────────────
@@ -229,7 +263,9 @@ async fn test_cert_info_extracted() {
 
     assert!(result.is_ok());
     let resp = result.unwrap();
-    let cert = resp.cert_info.expect("cert_info should be present for HTTPS");
+    let cert = resp
+        .cert_info
+        .expect("cert_info should be present for HTTPS");
     assert_eq!(cert.common_name.as_deref(), Some("localhost"));
     assert!(cert.sans.contains(&"localhost".to_string()));
     assert!(cert.issuer.is_some());
@@ -265,7 +301,8 @@ async fn test_server_custom_status_code() {
         response_status: 403,
         response_body: "forbidden".to_string(),
         ..Default::default()
-    }).await;
+    })
+    .await;
 
     let config = make_config(&server.url());
 

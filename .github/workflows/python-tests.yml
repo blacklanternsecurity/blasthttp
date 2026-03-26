@@ -1,0 +1,189 @@
+name: Python Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - stable
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache OpenSSL build
+        uses: actions/cache@v4
+        with:
+          path: vendor/openssl/install
+          key: openssl-3.3.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-openssl.sh') }}
+
+      - name: Build custom OpenSSL
+        run: ./scripts/build-openssl.sh
+
+      - name: Create virtualenv
+        run: python -m venv .venv
+
+      - name: Build Python extension
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: |
+          source .venv/bin/activate
+          pip install maturin
+          maturin develop --release
+
+      - name: Verify module
+        run: |
+          source .venv/bin/activate
+          python -c "import blasthttp; print(f'blasthttp {blasthttp.__version__}')"
+
+  linux-build:
+    needs: python-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: x86
+          - runner: ubuntu-22.04
+            target: aarch64
+          - runner: ubuntu-22.04
+            target: armv7
+          - runner: ubuntu-22.04
+            target: s390x
+          - runner: ubuntu-22.04
+            target: ppc64le
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: auto
+          before-script-linux: |
+            set -e
+            # Install OpenSSL build dependencies
+            if command -v apk >/dev/null 2>&1; then
+              apk add --no-cache perl make gcc musl-dev linux-headers curl bash
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y perl-IPC-Cmd 2>/dev/null || true
+            fi
+            # Build custom OpenSSL with weak cipher support
+            ./scripts/build-openssl.sh
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+
+  musllinux-build:
+    needs: python-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: x86
+          - runner: ubuntu-22.04
+            target: aarch64
+          - runner: ubuntu-22.04
+            target: armv7
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: musllinux_1_2
+          before-script-linux: |
+            set -e
+            apk add --no-cache perl make gcc musl-dev linux-headers curl bash
+            ./scripts/build-openssl.sh
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: dist
+
+  sdist-build:
+    needs: python-tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: dist
+
+  release:
+    name: Release
+    needs:
+      - linux-build
+      - musllinux-build
+      - sdist-build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'wheels-*/*'
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: --non-interactive --skip-existing wheels-*/*

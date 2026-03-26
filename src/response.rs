@@ -62,7 +62,8 @@ pub struct ResponseHash {
 impl ResponseHash {
     pub fn compute(body: &[u8], headers: &[(String, String)]) -> Self {
         // Build raw header string matching BBOT's format: "Name: Value\r\n..."
-        let raw_headers = headers.iter()
+        let raw_headers = headers
+            .iter()
             .map(|(k, v)| format!("{}: {}", k, v))
             .collect::<Vec<_>>()
             .join("\r\n");
@@ -110,7 +111,10 @@ mod tests {
     fn test_sha256_matches_python() {
         // Python: hashlib.sha256(b"hello world").hexdigest()
         let result = hex_digest(openssl::hash::MessageDigest::sha256(), b"hello world");
-        assert_eq!(result, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            result,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]
@@ -131,8 +135,14 @@ mod tests {
         assert!(!hash.body_md5.is_empty());
         assert!(!hash.body_sha256.is_empty());
         // Verify body hashes are for "test body"
-        assert_eq!(hash.body_md5, hex_digest(openssl::hash::MessageDigest::md5(), b"test body"));
-        assert_eq!(hash.body_sha256, hex_digest(openssl::hash::MessageDigest::sha256(), b"test body"));
+        assert_eq!(
+            hash.body_md5,
+            hex_digest(openssl::hash::MessageDigest::md5(), b"test body")
+        );
+        assert_eq!(
+            hash.body_sha256,
+            hex_digest(openssl::hash::MessageDigest::sha256(), b"test body")
+        );
         assert_eq!(hash.body_mmh3, mmh3_32(b"test body"));
     }
 
@@ -146,8 +156,17 @@ mod tests {
         let hash = ResponseHash::compute(b"", &headers);
 
         let expected_raw = "content-type: text/html\r\nserver: nginx";
-        assert_eq!(hash.header_md5, hex_digest(openssl::hash::MessageDigest::md5(), expected_raw.as_bytes()));
-        assert_eq!(hash.header_sha256, hex_digest(openssl::hash::MessageDigest::sha256(), expected_raw.as_bytes()));
+        assert_eq!(
+            hash.header_md5,
+            hex_digest(openssl::hash::MessageDigest::md5(), expected_raw.as_bytes())
+        );
+        assert_eq!(
+            hash.header_sha256,
+            hex_digest(
+                openssl::hash::MessageDigest::sha256(),
+                expected_raw.as_bytes()
+            )
+        );
         assert_eq!(hash.header_mmh3, mmh3_32(expected_raw.as_bytes()));
     }
 }

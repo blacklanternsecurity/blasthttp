@@ -3,6 +3,7 @@ name = "blasthttp"
 version = "0.1.1"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
+license = "GPL-3.0"
 
 [lib]
 # When building as a Python module, we need a cdylib (shared library).

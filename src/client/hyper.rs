@@ -1,18 +1,18 @@
+use super::{ClientError, HttpClient};
 use crate::config::RequestConfig;
-use crate::debug::{DebugLog, new_debug_log, debug_record};
-use crate::response::{Response, RedirectHop, CertInfo};
-use super::{HttpClient, ClientError};
+use crate::debug::{DebugLog, debug_record, new_debug_log};
+use crate::response::{CertInfo, RedirectHop, Response};
 
-use std::io::Read;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, Once};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::future::Future;
+use std::io::Read;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Once};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 type FullBody = http_body_util::Full<bytes::Bytes>;
 
@@ -34,7 +34,8 @@ fn sanitize_uri(url: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b'%' && i + 2 < bytes.len()
+        if b == b'%'
+            && i + 2 < bytes.len()
             && bytes[i + 1].is_ascii_hexdigit()
             && bytes[i + 2].is_ascii_hexdigit()
         {
@@ -82,16 +83,19 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
     let cert = ssl.peer_certificate()?;
 
     // Common Name from Subject
-    let common_name = cert.subject_name()
+    let common_name = cert
+        .subject_name()
         .entries_by_nid(openssl::nid::Nid::COMMONNAME)
         .next()
         .and_then(|e| e.data().as_utf8().ok())
         .map(|s| s.to_string());
 
     // Subject Alternative Names (DNS entries)
-    let sans = cert.subject_alt_names()
+    let sans = cert
+        .subject_alt_names()
         .map(|names| {
-            names.iter()
+            names
+                .iter()
                 .filter_map(|name| name.dnsname().map(|s| s.to_string()))
                 .collect()
         })
@@ -99,12 +103,18 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
 
     // Email addresses from Subject and Issuer
     let mut emails: Vec<String> = Vec::new();
-    for entry in cert.subject_name().entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS) {
+    for entry in cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS)
+    {
         if let Ok(s) = entry.data().as_utf8() {
             emails.push(s.to_string());
         }
     }
-    for entry in cert.issuer_name().entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS) {
+    for entry in cert
+        .issuer_name()
+        .entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS)
+    {
         if let Ok(s) = entry.data().as_utf8()
             && !emails.contains(&s.to_string())
         {
@@ -124,7 +134,8 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
     }
 
     // Issuer Common Name
-    let issuer = cert.issuer_name()
+    let issuer = cert
+        .issuer_name()
         .entries_by_nid(openssl::nid::Nid::COMMONNAME)
         .next()
         .and_then(|e| e.data().as_utf8().ok())
@@ -135,10 +146,12 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
     let not_after = cert.not_after().to_string();
 
     // SHA-256 fingerprint
-    let fingerprint_sha256 = cert.digest(openssl::hash::MessageDigest::sha256())
+    let fingerprint_sha256 = cert
+        .digest(openssl::hash::MessageDigest::sha256())
         .ok()
         .map(|digest| {
-            digest.iter()
+            digest
+                .iter()
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(":")
@@ -173,7 +186,10 @@ fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
         "1.1" | "tls1.1" | "tlsv1.1" => Ok(openssl::ssl::SslVersion::TLS1_1),
         "1.2" | "tls1.2" | "tlsv1.2" => Ok(openssl::ssl::SslVersion::TLS1_2),
         "1.3" | "tls1.3" | "tlsv1.3" => Ok(openssl::ssl::SslVersion::TLS1_3),
-        _ => Err(ClientError::other(format!("unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)", s))),
+        _ => Err(ClientError::other(format!(
+            "unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)",
+            s
+        ))),
     }
 }
 
@@ -182,8 +198,9 @@ impl OpenSslConnector {
         // Ensure legacy ciphers (RC4, DES, etc.) are available
         ensure_legacy_provider();
 
-        let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
-            .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
+        let mut builder =
+            openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
+                .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
         // Security level 0: allow all ciphers including RC4, DES, export.
         // This is an offensive-first tool — we need to connect to anything.
@@ -194,32 +211,40 @@ impl OpenSslConnector {
         }
 
         if let Some(ref ciphers) = config.cipher_string {
-            builder.set_cipher_list(ciphers)
-                .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
+            builder.set_cipher_list(ciphers).map_err(|e| {
+                ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
+            })?;
         }
 
         if let Some(ref min_ver) = config.min_tls_version {
             let version = parse_tls_version(min_ver)?;
-            builder.set_min_proto_version(Some(version))
+            builder
+                .set_min_proto_version(Some(version))
                 .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
         }
 
         if let Some(ref max_ver) = config.max_tls_version {
             let version = parse_tls_version(max_ver)?;
-            builder.set_max_proto_version(Some(version))
+            builder
+                .set_max_proto_version(Some(version))
                 .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
         }
 
         // ALPN: advertise HTTP/2 and HTTP/1.1 support during TLS handshake.
         // The wire format is length-prefixed: [2, b'h', b'2', 8, b'h', b't', ...].
-        builder.set_alpn_protos(b"\x02h2\x08http/1.1")
+        builder
+            .set_alpn_protos(b"\x02h2\x08http/1.1")
             .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
         let ssl = builder.build();
         let mut http = HttpConnector::new();
         http.enforce_http(false);
 
-        Ok(OpenSslConnector { http, ssl, cert_slot })
+        Ok(OpenSslConnector {
+            http,
+            ssl,
+            cert_slot,
+        })
     }
 }
 
@@ -271,10 +296,7 @@ impl hyper::rt::Write for ConnectionStream {
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
             ConnectionStream::Plain(tcp) => {
                 let mut io = hyper_util::rt::TokioIo::new(tcp);
@@ -287,10 +309,7 @@ impl hyper::rt::Write for ConnectionStream {
         }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
             ConnectionStream::Plain(tcp) => {
                 let mut io = hyper_util::rt::TokioIo::new(tcp);
@@ -345,14 +364,17 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
             // Only set SNI for hostnames, not IP addresses (SNI with IPs is invalid per RFC)
             if host.parse::<std::net::IpAddr>().is_err() {
-                ssl_conf.set_hostname(&host)
+                ssl_conf
+                    .set_hostname(&host)
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
             }
 
             let mut stream = tokio_openssl::SslStream::new(ssl_conf, tcp_stream)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
-            Pin::new(&mut stream).connect().await
+            Pin::new(&mut stream)
+                .connect()
+                .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
             // Extract cert info after successful handshake
@@ -380,14 +402,10 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 // - SOCKS5: works for both HTTP and HTTPS targets.
 
 type DirectClient = Client<OpenSslConnector, FullBody>;
-type TunnelProxyClient = Client<
-    hyper_util::client::legacy::connect::proxy::Tunnel<OpenSslConnector>,
-    FullBody,
->;
-type Socks5ProxyClient = Client<
-    hyper_util::client::legacy::connect::proxy::SocksV5<OpenSslConnector>,
-    FullBody,
->;
+type TunnelProxyClient =
+    Client<hyper_util::client::legacy::connect::proxy::Tunnel<OpenSslConnector>, FullBody>;
+type Socks5ProxyClient =
+    Client<hyper_util::client::legacy::connect::proxy::SocksV5<OpenSslConnector>, FullBody>;
 
 /// The cached hyper client + its cert info slot.
 /// hyper's Client uses Arc internally, so Clone shares the connection pool.
@@ -442,9 +460,10 @@ impl HyperClient {
         match config.proxy.as_deref() {
             None => Ok(ConnMode::Direct),
             Some(proxy_url) => {
-                let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-                    ClientError::invalid_url(format!("invalid proxy URL: {}", e))
-                })?;
+                let proxy_uri: http::Uri =
+                    proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+                        ClientError::invalid_url(format!("invalid proxy URL: {}", e))
+                    })?;
                 let proxy_scheme = proxy_uri.scheme_str().unwrap_or("");
                 match proxy_scheme {
                     "http" | "https" => {
@@ -457,17 +476,24 @@ impl HyperClient {
                         }
                     }
                     "socks5" | "socks5h" => Ok(ConnMode::Socks5(proxy_url.to_string())),
-                    _ => Err(ClientError::other(
-                        format!("unsupported proxy scheme '{}' (use http, https, socks5)", proxy_scheme),
-                    )),
+                    _ => Err(ClientError::other(format!(
+                        "unsupported proxy scheme '{}' (use http, https, socks5)",
+                        proxy_scheme
+                    ))),
                 }
             }
         }
     }
 
     /// Get or build a cached client for the given connection mode.
-    fn get_or_build(&self, config: &RequestConfig, mode: &ConnMode) -> Result<CachedClient, ClientError> {
-        let mut guard = self.cached.lock()
+    fn get_or_build(
+        &self,
+        config: &RequestConfig,
+        mode: &ConnMode,
+    ) -> Result<CachedClient, ClientError> {
+        let mut guard = self
+            .cached
+            .lock()
             .map_err(|_| ClientError::other("client lock poisoned".to_string()))?;
 
         if let Some(cached) = guard.get(mode) {
@@ -487,17 +513,19 @@ impl HyperClient {
                 unreachable!("ForwardProxy uses dispatch_forward_proxy, not get_or_build")
             }
             ConnMode::Tunnel(proxy_url) => {
-                let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-                    ClientError::invalid_url(format!("invalid proxy URL: {}", e))
-                })?;
+                let proxy_uri: http::Uri =
+                    proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+                        ClientError::invalid_url(format!("invalid proxy URL: {}", e))
+                    })?;
                 use hyper_util::client::legacy::connect::proxy::Tunnel;
                 let tunnel = Tunnel::new(proxy_uri, connector);
                 AnyClient::Tunnel(builder.build(tunnel))
             }
             ConnMode::Socks5(proxy_url) => {
-                let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-                    ClientError::invalid_url(format!("invalid proxy URL: {}", e))
-                })?;
+                let proxy_uri: http::Uri =
+                    proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
+                        ClientError::invalid_url(format!("invalid proxy URL: {}", e))
+                    })?;
                 use hyper_util::client::legacy::connect::proxy::SocksV5;
                 let socks = SocksV5::new(proxy_uri, connector);
                 AnyClient::Socks5(builder.build(socks))
@@ -523,7 +551,12 @@ async fn dispatch_request(
 
     debug_record(log, v, 1, "   Request headers:");
     for (name, value) in request.headers() {
-        debug_record(log, v, 1, &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")));
+        debug_record(
+            log,
+            v,
+            1,
+            &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")),
+        );
     }
     debug_record(log, v, 1, "   Sending request...");
 
@@ -531,7 +564,8 @@ async fn dispatch_request(
         AnyClient::Direct(c) => c.request(request).await,
         AnyClient::Tunnel(c) => c.request(request).await,
         AnyClient::Socks5(c) => c.request(request).await,
-    }.map_err(|e| {
+    }
+    .map_err(|e| {
         let msg = format!("request failed: {}", e);
         let err_str = e.to_string().to_lowercase();
         if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
@@ -571,13 +605,21 @@ async fn dispatch_raw(
         format!("{}:{}", host, port)
     };
 
-    debug_record(log, v, 1, &format!(
-        "   dispatch_raw: connecting to {} (host={})", connect_addr, host,
-    ));
+    debug_record(
+        log,
+        v,
+        1,
+        &format!(
+            "   dispatch_raw: connecting to {} (host={})",
+            connect_addr, host,
+        ),
+    );
 
-    let tcp = tokio::net::TcpStream::connect(&connect_addr).await.map_err(|e| {
-        ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
-    })?;
+    let tcp = tokio::net::TcpStream::connect(&connect_addr)
+        .await
+        .map_err(|e| {
+            ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
+        })?;
 
     let mut cert_info: Option<CertInfo> = None;
 
@@ -585,8 +627,9 @@ async fn dispatch_raw(
         // TLS handshake with SNI set to the original hostname
         ensure_legacy_provider();
 
-        let mut ssl_builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
-            .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
+        let mut ssl_builder =
+            openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
+                .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
         ssl_builder.set_security_level(0);
 
@@ -594,21 +637,25 @@ async fn dispatch_raw(
             ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
         }
         if let Some(ref ciphers) = config.cipher_string {
-            ssl_builder.set_cipher_list(ciphers)
-                .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
+            ssl_builder.set_cipher_list(ciphers).map_err(|e| {
+                ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
+            })?;
         }
         if let Some(ref min_ver) = config.min_tls_version {
             let version = parse_tls_version(min_ver)?;
-            ssl_builder.set_min_proto_version(Some(version))
+            ssl_builder
+                .set_min_proto_version(Some(version))
                 .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
         }
         if let Some(ref max_ver) = config.max_tls_version {
             let version = parse_tls_version(max_ver)?;
-            ssl_builder.set_max_proto_version(Some(version))
+            ssl_builder
+                .set_max_proto_version(Some(version))
                 .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
         }
         // HTTP/1.1 only for raw dispatch (request_target doesn't apply to h2)
-        ssl_builder.set_alpn_protos(b"\x08http/1.1")
+        ssl_builder
+            .set_alpn_protos(b"\x08http/1.1")
             .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
         let ssl_connector = ssl_builder.build();
@@ -617,14 +664,17 @@ async fn dispatch_raw(
 
         // SNI = original hostname, NOT the resolved IP
         if host.parse::<std::net::IpAddr>().is_err() {
-            ssl_conf.set_hostname(&host)
+            ssl_conf
+                .set_hostname(&host)
                 .map_err(|e| ClientError::tls(format!("SNI setup failed: {}", e)))?;
         }
 
         let mut tls_stream = tokio_openssl::SslStream::new(ssl_conf, tcp)
             .map_err(|e| ClientError::tls(format!("TLS stream setup failed: {}", e)))?;
 
-        Pin::new(&mut tls_stream).connect().await
+        Pin::new(&mut tls_stream)
+            .connect()
+            .await
             .map_err(|e| ClientError::tls(format!("TLS handshake failed: {}", e)))?;
 
         cert_info = extract_cert_info(tls_stream.ssl());
@@ -635,16 +685,19 @@ async fn dispatch_raw(
     };
 
     // HTTP/1.1 handshake
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.map_err(|e| {
-        ClientError::connection(format!("HTTP handshake failed: {}", e))
-    })?;
-    tokio::spawn(async move { let _ = conn.await; });
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| ClientError::connection(format!("HTTP handshake failed: {}", e)))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     // Build request — use request_target as URI if set, otherwise use target_uri
     let request_uri = if let Some(ref rt) = config.request_target {
-        rt.parse::<http::Uri>().map_err(|e: http::uri::InvalidUri| {
-            ClientError::invalid_url(format!("invalid request_target '{}': {}", rt, e))
-        })?
+        rt.parse::<http::Uri>()
+            .map_err(|e: http::uri::InvalidUri| {
+                ClientError::invalid_url(format!("invalid request_target '{}': {}", rt, e))
+            })?
     } else {
         target_uri.clone()
     };
@@ -653,7 +706,12 @@ async fn dispatch_raw(
 
     debug_record(log, v, 1, "   Request headers:");
     for (name, value) in request.headers() {
-        debug_record(log, v, 1, &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")));
+        debug_record(
+            log,
+            v,
+            1,
+            &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")),
+        );
     }
     debug_record(log, v, 1, "   Sending request via dispatch_raw...");
 
@@ -690,29 +748,36 @@ async fn dispatch_forward_proxy(
     let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
         ClientError::invalid_url(format!("invalid proxy URL: {}", e))
     })?;
-    let proxy_host = proxy_uri.host().ok_or_else(|| {
-        ClientError::other("proxy URL has no host".to_string())
-    })?;
+    let proxy_host = proxy_uri
+        .host()
+        .ok_or_else(|| ClientError::other("proxy URL has no host".to_string()))?;
     let proxy_port = proxy_uri.port_u16().unwrap_or(8080);
     let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
 
-    debug_record(log, config.verbosity, 1, &format!(
-        "   Forward proxy: connecting to {}", proxy_addr,
-    ));
+    debug_record(
+        log,
+        config.verbosity,
+        1,
+        &format!("   Forward proxy: connecting to {}", proxy_addr,),
+    );
 
     // TCP connect to the proxy
-    let tcp = tokio::net::TcpStream::connect(&proxy_addr).await.map_err(|e| {
-        ClientError::connection(format!("failed to connect to proxy {}: {}", proxy_addr, e))
-    })?;
+    let tcp = tokio::net::TcpStream::connect(&proxy_addr)
+        .await
+        .map_err(|e| {
+            ClientError::connection(format!("failed to connect to proxy {}: {}", proxy_addr, e))
+        })?;
     let io = hyper_util::rt::TokioIo::new(tcp);
 
     // HTTP/1.1 handshake — gives us a SendRequest that preserves the URI as-is
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.map_err(|e| {
-        ClientError::connection(format!("proxy handshake failed: {}", e))
-    })?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| ClientError::connection(format!("proxy handshake failed: {}", e)))?;
 
     // Drive the connection in the background
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     // Build request with absolute-form URI (SendRequest does NOT normalize it)
     let request = build_request(target_uri, config)?;
@@ -720,7 +785,12 @@ async fn dispatch_forward_proxy(
 
     debug_record(log, v, 1, "   Request headers:");
     for (name, value) in request.headers() {
-        debug_record(log, v, 1, &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")));
+        debug_record(
+            log,
+            v,
+            1,
+            &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")),
+        );
     }
     debug_record(log, v, 1, "   Sending request via forward proxy...");
 
@@ -736,16 +806,21 @@ fn build_request(
     uri: &http::Uri,
     config: &RequestConfig,
 ) -> Result<hyper::Request<FullBody>, ClientError> {
-    let mut builder = hyper::Request::builder()
-        .method(config.method())
-        .uri(uri);
+    let mut builder = hyper::Request::builder().method(config.method()).uri(uri);
 
     // Check if custom headers include User-Agent and Accept-Encoding
-    let has_custom_ua = config.headers.as_ref()
+    let has_custom_ua = config
+        .headers
+        .as_ref()
         .map(|h| h.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")))
         .unwrap_or(false);
-    let has_custom_ae = config.headers.as_ref()
-        .map(|h| h.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding")))
+    let has_custom_ae = config
+        .headers
+        .as_ref()
+        .map(|h| {
+            h.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+        })
         .unwrap_or(false);
 
     // Only add defaults if not overridden by caller
@@ -776,7 +851,8 @@ async fn parse_response(
     let v = config.verbosity;
     let status = hyper_response.status().as_u16();
 
-    let location = hyper_response.headers()
+    let location = hyper_response
+        .headers()
         .get("location")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
@@ -789,7 +865,8 @@ async fn parse_response(
         headers.push((name.to_string(), val_str));
     }
 
-    let content_encoding = hyper_response.headers()
+    let content_encoding = hyper_response
+        .headers()
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
@@ -797,21 +874,46 @@ async fn parse_response(
 
     let max_body = config.max_body();
     let raw_bytes = read_body(hyper_response.into_body(), max_body).await?;
-    debug_record(log, v, 1, &format!("   Raw body: {} bytes", raw_bytes.len()));
+    debug_record(
+        log,
+        v,
+        1,
+        &format!("   Raw body: {} bytes", raw_bytes.len()),
+    );
 
     let body_bytes = if content_encoding.is_empty() {
         raw_bytes
     } else {
         let decompressed = decompress(&content_encoding, &raw_bytes)?;
-        debug_record(log, v, 1, &format!("   Decompressed ({}): {} -> {} bytes", content_encoding, raw_bytes.len(), decompressed.len()));
+        debug_record(
+            log,
+            v,
+            1,
+            &format!(
+                "   Decompressed ({}): {} -> {} bytes",
+                content_encoding,
+                raw_bytes.len(),
+                decompressed.len()
+            ),
+        );
         decompressed
     };
 
     if body_bytes.len() >= max_body {
-        debug_record(log, v, 1, &format!("   Body truncated at {} bytes", max_body));
+        debug_record(
+            log,
+            v,
+            1,
+            &format!("   Body truncated at {} bytes", max_body),
+        );
     }
 
-    Ok(SingleResponse { status, headers, body_bytes, location })
+    Ok(SingleResponse {
+        status,
+        headers,
+        body_bytes,
+        location,
+    })
 }
 
 struct SingleResponse {
@@ -834,15 +936,17 @@ fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, Cl
     }
 
     let scheme = current.scheme_str().unwrap_or("https");
-    let authority = current.authority()
-        .ok_or_else(|| ClientError::invalid_url(
-            format!("no authority in current URL to resolve relative redirect: {}", location),
-        ))?;
+    let authority = current.authority().ok_or_else(|| {
+        ClientError::invalid_url(format!(
+            "no authority in current URL to resolve relative redirect: {}",
+            location
+        ))
+    })?;
 
     let absolute = format!("{}://{}{}", scheme, authority, sanitized);
-    absolute.parse().map_err(|e: http::uri::InvalidUri| ClientError::invalid_url(
-        format!("invalid redirect URL '{}': {}", absolute, e),
-    ))
+    absolute.parse().map_err(|e: http::uri::InvalidUri| {
+        ClientError::invalid_url(format!("invalid redirect URL '{}': {}", absolute, e))
+    })
 }
 
 // ── HttpClient implementation ─────────────────────────────────────
@@ -867,9 +971,17 @@ impl HttpClient for HyperClient {
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 let backoff = retry_backoff(attempt - 1, min_wait, max_wait);
-                debug_record(&log, config.verbosity, 1, &format!(
-                    "   Retry {}/{} after {}ms", attempt, max_retries, backoff.as_millis(),
-                ));
+                debug_record(
+                    &log,
+                    config.verbosity,
+                    1,
+                    &format!(
+                        "   Retry {}/{} after {}ms",
+                        attempt,
+                        max_retries,
+                        backoff.as_millis(),
+                    ),
+                );
                 tokio::time::sleep(backoff).await;
             }
 
@@ -877,9 +989,12 @@ impl HttpClient for HyperClient {
                 Ok(Ok(response)) => {
                     let status = response.status;
                     if super::ErrorKind::Status(status).is_retryable() && attempt < max_retries {
-                        debug_record(&log, config.verbosity, 1, &format!(
-                            "   Retryable status {} from {}", status, config.url,
-                        ));
+                        debug_record(
+                            &log,
+                            config.verbosity,
+                            1,
+                            &format!("   Retryable status {} from {}", status, config.url,),
+                        );
                         last_err = Some(ClientError::status(
                             status,
                             format!("server returned {} for {}", status, config.url),
@@ -890,18 +1005,22 @@ impl HttpClient for HyperClient {
                 }
                 Ok(Err(e)) => {
                     if e.kind.is_retryable() && attempt < max_retries {
-                        debug_record(&log, config.verbosity, 1, &format!(
-                            "   Retryable error: {}", e.message,
-                        ));
+                        debug_record(
+                            &log,
+                            config.verbosity,
+                            1,
+                            &format!("   Retryable error: {}", e.message,),
+                        );
                         last_err = Some(e);
                         continue;
                     }
                     return Err(e);
                 }
                 Err(_) => {
-                    return Err(ClientError::timeout(
-                        format!("request timed out after {}s", config.timeout()),
-                    ));
+                    return Err(ClientError::timeout(format!(
+                        "request timed out after {}s",
+                        config.timeout()
+                    )));
                 }
             }
         }
@@ -911,13 +1030,18 @@ impl HttpClient for HyperClient {
 }
 
 impl HyperClient {
-    async fn send_inner(&self, config: &RequestConfig, log: &DebugLog) -> Result<Response, ClientError> {
+    async fn send_inner(
+        &self,
+        config: &RequestConfig,
+        log: &DebugLog,
+    ) -> Result<Response, ClientError> {
         let v = config.verbosity;
         let start = Instant::now();
 
         let sanitized_url = sanitize_uri(&config.url);
-        let mut uri: http::Uri = sanitized_url.parse()
-            .map_err(|e: http::uri::InvalidUri| ClientError::invalid_url(format!("invalid URL: {}", e)))?;
+        let mut uri: http::Uri = sanitized_url.parse().map_err(|e: http::uri::InvalidUri| {
+            ClientError::invalid_url(format!("invalid URL: {}", e))
+        })?;
 
         debug_record(log, v, 1, &format!("-> {} {}", config.method(), uri));
         if let Some(ref proxy) = config.proxy {
@@ -958,9 +1082,7 @@ impl HyperClient {
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let hash = crate::response::ResponseHash::compute(&resp.body_bytes, &resp.headers);
 
-            let debug_log = log.lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
+            let debug_log = log.lock().map(|guard| guard.clone()).unwrap_or_default();
 
             return Ok(Response {
                 url: uri.to_string(),
@@ -1009,18 +1131,23 @@ impl HyperClient {
             if is_redirect(resp.status) && config.should_follow_redirects() {
                 hops += 1;
                 if hops > config.redirect_limit() {
-                    return Err(ClientError::too_many_redirects(
-                        format!("too many redirects (limit: {})", config.redirect_limit()),
-                    ));
+                    return Err(ClientError::too_many_redirects(format!(
+                        "too many redirects (limit: {})",
+                        config.redirect_limit()
+                    )));
                 }
 
-                let location = resp.location.as_deref()
-                    .ok_or_else(|| ClientError::other(
-                        format!("redirect {} but no Location header", resp.status),
-                    ))?;
+                let location = resp.location.as_deref().ok_or_else(|| {
+                    ClientError::other(format!("redirect {} but no Location header", resp.status))
+                })?;
 
                 let next_uri = resolve_redirect(&uri, location)?;
-                debug_record(log, v, 1, &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri));
+                debug_record(
+                    log,
+                    v,
+                    1,
+                    &format!("   Redirect #{}: {} -> {}", hops, uri, next_uri),
+                );
 
                 redirect_chain.push(RedirectHop {
                     url: uri.to_string(),
@@ -1034,12 +1161,22 @@ impl HyperClient {
             let body = String::from_utf8(resp.body_bytes.clone())
                 .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
 
-            let cert_info = cached.as_ref()
+            let cert_info = cached
+                .as_ref()
                 .and_then(|c| c.cert_slot.lock().ok())
                 .and_then(|guard| guard.clone());
 
             let elapsed_ms = start.elapsed().as_millis() as u64;
-            debug_record(log, v, 1, &format!("   Total time: {}ms ({} redirect(s))", elapsed_ms, redirect_chain.len()));
+            debug_record(
+                log,
+                v,
+                1,
+                &format!(
+                    "   Total time: {}ms ({} redirect(s))",
+                    elapsed_ms,
+                    redirect_chain.len()
+                ),
+            );
 
             if let Some(ref info) = cert_info {
                 debug_record(log, v, 1, &format!("   Cert CN: {:?}", info.common_name));
@@ -1049,9 +1186,7 @@ impl HyperClient {
             let hash = crate::response::ResponseHash::compute(&resp.body_bytes, &resp.headers);
 
             // Extract collected debug messages
-            let debug_log = log.lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
+            let debug_log = log.lock().map(|guard| guard.clone()).unwrap_or_default();
 
             return Ok(Response {
                 url: uri.to_string(),
@@ -1076,21 +1211,24 @@ fn decompress(encoding: &str, data: &[u8]) -> Result<Vec<u8>, ClientError> {
         "gzip" => {
             let mut decoder = flate2::read::GzDecoder::new(data);
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf)
+            decoder
+                .read_to_end(&mut buf)
                 .map_err(|e| ClientError::other(format!("gzip decompression failed: {}", e)))?;
             Ok(buf)
         }
         "deflate" => {
             let mut decoder = flate2::read::DeflateDecoder::new(data);
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf)
+            decoder
+                .read_to_end(&mut buf)
                 .map_err(|e| ClientError::other(format!("deflate decompression failed: {}", e)))?;
             Ok(buf)
         }
         "br" => {
             let mut decoder = brotli::Decompressor::new(data, 4096);
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf)
+            decoder
+                .read_to_end(&mut buf)
                 .map_err(|e| ClientError::other(format!("brotli decompression failed: {}", e)))?;
             Ok(buf)
         }
@@ -1103,7 +1241,9 @@ where
     B: hyper::body::Body<Data = bytes::Bytes>,
     B::Error: std::fmt::Display,
 {
-    let collected = body.collect().await
+    let collected = body
+        .collect()
+        .await
         .map_err(|e| ClientError::connection(format!("failed to read body: {}", e)))?;
 
     let bytes = collected.to_bytes();

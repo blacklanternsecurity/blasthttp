@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::client::{HttpClient, ClientError};
+use crate::client::{ClientError, HttpClient};
 use crate::config::RequestConfig;
 use crate::response::Response;
 
@@ -141,10 +141,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_runs_concurrently() {
-        let client = Arc::new(
-            MockClient::new(200, "ok".to_string())
-                .with_delay(Duration::from_millis(100))
-        );
+        let client =
+            Arc::new(MockClient::new(200, "ok".to_string()).with_delay(Duration::from_millis(100)));
 
         let configs: Vec<RequestConfig> = (0..5)
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
@@ -155,17 +153,18 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
-        assert!(elapsed < Duration::from_millis(300),
-            "batch took {:?}, expected < 300ms (concurrent)", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "batch took {:?}, expected < 300ms (concurrent)",
+            elapsed
+        );
         assert_eq!(client.peak_concurrent(), 5);
     }
 
     #[tokio::test]
     async fn test_batch_respects_concurrency_limit() {
-        let client = Arc::new(
-            MockClient::new(200, "ok".to_string())
-                .with_delay(Duration::from_millis(100))
-        );
+        let client =
+            Arc::new(MockClient::new(200, "ok".to_string()).with_delay(Duration::from_millis(100)));
 
         let configs: Vec<RequestConfig> = (0..10)
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
@@ -174,16 +173,17 @@ mod tests {
         let results = send_batch(client.clone(), configs, 2, None, None).await;
 
         assert_eq!(results.len(), 10);
-        assert!(client.peak_concurrent() <= 2,
-            "peak concurrent was {}, expected <= 2", client.peak_concurrent());
+        assert!(
+            client.peak_concurrent() <= 2,
+            "peak concurrent was {}, expected <= 2",
+            client.peak_concurrent()
+        );
     }
 
     #[tokio::test]
     async fn test_batch_concurrency_one_is_sequential() {
-        let client = Arc::new(
-            MockClient::new(200, "ok".to_string())
-                .with_delay(Duration::from_millis(50))
-        );
+        let client =
+            Arc::new(MockClient::new(200, "ok".to_string()).with_delay(Duration::from_millis(50)));
 
         let configs: Vec<RequestConfig> = (0..4)
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
@@ -195,8 +195,11 @@ mod tests {
 
         assert_eq!(results.len(), 4);
         assert_eq!(client.peak_concurrent(), 1);
-        assert!(elapsed >= Duration::from_millis(180),
-            "batch took {:?}, expected >= 180ms (sequential)", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "batch took {:?}, expected >= 180ms (sequential)",
+            elapsed
+        );
     }
 
     // ── Rate limiting tests ──────────────────────────────────────
@@ -214,8 +217,11 @@ mod tests {
 
         assert_eq!(results.len(), 5);
         // No rate limit + no delay = nearly instant
-        assert!(elapsed < Duration::from_millis(100),
-            "unlimited batch took {:?}, expected < 100ms", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "unlimited batch took {:?}, expected < 100ms",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -232,11 +238,17 @@ mod tests {
 
         assert_eq!(results.len(), 5);
         // 5 requests at 10/sec = 4 intervals × 100ms = ~400ms minimum
-        assert!(elapsed >= Duration::from_millis(350),
-            "rate-limited batch took {:?}, expected >= 350ms", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "rate-limited batch took {:?}, expected >= 350ms",
+            elapsed
+        );
         // But shouldn't be wildly over either
-        assert!(elapsed < Duration::from_millis(700),
-            "rate-limited batch took {:?}, expected < 700ms", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "rate-limited batch took {:?}, expected < 700ms",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -253,18 +265,19 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         // 3 requests at 1/sec = 2 intervals × 1s = ~2s minimum
-        assert!(elapsed >= Duration::from_millis(1800),
-            "1/sec batch took {:?}, expected >= 1800ms", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(1800),
+            "1/sec batch took {:?}, expected >= 1800ms",
+            elapsed
+        );
     }
 
     #[tokio::test]
     async fn test_rate_limit_with_concurrency() {
         // Rate limit AND concurrency together
         // 20 req/s = 50ms intervals, concurrency=2, 4 requests with 100ms delay each
-        let client = Arc::new(
-            MockClient::new(200, "ok".to_string())
-                .with_delay(Duration::from_millis(100))
-        );
+        let client =
+            Arc::new(MockClient::new(200, "ok".to_string()).with_delay(Duration::from_millis(100)));
 
         let configs: Vec<RequestConfig> = (0..4)
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
@@ -293,8 +306,11 @@ mod tests {
 
         assert_eq!(results.len(), 5);
         // 5 requests at 10/sec = 4 intervals × 100ms = ~400ms minimum
-        assert!(elapsed >= Duration::from_millis(350),
-            "shared-limited batch took {:?}, expected >= 350ms", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "shared-limited batch took {:?}, expected >= 350ms",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -325,9 +341,15 @@ mod tests {
 
         assert_eq!(r1.len() + r2.len(), 10);
         // 10 requests sharing one 10 rps limiter = 9 intervals × 100ms = ~900ms
-        assert!(elapsed >= Duration::from_millis(800),
-            "concurrent batches took {:?}, expected >= 800ms", elapsed);
-        assert!(elapsed < Duration::from_millis(1300),
-            "concurrent batches took {:?}, expected < 1300ms", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(800),
+            "concurrent batches took {:?}, expected >= 800ms",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(1300),
+            "concurrent batches took {:?}, expected < 1300ms",
+            elapsed
+        );
     }
 }
