@@ -10,6 +10,16 @@
 
 Offensive-first HTTP library written in Rust with Python bindings. Built for [BBOT](https://github.com/blacklanternsecurity/bbot).
 
+## Installation
+
+```bash
+# Python
+pip install blasthttp
+
+# Rust
+cargo add blasthttp
+```
+
 ## Key Advantages
 
 - **Batch connection reuse** — connections are pooled and reused within a batch, dramatically reducing overhead when scanning many URLs on the same hosts
@@ -148,7 +158,7 @@ The client-level rate limit takes precedence over the per-call `rate_limit` para
 ### Prerequisites
 
 - Rust (2024 edition) — install via [rustup](https://rustup.rs/)
-- Python 3.9+ (for Python bindings)
+- Python 3.10+ (for Python bindings)
 - Standard C build tools (`build-essential` / `gcc`, `make`, `perl`)
 - `curl` or `wget` (for OpenSSL download)
 
