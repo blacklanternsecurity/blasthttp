@@ -827,7 +827,9 @@ fn build_request(
     } else {
         uri.clone()
     };
-    let mut builder = hyper::Request::builder().method(config.method()).uri(effective_uri);
+    let mut builder = hyper::Request::builder()
+        .method(config.method())
+        .uri(effective_uri);
 
     // Check which default headers the caller has already provided.
     // Note: we only check for the *presence* of a custom header to decide whether
@@ -835,7 +837,9 @@ fn build_request(
     // duplicates), so callers can send multiple Host headers if needed.
     let custom = config.headers.as_deref().unwrap_or(&[]);
     let has_custom_host = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
-    let has_custom_ua = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+    let has_custom_ua = custom
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
     let has_custom_ae = custom
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
