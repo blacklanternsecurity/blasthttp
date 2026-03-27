@@ -546,7 +546,7 @@ async fn dispatch_request(
     config: &RequestConfig,
     log: &DebugLog,
 ) -> Result<SingleResponse, ClientError> {
-    let request = build_request(uri, config)?;
+    let request = build_request(uri, config, false)?;
     let v = config.verbosity;
 
     debug_record(log, v, 1, "   Request headers:");
@@ -702,7 +702,10 @@ async fn dispatch_raw(
         target_uri.clone()
     };
 
-    let request = build_request(&request_uri, config)?;
+    // Use origin-form unless request_target was explicitly set (caller wants
+    // exact control over the request-line, e.g. absolute-form for SSRF testing).
+    let use_origin_form = config.request_target.is_none();
+    let request = build_request(&request_uri, config, use_origin_form)?;
 
     debug_record(log, v, 1, "   Request headers:");
     for (name, value) in request.headers() {
@@ -780,7 +783,7 @@ async fn dispatch_forward_proxy(
     });
 
     // Build request with absolute-form URI (SendRequest does NOT normalize it)
-    let request = build_request(target_uri, config)?;
+    let request = build_request(target_uri, config, false)?;
     let v = config.verbosity;
 
     debug_record(log, v, 1, "   Request headers:");
@@ -805,25 +808,47 @@ async fn dispatch_forward_proxy(
 fn build_request(
     uri: &http::Uri,
     config: &RequestConfig,
+    origin_form: bool,
 ) -> Result<hyper::Request<FullBody>, ClientError> {
-    let mut builder = hyper::Request::builder().method(config.method()).uri(uri);
+    // For direct connections (dispatch_raw), use origin-form (path + query only)
+    // in the request-line per RFC 7230 §5.3.1. For pooled/client connections,
+    // hyper needs the full URI for routing.
+    let effective_uri = if origin_form {
+        let path = uri.path();
+        if let Some(q) = uri.query() {
+            format!("{}?{}", path, q)
+                .parse::<http::Uri>()
+                .unwrap_or_else(|_| uri.clone())
+        } else if path.is_empty() {
+            "/".parse::<http::Uri>().unwrap()
+        } else {
+            path.parse::<http::Uri>().unwrap_or_else(|_| uri.clone())
+        }
+    } else {
+        uri.clone()
+    };
+    let mut builder = hyper::Request::builder().method(config.method()).uri(effective_uri);
 
-    // Check if custom headers include User-Agent and Accept-Encoding
-    let has_custom_ua = config
-        .headers
-        .as_ref()
-        .map(|h| h.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")))
-        .unwrap_or(false);
-    let has_custom_ae = config
-        .headers
-        .as_ref()
-        .map(|h| {
-            h.iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
-        })
-        .unwrap_or(false);
+    // Check which default headers the caller has already provided.
+    // Note: we only check for the *presence* of a custom header to decide whether
+    // to add a default. Custom headers are always appended as-is (including
+    // duplicates), so callers can send multiple Host headers if needed.
+    let custom = config.headers.as_deref().unwrap_or(&[]);
+    let has_custom_host = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
+    let has_custom_ua = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+    let has_custom_ae = custom
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
 
-    // Only add defaults if not overridden by caller
+    // Auto-set Host from URI (HTTP/1.1 requirement) unless the caller supplies
+    // their own.  hyper's low-level handshake API (used by dispatch_raw for
+    // resolve_ip / request_target) does not auto-set Host, so we must do it.
+    if !has_custom_host {
+        if let Some(authority) = uri.authority() {
+            builder = builder.header("Host", authority.as_str());
+        }
+    }
+
     if !has_custom_ua {
         builder = builder.header("User-Agent", "blasthttp/0.1.0");
     }
@@ -1299,5 +1324,66 @@ mod tests {
         assert_eq!(retry_backoff(0, min, max), Duration::from_millis(500));
         // 2^1 × 500ms = 1000ms
         assert_eq!(retry_backoff(1, min, max), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn test_build_request_auto_host_from_uri() {
+        let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
+        let config = RequestConfig::new("http://example.com:8080/path".to_string());
+        let req = build_request(&uri, &config, true).unwrap();
+        assert_eq!(req.headers().get("host").unwrap(), "example.com:8080");
+    }
+
+    #[test]
+    fn test_build_request_custom_host_overrides_auto() {
+        let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
+        let mut config = RequestConfig::new("http://example.com:8080/path".to_string());
+        config.headers = Some(vec![("Host".to_string(), "custom.host".to_string())]);
+        let req = build_request(&uri, &config, true).unwrap();
+        // Should only have the custom Host, not auto-derived
+        let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0], "custom.host");
+    }
+
+    #[test]
+    fn test_build_request_multiple_host_headers() {
+        let uri: http::Uri = "http://example.com/".parse().unwrap();
+        let mut config = RequestConfig::new("http://example.com/".to_string());
+        config.headers = Some(vec![
+            ("Host".to_string(), "first.host".to_string()),
+            ("Host".to_string(), "second.host".to_string()),
+        ]);
+        let req = build_request(&uri, &config, true).unwrap();
+        let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0], "first.host");
+        assert_eq!(hosts[1], "second.host");
+    }
+
+    #[test]
+    fn test_build_request_origin_form_strips_authority() {
+        let uri: http::Uri = "http://example.com:8080/path?q=1".parse().unwrap();
+        let config = RequestConfig::new("http://example.com:8080/path?q=1".to_string());
+        let req = build_request(&uri, &config, true).unwrap();
+        assert_eq!(req.uri(), "/path?q=1");
+    }
+
+    #[test]
+    fn test_build_request_absolute_form_preserves_uri() {
+        let uri: http::Uri = "http://example.com:8080/path?q=1".parse().unwrap();
+        let config = RequestConfig::new("http://example.com:8080/path?q=1".to_string());
+        let req = build_request(&uri, &config, false).unwrap();
+        assert_eq!(req.uri().to_string(), "http://example.com:8080/path?q=1");
+    }
+
+    #[test]
+    fn test_build_request_request_target_absolute_form() {
+        // When request_target is set, the caller wants exact control.
+        // Simulate: origin_form=false (as dispatch_raw does when request_target is Some)
+        let uri: http::Uri = "http://evil.com/admin".parse().unwrap();
+        let config = RequestConfig::new("http://example.com/".to_string());
+        let req = build_request(&uri, &config, false).unwrap();
+        assert_eq!(req.uri().to_string(), "http://evil.com/admin");
     }
 }
