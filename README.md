@@ -130,6 +130,32 @@ for r in results:
 client.download("https://example.com/file.zip", "/tmp/file.zip")
 ```
 
+### DNS Pinning & Request-Line Control
+
+Use `resolve_ip` to connect to a specific IP while keeping the original hostname for SNI and Host header — like `curl --resolve`:
+
+```python
+# Connect to 93.184.215.14 but use example.com for TLS SNI and Host header
+response = client.request("https://example.com/", resolve_ip="93.184.215.14")
+
+# Virtual host scanning: override Host header while pinning to target IP
+response = client.request(
+    "http://target.com/",
+    headers=[("Host", "secret-vhost.target.com")],
+    resolve_ip="10.0.0.1",
+)
+```
+
+Use `request_target` to override the request-line URI (e.g. for SSRF testing or request smuggling):
+
+```python
+# Send "GET http://internal.server/admin HTTP/1.1" on the wire
+response = client.request(
+    "http://proxy.target.com/",
+    request_target="http://internal.server/admin",
+)
+```
+
 ### Global Rate Limiting
 
 Set a client-level rate limit (requests per second) that applies to **all** request methods — `request()`, `request_batch()`, and `download()`:
