@@ -847,10 +847,8 @@ fn build_request(
     // Auto-set Host from URI (HTTP/1.1 requirement) unless the caller supplies
     // their own.  hyper's low-level handshake API (used by dispatch_raw for
     // resolve_ip / request_target) does not auto-set Host, so we must do it.
-    if !has_custom_host {
-        if let Some(authority) = uri.authority() {
-            builder = builder.header("Host", authority.as_str());
-        }
+    if !has_custom_host && let Some(authority) = uri.authority() {
+        builder = builder.header("Host", authority.as_str());
     }
 
     if !has_custom_ua {
