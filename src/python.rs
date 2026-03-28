@@ -378,7 +378,8 @@ impl BlastHTTP {
     /// Send a batch of requests concurrently. Returns list of BatchResult objects.
     /// Each result has .url, .response (or None), and .error (or None).
     /// rate_limit: max requests per second (None = unlimited).
-    /// If set_rate_limit() was called on this client, that takes precedence.
+    /// If both set_rate_limit() and rate_limit are set, the more restrictive
+    /// (lower RPS) limit is used.
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch(
         &self,
