@@ -28,6 +28,10 @@ impl RateLimiter {
         }
     }
 
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
     pub async fn acquire(&self) {
         let mut next = self.next.lock().await;
         tokio::time::sleep_until(*next).await;
@@ -45,8 +49,24 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
     shared_limiter: Option<Arc<RateLimiter>>,
 ) -> Vec<BatchResult> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    // Client-level limiter takes precedence, then per-call, then unlimited
-    let limiter = shared_limiter.or_else(|| rate_limit.map(|rps| Arc::new(RateLimiter::new(rps))));
+    // When both a client-level and per-call rate limit are set, use the more
+    // restrictive (lower RPS) of the two. This lets modules enforce a tighter
+    // rate than the global without overriding the global for other callers.
+    let limiter = match (shared_limiter, rate_limit) {
+        (Some(shared), Some(per_call_rps)) => {
+            let shared_interval = shared.interval();
+            let per_call_interval = Duration::from_secs_f64(1.0 / per_call_rps);
+            if per_call_interval > shared_interval {
+                // Per-call limit is more restrictive (slower), use it
+                Some(Arc::new(RateLimiter::new(per_call_rps)))
+            } else {
+                Some(shared)
+            }
+        }
+        (Some(shared), None) => Some(shared),
+        (None, Some(rps)) => Some(Arc::new(RateLimiter::new(rps))),
+        (None, None) => None,
+    };
     let mut handles = Vec::new();
 
     for config in configs {
@@ -292,8 +312,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shared_limiter_takes_precedence() {
-        // shared_limiter at 10 rps should override per-call None
+    async fn test_shared_limiter_applies_when_no_per_call() {
+        // shared_limiter at 10 rps should apply when per-call is None
         let client = Arc::new(MockClient::new(200, "ok".to_string()));
         let configs: Vec<RequestConfig> = (0..5)
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
@@ -309,6 +329,52 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(350),
             "shared-limited batch took {:?}, expected >= 350ms",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_call_wins_when_more_restrictive() {
+        // shared = 100 rps (10ms intervals), per-call = 10 rps (100ms intervals)
+        // Per-call is more restrictive, should be used
+        let client = Arc::new(MockClient::new(200, "ok".to_string()));
+        let configs: Vec<RequestConfig> = (0..5)
+            .map(|i| RequestConfig::new(format!("https://{}.com", i)))
+            .collect();
+
+        let shared = Arc::new(RateLimiter::new(100.0));
+        let start = Instant::now();
+        let results = send_batch(client, configs, 50, Some(10.0), Some(shared)).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 5);
+        // Per-call 10 rps should win: 4 intervals × 100ms = ~400ms
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "batch took {:?}, expected >= 350ms (per-call 10 rps should win)",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_wins_when_more_restrictive() {
+        // shared = 10 rps (100ms intervals), per-call = 100 rps (10ms intervals)
+        // Shared is more restrictive, should be used
+        let client = Arc::new(MockClient::new(200, "ok".to_string()));
+        let configs: Vec<RequestConfig> = (0..5)
+            .map(|i| RequestConfig::new(format!("https://{}.com", i)))
+            .collect();
+
+        let shared = Arc::new(RateLimiter::new(10.0));
+        let start = Instant::now();
+        let results = send_batch(client, configs, 50, Some(100.0), Some(shared)).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 5);
+        // Shared 10 rps should win: 4 intervals × 100ms = ~400ms
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "batch took {:?}, expected >= 350ms (shared 10 rps should win)",
             elapsed
         );
     }
