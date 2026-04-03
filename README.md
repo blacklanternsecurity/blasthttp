@@ -104,30 +104,33 @@ Output is JSON (one object per response), including status, headers, redirect ch
 
 ## Python API
 
+All request methods are async — they return native Python coroutines via `pyo3-async-runtimes`.
+
 ```python
+import asyncio
 import blasthttp
 
-# Check version
-print(blasthttp.__version__)  # e.g. "0.1.0"
+async def main():
+    client = blasthttp.BlastHTTP()
 
-client = blasthttp.BlastHTTP()
+    # Single request
+    response = await client.request("https://example.com")
+    print(response.status, len(response.body))
 
-# Single request
-response = client.request("https://example.com")
-print(response.status, len(response.body))
+    # Batch requests
+    configs = [
+        blasthttp.BatchConfig("https://a.com"),
+        blasthttp.BatchConfig("https://b.com", method="POST", body="data"),
+    ]
+    results = await client.request_batch(configs, concurrency=50)
+    for r in results:
+        if r.success:
+            print(r.url, r.response.status)
 
-# Batch requests
-configs = [
-    {"url": "https://a.com"},
-    {"url": "https://b.com", "method": "POST", "body": "data"},
-]
-results = client.request_batch(configs, concurrency=50)
-for r in results:
-    if r.success:
-        print(r.url, r.response.status)
+    # Download to file
+    await client.download("https://example.com/file.zip", "/tmp/file.zip")
 
-# Download to file
-client.download("https://example.com/file.zip", "/tmp/file.zip")
+asyncio.run(main())
 ```
 
 ### DNS Pinning & Request-Line Control
@@ -136,10 +139,10 @@ Use `resolve_ip` to connect to a specific IP while keeping the original hostname
 
 ```python
 # Connect to 93.184.215.14 but use example.com for TLS SNI and Host header
-response = client.request("https://example.com/", resolve_ip="93.184.215.14")
+response = await client.request("https://example.com/", resolve_ip="93.184.215.14")
 
 # Virtual host scanning: override Host header while pinning to target IP
-response = client.request(
+response = await client.request(
     "http://target.com/",
     headers=[("Host", "secret-vhost.target.com")],
     resolve_ip="10.0.0.1",
@@ -150,7 +153,7 @@ Use `request_target` to override the request-line URI (e.g. for SSRF testing or 
 
 ```python
 # Send "GET http://internal.server/admin HTTP/1.1" on the wire
-response = client.request(
+response = await client.request(
     "http://proxy.target.com/",
     request_target="http://internal.server/admin",
 )
@@ -165,9 +168,9 @@ client = blasthttp.BlastHTTP()
 client.set_rate_limit(50)  # 50 requests/sec across all callers
 
 # All of these respect the 50 rps limit:
-client.request("https://example.com")
-client.request_batch(configs, concurrency=100)
-client.download("https://example.com/file", "/tmp/file")
+await client.request("https://example.com")
+await client.request_batch(configs, concurrency=100)
+await client.download("https://example.com/file", "/tmp/file")
 
 # Disable rate limiting
 client.set_rate_limit(0)
