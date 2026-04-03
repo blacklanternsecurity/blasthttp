@@ -5,6 +5,7 @@
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3_async_runtimes::tokio::future_into_py;
 use std::sync::Arc;
 
 use crate::batch::{self, RateLimiter};
@@ -260,7 +261,6 @@ impl PyBatchResult {
 #[pyclass]
 struct BlastHTTP {
     client: Arc<HyperClient>,
-    runtime: Arc<tokio::runtime::Runtime>,
     rate_limiter: Option<Arc<RateLimiter>>,
 }
 
@@ -268,12 +268,8 @@ struct BlastHTTP {
 impl BlastHTTP {
     #[new]
     fn new() -> PyResult<Self> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {}", e)))?;
-
         Ok(BlastHTTP {
             client: Arc::new(HyperClient::new()),
-            runtime: Arc::new(runtime),
             rate_limiter: None,
         })
     }
@@ -311,9 +307,9 @@ impl BlastHTTP {
         resolve_ip=None,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn request(
+    fn request<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         url: String,
         method: Option<String>,
         headers: Option<Vec<(String, String)>>,
@@ -333,7 +329,7 @@ impl BlastHTTP {
         raw_path: Option<bool>,
         request_target: Option<String>,
         resolve_ip: Option<String>,
-    ) -> PyResult<PyResponse> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let config = RequestConfig {
             url,
             method,
@@ -357,22 +353,19 @@ impl BlastHTTP {
             verbosity: 0,
         };
 
-        // Release the GIL during block_on so Python threads (e.g. test httpservers)
-        // can run while we wait for the Rust async runtime.
         let limiter = self.rate_limiter.clone();
         let client = self.client.clone();
-        let response = py.allow_threads(|| {
-            self.runtime
-                .block_on(async move {
-                    if let Some(ref limiter) = limiter {
-                        limiter.acquire().await;
-                    }
-                    client.send(&config).await
-                })
-                .map_err(|e| PyRuntimeError::new_err(e.message))
-        })?;
 
-        Ok(PyResponse { inner: response })
+        future_into_py(py, async move {
+            if let Some(ref limiter) = limiter {
+                limiter.acquire().await;
+            }
+            let response = client
+                .send(&config)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            Ok(PyResponse { inner: response })
+        })
     }
 
     /// Send a batch of requests concurrently. Returns list of BatchResult objects.
@@ -381,43 +374,48 @@ impl BlastHTTP {
     /// If both set_rate_limit() and rate_limit are set, the more restrictive
     /// (lower RPS) limit is used.
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
-    fn request_batch(
+    fn request_batch<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         configs: Vec<PyBatchConfig>,
         concurrency: usize,
         rate_limit: Option<f64>,
-    ) -> PyResult<Vec<PyBatchResult>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
             .map(|c| c.into_request_config())
             .collect();
 
         let shared_limiter = self.rate_limiter.clone();
-        let results = py.allow_threads(|| {
-            self.runtime.block_on(batch::send_batch(
-                self.client.clone(),
+        let client = self.client.clone();
+
+        future_into_py(py, async move {
+            let results = batch::send_batch(
+                client,
                 request_configs,
                 concurrency,
                 rate_limit,
                 shared_limiter,
-            ))
-        });
+            )
+            .await;
 
-        Ok(results
-            .into_iter()
-            .map(|r| {
-                let (response, error) = match r.result {
-                    Ok(resp) => (Some(resp), None),
-                    Err(e) => (None, Some(e.message)),
-                };
-                PyBatchResult {
-                    url: r.url,
-                    response,
-                    error,
-                }
-            })
-            .collect())
+            let py_results: Vec<PyBatchResult> = results
+                .into_iter()
+                .map(|r| {
+                    let (response, error) = match r.result {
+                        Ok(resp) => (Some(resp), None),
+                        Err(e) => (None, Some(e.message)),
+                    };
+                    PyBatchResult {
+                        url: r.url,
+                        response,
+                        error,
+                    }
+                })
+                .collect();
+
+            Ok(py_results)
+        })
     }
 
     /// Download a URL directly to a local file.
@@ -434,9 +432,9 @@ impl BlastHTTP {
         retries=None,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn download(
+    fn download<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         url: String,
         path: String,
         max_size: Option<usize>,
@@ -445,7 +443,7 @@ impl BlastHTTP {
         proxy: Option<String>,
         headers: Option<Vec<(String, String)>>,
         retries: Option<u32>,
-    ) -> PyResult<String> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let config = RequestConfig {
             url,
             method: Some("GET".to_string()),
@@ -471,26 +469,26 @@ impl BlastHTTP {
 
         let limiter = self.rate_limiter.clone();
         let client = self.client.clone();
-        let response = py.allow_threads(|| {
-            self.runtime
-                .block_on(async move {
-                    if let Some(ref limiter) = limiter {
-                        limiter.acquire().await;
-                    }
-                    client.send(&config).await
-                })
-                .map_err(|e| PyRuntimeError::new_err(e.message))
-        })?;
 
-        // Write body bytes to file
-        let mut file = std::fs::File::create(&path).map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to create file '{}': {}", path, e))
-        })?;
-        file.write_all(&response.body_bytes).map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to write to '{}': {}", path, e))
-        })?;
+        future_into_py(py, async move {
+            if let Some(ref limiter) = limiter {
+                limiter.acquire().await;
+            }
+            let response = client
+                .send(&config)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.message))?;
 
-        Ok(path)
+            // Write body bytes to file
+            let mut file = std::fs::File::create(&path).map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to create file '{}': {}", path, e))
+            })?;
+            file.write_all(&response.body_bytes).map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to write to '{}': {}", path, e))
+            })?;
+
+            Ok(path)
+        })
     }
 }
 
