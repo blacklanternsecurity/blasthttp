@@ -578,27 +578,25 @@ async fn dispatch_request(
     parse_response(hyper_response, config, log).await
 }
 
-/// Raw dispatch for requests needing resolve_ip and/or request_target.
+/// Opens a fresh TCP connection (optionally to a resolved IP instead of DNS)
+/// and performs TLS if HTTPS (with SNI set to the original hostname).
+/// Returns the connected stream and any certificate info collected during
+/// the TLS handshake.
 ///
-/// Opens a fresh TCP connection (optionally to a resolved IP instead of DNS),
-/// performs TLS if HTTPS (with SNI set to the original hostname), then sends
-/// the request via HTTP/1.1. If request_target is set, it overrides the URI
-/// in the request line.
-///
-/// This bypasses the cached HyperClient connection pool — fine for low-volume
-/// specialized requests (host_header, generic_ssrf, virtualhost discovery).
-async fn dispatch_raw(
+/// Shared setup used by `dispatch_direct` (one-shot hyper requests over an
+/// un-pooled socket) and by callers that need a long-lived, unframed handle
+/// to a TCP or TLS stream.
+async fn connect_stream(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
-) -> Result<(SingleResponse, Option<CertInfo>), ClientError> {
+) -> Result<(Box<dyn IoReadWrite + Send + Unpin>, Option<CertInfo>), ClientError> {
     let v = config.verbosity;
     let host = target_uri.host().unwrap_or("").to_string();
     let is_https = target_uri.scheme_str() == Some("https");
     let default_port = if is_https { 443 } else { 80 };
     let port = target_uri.port_u16().unwrap_or(default_port);
 
-    // Determine TCP connect address
     let connect_addr = if let Some(ref ip) = config.resolve_ip {
         format!("{}:{}", ip, port)
     } else {
@@ -610,7 +608,7 @@ async fn dispatch_raw(
         v,
         1,
         &format!(
-            "   dispatch_raw: connecting to {} (host={})",
+            "   connect_stream: connecting to {} (host={})",
             connect_addr, host,
         ),
     );
@@ -621,70 +619,83 @@ async fn dispatch_raw(
             ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
         })?;
 
-    let mut cert_info: Option<CertInfo> = None;
+    if !is_https {
+        return Ok((Box::new(tcp), None));
+    }
 
-    let io: hyper_util::rt::TokioIo<Box<dyn IoReadWrite + Send + Unpin>> = if is_https {
-        // TLS handshake with SNI set to the original hostname
-        ensure_legacy_provider();
+    ensure_legacy_provider();
 
-        let mut ssl_builder =
-            openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
-                .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
+    let mut ssl_builder =
+        openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
+            .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
-        ssl_builder.set_security_level(0);
+    ssl_builder.set_security_level(0);
 
-        if !config.should_verify_certs() {
-            ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
-        }
-        if let Some(ref ciphers) = config.cipher_string {
-            ssl_builder.set_cipher_list(ciphers).map_err(|e| {
-                ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
-            })?;
-        }
-        if let Some(ref min_ver) = config.min_tls_version {
-            let version = parse_tls_version(min_ver)?;
-            ssl_builder
-                .set_min_proto_version(Some(version))
-                .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
-        }
-        if let Some(ref max_ver) = config.max_tls_version {
-            let version = parse_tls_version(max_ver)?;
-            ssl_builder
-                .set_max_proto_version(Some(version))
-                .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
-        }
-        // HTTP/1.1 only for raw dispatch (request_target doesn't apply to h2)
+    if !config.should_verify_certs() {
+        ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+    }
+    if let Some(ref ciphers) = config.cipher_string {
+        ssl_builder.set_cipher_list(ciphers).map_err(|e| {
+            ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
+        })?;
+    }
+    if let Some(ref min_ver) = config.min_tls_version {
+        let version = parse_tls_version(min_ver)?;
         ssl_builder
-            .set_alpn_protos(b"\x08http/1.1")
-            .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
+            .set_min_proto_version(Some(version))
+            .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
+    }
+    if let Some(ref max_ver) = config.max_tls_version {
+        let version = parse_tls_version(max_ver)?;
+        ssl_builder
+            .set_max_proto_version(Some(version))
+            .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
+    }
+    // HTTP/1.1 only on direct connections — request_target/resolve_ip paths
+    // cannot negotiate h2 meaningfully.
+    ssl_builder
+        .set_alpn_protos(b"\x08http/1.1")
+        .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
-        let ssl_connector = ssl_builder.build();
-        let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
-            .map_err(|e| ClientError::tls(format!("SSL conf failed: {}", e)))?;
+    let ssl_connector = ssl_builder.build();
+    let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
+        .map_err(|e| ClientError::tls(format!("SSL conf failed: {}", e)))?;
 
-        // SNI = original hostname, NOT the resolved IP
-        if host.parse::<std::net::IpAddr>().is_err() {
-            ssl_conf
-                .set_hostname(&host)
-                .map_err(|e| ClientError::tls(format!("SNI setup failed: {}", e)))?;
-        }
+    // SNI = original hostname, NOT the resolved IP
+    if host.parse::<std::net::IpAddr>().is_err() {
+        ssl_conf
+            .set_hostname(&host)
+            .map_err(|e| ClientError::tls(format!("SNI setup failed: {}", e)))?;
+    }
 
-        let mut tls_stream = tokio_openssl::SslStream::new(ssl_conf, tcp)
-            .map_err(|e| ClientError::tls(format!("TLS stream setup failed: {}", e)))?;
+    let mut tls_stream = tokio_openssl::SslStream::new(ssl_conf, tcp)
+        .map_err(|e| ClientError::tls(format!("TLS stream setup failed: {}", e)))?;
 
-        Pin::new(&mut tls_stream)
-            .connect()
-            .await
-            .map_err(|e| ClientError::tls(format!("TLS handshake failed: {}", e)))?;
+    Pin::new(&mut tls_stream)
+        .connect()
+        .await
+        .map_err(|e| ClientError::tls(format!("TLS handshake failed: {}", e)))?;
 
-        cert_info = extract_cert_info(tls_stream.ssl());
+    let cert_info = extract_cert_info(tls_stream.ssl());
 
-        hyper_util::rt::TokioIo::new(Box::new(tls_stream) as Box<dyn IoReadWrite + Send + Unpin>)
-    } else {
-        hyper_util::rt::TokioIo::new(Box::new(tcp) as Box<dyn IoReadWrite + Send + Unpin>)
-    };
+    Ok((Box::new(tls_stream), cert_info))
+}
 
-    // HTTP/1.1 handshake
+/// One-shot HTTP/1.1 request over a direct, un-pooled connection. Used when
+/// `resolve_ip` or `request_target` is set and hyper's Client wrapper would
+/// either normalize the URI (stripping absolute-form) or route through the
+/// shared connection pool, neither of which matches the caller's intent for
+/// these specialized requests (host_header, generic_ssrf, virtualhost
+/// discovery).
+async fn dispatch_direct(
+    target_uri: &http::Uri,
+    config: &RequestConfig,
+    log: &DebugLog,
+) -> Result<(SingleResponse, Option<CertInfo>), ClientError> {
+    let v = config.verbosity;
+    let (stream, cert_info) = connect_stream(target_uri, config, log).await?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
         .map_err(|e| ClientError::connection(format!("HTTP handshake failed: {}", e)))?;
@@ -692,7 +703,6 @@ async fn dispatch_raw(
         let _ = conn.await;
     });
 
-    // Build request — use request_target as URI if set, otherwise use target_uri
     let request_uri = if let Some(ref rt) = config.request_target {
         rt.parse::<http::Uri>()
             .map_err(|e: http::uri::InvalidUri| {
@@ -716,10 +726,10 @@ async fn dispatch_raw(
             &format!("     {}: {}", name, value.to_str().unwrap_or("<binary>")),
         );
     }
-    debug_record(log, v, 1, "   Sending request via dispatch_raw...");
+    debug_record(log, v, 1, "   Sending request via dispatch_direct...");
 
     let hyper_response = sender.send_request(request).await.map_err(|e| {
-        let msg = format!("dispatch_raw request failed: {}", e);
+        let msg = format!("dispatch_direct request failed: {}", e);
         let err_str = e.to_string().to_lowercase();
         if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
             ClientError::tls(msg)
@@ -732,7 +742,9 @@ async fn dispatch_raw(
     Ok((resp, cert_info))
 }
 
-/// Trait alias for streams usable in dispatch_raw (both TcpStream and SslStream).
+/// Stream types returned by `connect_stream`: plain TCP or TLS over TCP.
+/// Boxed as `Box<dyn IoReadWrite + Send + Unpin>` so callers can hold the
+/// stream without knowing which variant they got.
 trait IoReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
 impl IoReadWrite for tokio::net::TcpStream {}
 impl IoReadWrite for tokio_openssl::SslStream<tokio::net::TcpStream> {}
@@ -810,7 +822,7 @@ fn build_request(
     config: &RequestConfig,
     origin_form: bool,
 ) -> Result<hyper::Request<FullBody>, ClientError> {
-    // For direct connections (dispatch_raw), use origin-form (path + query only)
+    // For direct connections (dispatch_direct), use origin-form (path + query only)
     // in the request-line per RFC 7230 §5.3.1. For pooled/client connections,
     // hyper needs the full URI for routing.
     let effective_uri = if origin_form {
@@ -845,7 +857,7 @@ fn build_request(
         .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
 
     // Auto-set Host from URI (HTTP/1.1 requirement) unless the caller supplies
-    // their own.  hyper's low-level handshake API (used by dispatch_raw for
+    // their own.  hyper's low-level handshake API (used by dispatch_direct for
     // resolve_ip / request_target) does not auto-set Host, so we must do it.
     if !has_custom_host && let Some(authority) = uri.authority() {
         builder = builder.header("Host", authority.as_str());
@@ -1093,15 +1105,15 @@ impl HyperClient {
             debug_record(log, v, 1, &format!("   Request target: {}", rt));
         }
 
-        // dispatch_raw: used when resolve_ip or request_target is set.
+        // dispatch_direct: used when resolve_ip or request_target is set.
         // Bypasses the cached connection pool — opens a fresh TCP connection.
         if config.resolve_ip.is_some() || config.request_target.is_some() {
             let redirect_chain: Vec<RedirectHop> = Vec::new();
-            let (resp, cert_info) = dispatch_raw(&uri, config, log).await?;
+            let (resp, cert_info) = dispatch_direct(&uri, config, log).await?;
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
-            // No redirect following for dispatch_raw — these are specialized
+            // No redirect following for dispatch_direct — these are specialized
             // requests (host_header, SSRF) that need exact control.
             let body = String::from_utf8(resp.body_bytes.clone())
                 .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
@@ -1382,7 +1394,7 @@ mod tests {
     #[test]
     fn test_build_request_request_target_absolute_form() {
         // When request_target is set, the caller wants exact control.
-        // Simulate: origin_form=false (as dispatch_raw does when request_target is Some)
+        // Simulate: origin_form=false (as dispatch_direct does when request_target is Some)
         let uri: http::Uri = "http://evil.com/admin".parse().unwrap();
         let config = RequestConfig::new("http://example.com/".to_string());
         let req = build_request(&uri, &config, false).unwrap();
