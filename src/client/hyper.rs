@@ -591,16 +591,29 @@ pub(crate) async fn connect_stream(
     config: &RequestConfig,
     log: &DebugLog,
 ) -> Result<(Box<dyn IoReadWrite + Send + Unpin>, Option<CertInfo>), ClientError> {
+    use super::proxy::{self, ProxyScheme};
+
     let v = config.verbosity;
     let host = target_uri.host().unwrap_or("").to_string();
     let is_https = target_uri.scheme_str() == Some("https");
     let default_port = if is_https { 443 } else { 80 };
     let port = target_uri.port_u16().unwrap_or(default_port);
 
-    let connect_addr = if let Some(ref ip) = config.resolve_ip {
-        format!("{}:{}", ip, port)
-    } else {
-        format!("{}:{}", host, port)
+    // Decide initial hop. If a proxy is set, connect to the proxy first and
+    // tunnel from there. resolve_ip is ignored when a proxy is set — DNS
+    // resolution happens at the proxy for SOCKS5, and CONNECT addresses the
+    // target by hostname.
+    let proxy_config = match config.proxy.as_ref() {
+        Some(p) => Some(proxy::parse_proxy_url(p)?),
+        None => None,
+    };
+
+    let connect_addr = match &proxy_config {
+        Some(p) => format!("{}:{}", p.host, p.port),
+        None => match config.resolve_ip.as_ref() {
+            Some(ip) => format!("{}:{}", ip, port),
+            None => format!("{}:{}", host, port),
+        },
     };
 
     debug_record(
@@ -608,12 +621,19 @@ pub(crate) async fn connect_stream(
         v,
         1,
         &format!(
-            "   connect_stream: connecting to {} (host={})",
-            connect_addr, host,
+            "   connect_stream: connecting to {} (target={}:{}{})",
+            connect_addr,
+            host,
+            port,
+            if proxy_config.is_some() {
+                " via proxy"
+            } else {
+                ""
+            }
         ),
     );
 
-    let tcp = tokio::net::TcpStream::connect(&connect_addr)
+    let mut tcp = tokio::net::TcpStream::connect(&connect_addr)
         .await
         .map_err(|e| {
             ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
@@ -630,6 +650,31 @@ pub(crate) async fn connect_stream(
             v,
             1,
             &format!("   set_nodelay failed (non-fatal): {}", e),
+        );
+    }
+
+    // Proxy handshake: open a byte-transparent tunnel to the target.
+    if let Some(ref p) = proxy_config {
+        match p.scheme {
+            ProxyScheme::Http => {
+                proxy::perform_http_connect(&mut tcp, &host, port).await?;
+            }
+            ProxyScheme::Socks5 => {
+                proxy::perform_socks5(
+                    &mut tcp,
+                    &host,
+                    port,
+                    p.username.as_deref(),
+                    p.password.as_deref(),
+                )
+                .await?;
+            }
+        }
+        debug_record(
+            log,
+            v,
+            1,
+            &format!("   proxy tunnel to {}:{} established", host, port),
         );
     }
 

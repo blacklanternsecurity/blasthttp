@@ -106,6 +106,7 @@ impl std::fmt::Display for ClientError {
 }
 
 pub mod hyper;
+pub mod proxy;
 pub mod raw;
 
 #[cfg(test)]

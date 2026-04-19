@@ -508,6 +508,7 @@ impl BlastHTTP {
         min_tls_version=None,
         max_tls_version=None,
         resolve_ip=None,
+        proxy=None,
     ))]
     fn raw_connect<'py>(
         &self,
@@ -518,6 +519,7 @@ impl BlastHTTP {
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
         resolve_ip: Option<String>,
+        proxy: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut config = RequestConfig::new(url.clone());
         config.verify_certs = verify_certs;
@@ -525,6 +527,7 @@ impl BlastHTTP {
         config.min_tls_version = min_tls_version;
         config.max_tls_version = max_tls_version;
         config.resolve_ip = resolve_ip;
+        config.proxy = proxy;
 
         let limiter = self.rate_limiter.clone();
 
