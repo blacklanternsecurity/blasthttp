@@ -62,6 +62,16 @@ jobs:
           source .venv/bin/activate
           python -c "import blasthttp; print(f'blasthttp {blasthttp.__version__}')"
 
+      - name: Install test dependencies
+        run: |
+          source .venv/bin/activate
+          pip install 'pytest>=8' 'pytest-asyncio>=0.23'
+
+      - name: Run Python tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/python/ -v
+
   version-check:
     needs: python-tests
     if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
