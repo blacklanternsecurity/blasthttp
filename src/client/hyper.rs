@@ -619,6 +619,20 @@ pub(crate) async fn connect_stream(
             ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
         })?;
 
+    // Disable Nagle on raw-path sockets. RawConnection callers send timing-
+    // sensitive byte sequences (consecutive requests, split-then-flush
+    // patterns) where Nagle's coalescing delay can cost the attack or let
+    // cross-tenant traffic interleave on the server side. Non-fatal if the
+    // OS refuses to set it.
+    if let Err(e) = tcp.set_nodelay(true) {
+        debug_record(
+            log,
+            v,
+            1,
+            &format!("   set_nodelay failed (non-fatal): {}", e),
+        );
+    }
+
     if !is_https {
         return Ok((Box::new(tcp), None));
     }
