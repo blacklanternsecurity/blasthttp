@@ -21,3 +21,7 @@ test.py
 test_batch.py
 test_python_bindings.py
 test_urls.txt
+
+# Python bytecode caches
+__pycache__/
+*.pyc
