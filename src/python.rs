@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::batch::{self, RateLimiter};
 use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
+use crate::client::raw;
 use crate::config::RequestConfig;
 use crate::response::{CertInfo, RedirectHop, Response, ResponseHash};
 
@@ -490,6 +491,116 @@ impl BlastHTTP {
             Ok(path)
         })
     }
+
+    /// Open a raw TCP or TLS connection to the target URL. Returns a
+    /// RawConnection handle the caller can send arbitrary bytes over and
+    /// read arbitrary bytes from, bypassing HTTP framing entirely.
+    ///
+    /// The URL's scheme (`http://` or `https://`) decides TCP vs TLS. Path
+    /// and query are ignored at connect time.
+    ///
+    /// If a rate limit is set on this BlastHTTP instance, opening a raw
+    /// connection consumes one rate-limit token.
+    #[pyo3(signature = (
+        url,
+        verify_certs=None,
+        cipher_string=None,
+        min_tls_version=None,
+        max_tls_version=None,
+        resolve_ip=None,
+    ))]
+    fn raw_connect<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        verify_certs: Option<bool>,
+        cipher_string: Option<String>,
+        min_tls_version: Option<String>,
+        max_tls_version: Option<String>,
+        resolve_ip: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut config = RequestConfig::new(url.clone());
+        config.verify_certs = verify_certs;
+        config.cipher_string = cipher_string;
+        config.min_tls_version = min_tls_version;
+        config.max_tls_version = max_tls_version;
+        config.resolve_ip = resolve_ip;
+
+        let limiter = self.rate_limiter.clone();
+
+        future_into_py(py, async move {
+            if let Some(ref limiter) = limiter {
+                limiter.acquire().await;
+            }
+            let conn = raw::RawConnection::connect(&url, &config)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            Ok(PyRawConnection {
+                inner: Arc::new(conn),
+            })
+        })
+    }
+}
+
+// ── RawConnection ─────────────────────────────────────────────────
+
+#[pyclass(name = "RawConnection")]
+struct PyRawConnection {
+    inner: Arc<raw::RawConnection>,
+}
+
+#[pymethods]
+impl PyRawConnection {
+    /// Write arbitrary bytes to the connection. No framing, no validation.
+    fn send_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .send_bytes(&data)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            Ok(())
+        })
+    }
+
+    /// Read up to `max_bytes` from the connection. Returns whatever bytes
+    /// were available within `timeout_ms`. An empty return means either
+    /// the timeout elapsed with no data or the peer closed the connection.
+    /// Pass `timeout_ms=None` to wait indefinitely.
+    #[pyo3(signature = (max_bytes, timeout_ms=None))]
+    fn read_raw<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let data = inner
+                .read_raw(max_bytes, timeout_ms)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            Ok(data)
+        })
+    }
+
+    /// Close the connection. Subsequent send_bytes / read_raw calls error.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .close()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            Ok(())
+        })
+    }
+
+    /// Certificate info from the TLS handshake, if any.
+    #[getter]
+    fn cert_info(&self) -> Option<PyCertInfo> {
+        self.inner.cert_info().map(|ci| PyCertInfo { inner: ci })
+    }
 }
 
 // ── Batch config input type ───────────────────────────────────────
@@ -645,5 +756,6 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCertInfo>()?;
     m.add_class::<PyResponseHash>()?;
     m.add_class::<PyRedirectHop>()?;
+    m.add_class::<PyRawConnection>()?;
     Ok(())
 }

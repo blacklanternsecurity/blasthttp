@@ -586,7 +586,7 @@ async fn dispatch_request(
 /// Shared setup used by `dispatch_direct` (one-shot hyper requests over an
 /// un-pooled socket) and by callers that need a long-lived, unframed handle
 /// to a TCP or TLS stream.
-async fn connect_stream(
+pub(crate) async fn connect_stream(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
@@ -745,7 +745,7 @@ async fn dispatch_direct(
 /// Stream types returned by `connect_stream`: plain TCP or TLS over TCP.
 /// Boxed as `Box<dyn IoReadWrite + Send + Unpin>` so callers can hold the
 /// stream without knowing which variant they got.
-trait IoReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+pub(crate) trait IoReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
 impl IoReadWrite for tokio::net::TcpStream {}
 impl IoReadWrite for tokio_openssl::SslStream<tokio::net::TcpStream> {}
 
