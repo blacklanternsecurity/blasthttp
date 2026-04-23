@@ -502,7 +502,10 @@ impl BlastHTTP {
     /// and query are ignored at connect time.
     ///
     /// If a rate limit is set on this BlastHTTP instance, opening a raw
-    /// connection consumes one rate-limit token.
+    /// connection consumes one rate-limit token. The returned
+    /// `RawConnection` inherits the same limiter, so every subsequent
+    /// `send_bytes` / `read_raw` call on that handle also consumes a
+    /// token — a single-connection caller can't burst past the limit.
     #[pyo3(signature = (
         url,
         verify_certs=None,
@@ -535,6 +538,9 @@ impl BlastHTTP {
         config.alpn_protocols = alpn_protocols;
 
         let limiter = self.rate_limiter.clone();
+        // Hand the limiter to the PyRawConnection so send_bytes /
+        // read_raw on that handle also consume tokens.
+        let limiter_for_conn = limiter.clone();
 
         future_into_py(py, async move {
             if let Some(ref limiter) = limiter {
@@ -545,6 +551,7 @@ impl BlastHTTP {
                 .map_err(|e| PyRuntimeError::new_err(e.message))?;
             Ok(PyRawConnection {
                 inner: Arc::new(conn),
+                rate_limiter: limiter_for_conn,
             })
         })
     }
@@ -555,14 +562,27 @@ impl BlastHTTP {
 #[pyclass(name = "RawConnection")]
 struct PyRawConnection {
     inner: Arc<raw::RawConnection>,
+    // Inherited from the BlastHTTP instance that opened the connection.
+    // When set, every send_bytes / read_raw call acquires one token
+    // from the limiter — not just the initial connect. This keeps a
+    // caller that pipelines many ops on a single connection from
+    // bursting past the configured rate.
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 #[pymethods]
 impl PyRawConnection {
     /// Write arbitrary bytes to the connection. No framing, no validation.
+    ///
+    /// If the originating BlastHTTP instance had a rate limit set,
+    /// this call also consumes one rate-limit token.
     fn send_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let limiter = self.rate_limiter.clone();
         future_into_py(py, async move {
+            if let Some(ref limiter) = limiter {
+                limiter.acquire().await;
+            }
             inner
                 .send_bytes(&data)
                 .await
@@ -575,6 +595,9 @@ impl PyRawConnection {
     /// were available within `timeout_ms`. An empty return means either
     /// the timeout elapsed with no data or the peer closed the connection.
     /// Pass `timeout_ms=None` to wait indefinitely.
+    ///
+    /// If the originating BlastHTTP instance had a rate limit set,
+    /// this call also consumes one rate-limit token.
     #[pyo3(signature = (max_bytes, timeout_ms=None))]
     fn read_raw<'py>(
         &self,
@@ -583,7 +606,11 @@ impl PyRawConnection {
         timeout_ms: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let limiter = self.rate_limiter.clone();
         future_into_py(py, async move {
+            if let Some(ref limiter) = limiter {
+                limiter.acquire().await;
+            }
             let data = inner
                 .read_raw(max_bytes, timeout_ms)
                 .await

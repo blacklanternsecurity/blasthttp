@@ -136,3 +136,27 @@ async def test_rate_limited_connect_succeeds(echo_server):
     assert isinstance(conn, blasthttp.RawConnection)
     assert elapsed < 1.0, f"rate-limited connect took {elapsed:.2f}s"
     await conn.close()
+
+
+async def test_rate_limit_tokens_consumed_on_send_and_read(echo_server):
+    """RawConnection inherits the originating BlastHTTP's rate limiter:
+    `send_bytes` and `read_raw` each consume one token. This prevents a
+    single-connection caller from bursting past the configured rate.
+
+    Set 10 RPS (100ms interval). connect + send + read = 3 token
+    acquisitions; the first runs immediately, the next two each wait
+    ~100ms → total ≥200ms. Allow scheduler slack but require ≥180ms."""
+    _server, port = echo_server
+    rl_client = blasthttp.BlastHTTP()
+    rl_client.set_rate_limit(10)
+
+    t0 = time.monotonic()
+    conn = await rl_client.raw_connect(f"http://127.0.0.1:{port}")
+    await conn.send_bytes(b"ping")
+    _ = await conn.read_raw(1024, timeout_ms=2000)
+    elapsed = time.monotonic() - t0
+    await conn.close()
+
+    assert elapsed >= 0.18, (
+        f"rate limit did not gate send/read: elapsed {elapsed:.3f}s"
+    )
