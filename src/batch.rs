@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::client::{ClientError, HttpClient};
@@ -34,6 +34,7 @@ pub struct BatchResult {
 ///      actually paced dispatch at ~1k QPS.
 ///   2. The mutex-across-await serialized every worker single-file
 ///      through the limiter, preventing any parallel progress.
+///
 /// Atomics with the sleep OUTSIDE any critical section avoid both —
 /// workers race on one CAS and then sleep independently.
 pub struct RateLimiter {
@@ -51,9 +52,7 @@ impl RateLimiter {
         );
         // Clamp to ≥1ns so the cursor always makes positive progress,
         // even at absurd rates. u64 ns gives ~584y of runtime headroom.
-        let interval_ns = (1_000_000_000.0 / requests_per_second)
-            .round()
-            .max(1.0) as u64;
+        let interval_ns = (1_000_000_000.0 / requests_per_second).round().max(1.0) as u64;
         RateLimiter {
             interval_ns,
             start: tokio::time::Instant::now(),
@@ -539,19 +538,11 @@ mod tests {
         let _ = send_batch(client.clone(), make_configs(), 100, None, None).await;
 
         let start = Instant::now();
-        let unlimited =
-            send_batch(client.clone(), make_configs(), 100, None, None).await;
+        let unlimited = send_batch(client.clone(), make_configs(), 100, None, None).await;
         let unlimited_elapsed = start.elapsed();
 
         let start = Instant::now();
-        let limited = send_batch(
-            client.clone(),
-            make_configs(),
-            100,
-            Some(100_000.0),
-            None,
-        )
-        .await;
+        let limited = send_batch(client.clone(), make_configs(), 100, Some(100_000.0), None).await;
         let limited_elapsed = start.elapsed();
 
         assert_eq!(unlimited.len(), n);

@@ -8,12 +8,11 @@
 //! types) use the Tier 2 primitives in `frame` directly.
 
 use super::frame::{
-    build_continuation_frame, build_data_frame, build_headers_frame,
-    build_settings_frame, HeadersFrameOpts, PREFACE,
+    HeadersFrameOpts, PREFACE, build_continuation_frame, build_data_frame, build_headers_frame,
+    build_settings_frame,
 };
 use super::header::Header;
 use super::hpack::{self, EncodeError};
-
 
 /// Options for [`build_probe`]. Every field has a sensible default
 /// matching spec-compliant one-shot requests; opt in to the weirder
@@ -80,7 +79,6 @@ impl Default for ProbeOpts {
     }
 }
 
-
 /// Assemble a full H2 probe (preface + SETTINGS + HEADERS [+ body])
 /// ready to send over a raw_connect connection.
 pub fn build_probe(headers: &[Header], opts: &ProbeOpts) -> Result<Vec<u8>, EncodeError> {
@@ -125,9 +123,7 @@ pub fn build_probe(headers: &[Header], opts: &ProbeOpts) -> Result<Vec<u8>, Enco
             // One CONTINUATION with the rest. (Finer-grained splits
             // are callable via `frame::build_continuation_frame`
             // directly.)
-            out.extend_from_slice(&build_continuation_frame(
-                rest, opts.stream_id, true,
-            ));
+            out.extend_from_slice(&build_continuation_frame(rest, opts.stream_id, true));
         }
     } else {
         out.extend_from_slice(&build_headers_frame(HeadersFrameOpts {
@@ -141,9 +137,7 @@ pub fn build_probe(headers: &[Header], opts: &ProbeOpts) -> Result<Vec<u8>, Enco
     }
 
     if let Some(body) = &opts.body {
-        out.extend_from_slice(&build_data_frame(
-            body, opts.stream_id, true, opts.pad_data,
-        ));
+        out.extend_from_slice(&build_data_frame(body, opts.stream_id, true, opts.pad_data));
     }
 
     out.extend_from_slice(&opts.extra_frames_after);
@@ -151,11 +145,10 @@ pub fn build_probe(headers: &[Header], opts: &ProbeOpts) -> Result<Vec<u8>, Enco
     Ok(out)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::h2::frame::{self, FRAME_HEADERS, FRAME_SETTINGS, FRAME_DATA, FRAME_CONTINUATION};
+    use crate::h2::frame::{self, FRAME_CONTINUATION, FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS};
 
     fn default_headers() -> Vec<Header> {
         vec![
@@ -182,17 +175,18 @@ mod tests {
 
     #[test]
     fn probe_with_body_emits_data_frame() {
-        let mut opts = ProbeOpts::default();
-        opts.body = Some(b"hello".to_vec());
+        let opts = ProbeOpts {
+            body: Some(b"hello".to_vec()),
+            ..ProbeOpts::default()
+        };
         let out = build_probe(&default_headers(), &opts).unwrap();
         // Scan for DATA frame.
         let mut found_data = false;
         let mut i = frame::PREFACE.len();
         while i < out.len() {
             let ftype = out[i + 3];
-            let payload_len = ((out[i] as usize) << 16)
-                | ((out[i + 1] as usize) << 8)
-                | (out[i + 2] as usize);
+            let payload_len =
+                ((out[i] as usize) << 16) | ((out[i + 1] as usize) << 8) | (out[i + 2] as usize);
             if ftype == FRAME_DATA {
                 found_data = true;
                 assert_eq!(&out[i + 9..i + 9 + payload_len], b"hello");
@@ -205,17 +199,18 @@ mod tests {
 
     #[test]
     fn split_headers_emits_continuation() {
-        let mut opts = ProbeOpts::default();
-        opts.split_headers_after = Some(2);
+        let opts = ProbeOpts {
+            split_headers_after: Some(2),
+            ..ProbeOpts::default()
+        };
         let out = build_probe(&default_headers(), &opts).unwrap();
         // Scan frames; first non-SETTINGS frame must be HEADERS, second
         // must be CONTINUATION.
         let mut frame_types = Vec::new();
         let mut i = frame::PREFACE.len();
         while i + 9 <= out.len() {
-            let payload_len = ((out[i] as usize) << 16)
-                | ((out[i + 1] as usize) << 8)
-                | (out[i + 2] as usize);
+            let payload_len =
+                ((out[i] as usize) << 16) | ((out[i + 1] as usize) << 8) | (out[i + 2] as usize);
             frame_types.push(out[i + 3]);
             i += 9 + payload_len;
         }
@@ -226,8 +221,10 @@ mod tests {
 
     #[test]
     fn skipping_settings_omits_frame() {
-        let mut opts = ProbeOpts::default();
-        opts.settings = None;
+        let opts = ProbeOpts {
+            settings: None,
+            ..ProbeOpts::default()
+        };
         let out = build_probe(&default_headers(), &opts).unwrap();
         let after_preface = &out[frame::PREFACE.len()..];
         // No SETTINGS frame — first frame right after preface is HEADERS.

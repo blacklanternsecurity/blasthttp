@@ -311,9 +311,9 @@ pub(crate) async fn perform_socks5(
         0x04 => 16,
         0x03 => {
             let mut len_byte = [0u8; 1];
-            tcp.read_exact(&mut len_byte).await.map_err(|e| {
-                ClientError::connection(format!("SOCKS5 reply read failed: {}", e))
-            })?;
+            tcp.read_exact(&mut len_byte)
+                .await
+                .map_err(|e| ClientError::connection(format!("SOCKS5 reply read failed: {}", e)))?;
             len_byte[0] as usize
         }
         other => {
@@ -582,8 +582,14 @@ mod tests {
                 .unwrap();
         });
         let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        perform_socks5(&mut tcp, "target.example", 443, Some("alice"), Some("s3cret"))
-            .await
-            .unwrap();
+        perform_socks5(
+            &mut tcp,
+            "target.example",
+            443,
+            Some("alice"),
+            Some("s3cret"),
+        )
+        .await
+        .unwrap();
     }
 }

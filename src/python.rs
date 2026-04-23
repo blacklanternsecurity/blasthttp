@@ -516,6 +516,7 @@ impl BlastHTTP {
         proxy=None,
         alpn_protocols=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn raw_connect<'py>(
         &self,
         py: Python<'py>,
@@ -813,9 +814,9 @@ fn parse_indexing(s: Option<&str>) -> PyResult<h2::Indexing> {
 
 fn bytes_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     use pyo3::types::{PyBytes, PyString};
-    if let Ok(s) = obj.downcast::<PyString>() {
+    if let Ok(s) = obj.cast::<PyString>() {
         Ok(s.to_str()?.as_bytes().to_vec())
-    } else if let Ok(b) = obj.downcast::<PyBytes>() {
+    } else if let Ok(b) = obj.cast::<PyBytes>() {
         Ok(b.as_bytes().to_vec())
     } else {
         Err(pyo3::exceptions::PyTypeError::new_err(
@@ -882,7 +883,7 @@ fn h2_encode_err_to_py(e: h2::EncodeError) -> PyErr {
 /// Returns bytes. Raises ValueError on permissiveness-gated validation
 /// errors.
 #[pyfunction]
-fn h2_encode_headers(py: Python<'_>, headers: Vec<PyH2Header>) -> PyResult<PyObject> {
+fn h2_encode_headers(py: Python<'_>, headers: Vec<PyH2Header>) -> PyResult<Py<PyAny>> {
     let rust_headers: Vec<h2::Header> = headers.into_iter().map(|h| h.inner).collect();
     let out = h2::hpack::encode_headers(&rust_headers).map_err(h2_encode_err_to_py)?;
     Ok(pyo3::types::PyBytes::new(py, &out).into())
@@ -926,7 +927,7 @@ fn h2_build_probe(
     force_no_end_stream_on_headers: bool,
     extra_frames_before_headers: Option<Vec<u8>>,
     extra_frames_after: Option<Vec<u8>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let rust_headers: Vec<h2::Header> = headers.into_iter().map(|h| h.inner).collect();
     let opts = h2::ProbeOpts {
         send_preface,
@@ -956,16 +957,26 @@ fn h2_build_probe(
 
 #[pyfunction]
 fn h2_build_raw_frame(
-    py: Python<'_>, frame_type: u8, flags: u8, stream_id: u32, payload: Vec<u8>,
-) -> PyObject {
-    pyo3::types::PyBytes::new(py, &h2::frame::build_raw_frame(frame_type, flags, stream_id, &payload)).into()
+    py: Python<'_>,
+    frame_type: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: Vec<u8>,
+) -> Py<PyAny> {
+    pyo3::types::PyBytes::new(
+        py,
+        &h2::frame::build_raw_frame(frame_type, flags, stream_id, &payload),
+    )
+    .into()
 }
 
 #[pyfunction]
 #[pyo3(signature = (settings = None, ack = false))]
 fn h2_build_settings_frame(
-    py: Python<'_>, settings: Option<Vec<(u16, u32)>>, ack: bool,
-) -> PyObject {
+    py: Python<'_>,
+    settings: Option<Vec<(u16, u32)>>,
+    ack: bool,
+) -> Py<PyAny> {
     let s = settings.unwrap_or_default();
     pyo3::types::PyBytes::new(py, &h2::frame::build_settings_frame(&s, ack)).into()
 }
@@ -984,7 +995,7 @@ fn h2_build_headers_frame(
     end_headers: bool,
     padding: u8,
     priority: Option<(u32, u8, bool)>,
-) -> PyObject {
+) -> Py<PyAny> {
     let out = h2::frame::build_headers_frame(h2::frame::HeadersFrameOpts {
         header_block: &header_block,
         stream_id,
@@ -999,32 +1010,47 @@ fn h2_build_headers_frame(
 #[pyfunction]
 #[pyo3(signature = (header_block, stream_id = 1, end_headers = true))]
 fn h2_build_continuation_frame(
-    py: Python<'_>, header_block: Vec<u8>, stream_id: u32, end_headers: bool,
-) -> PyObject {
-    pyo3::types::PyBytes::new(py, &h2::frame::build_continuation_frame(
-        &header_block, stream_id, end_headers,
-    )).into()
+    py: Python<'_>,
+    header_block: Vec<u8>,
+    stream_id: u32,
+    end_headers: bool,
+) -> Py<PyAny> {
+    pyo3::types::PyBytes::new(
+        py,
+        &h2::frame::build_continuation_frame(&header_block, stream_id, end_headers),
+    )
+    .into()
 }
 
 #[pyfunction]
 #[pyo3(signature = (data, stream_id = 1, end_stream = true, padding = 0))]
 fn h2_build_data_frame(
-    py: Python<'_>, data: Vec<u8>, stream_id: u32, end_stream: bool, padding: u8,
-) -> PyObject {
-    pyo3::types::PyBytes::new(py, &h2::frame::build_data_frame(
-        &data, stream_id, end_stream, padding,
-    )).into()
+    py: Python<'_>,
+    data: Vec<u8>,
+    stream_id: u32,
+    end_stream: bool,
+    padding: u8,
+) -> Py<PyAny> {
+    pyo3::types::PyBytes::new(
+        py,
+        &h2::frame::build_data_frame(&data, stream_id, end_stream, padding),
+    )
+    .into()
 }
 
 #[pyfunction]
 #[pyo3(signature = (increment, stream_id = 0))]
-fn h2_build_window_update_frame(py: Python<'_>, increment: u32, stream_id: u32) -> PyObject {
-    pyo3::types::PyBytes::new(py, &h2::frame::build_window_update_frame(increment, stream_id)).into()
+fn h2_build_window_update_frame(py: Python<'_>, increment: u32, stream_id: u32) -> Py<PyAny> {
+    pyo3::types::PyBytes::new(
+        py,
+        &h2::frame::build_window_update_frame(increment, stream_id),
+    )
+    .into()
 }
 
 #[pyfunction]
 #[pyo3(signature = (data = None, ack = false))]
-fn h2_build_ping_frame(py: Python<'_>, data: Option<Vec<u8>>, ack: bool) -> PyObject {
+fn h2_build_ping_frame(py: Python<'_>, data: Option<Vec<u8>>, ack: bool) -> Py<PyAny> {
     let d = data.unwrap_or_else(|| vec![0; 8]);
     let mut arr = [0u8; 8];
     for (i, b) in d.iter().take(8).enumerate() {
@@ -1035,31 +1061,45 @@ fn h2_build_ping_frame(py: Python<'_>, data: Option<Vec<u8>>, ack: bool) -> PyOb
 
 #[pyfunction]
 #[pyo3(signature = (stream_id, error_code = 0))]
-fn h2_build_rst_stream_frame(py: Python<'_>, stream_id: u32, error_code: u32) -> PyObject {
-    pyo3::types::PyBytes::new(py, &h2::frame::build_rst_stream_frame(stream_id, error_code)).into()
+fn h2_build_rst_stream_frame(py: Python<'_>, stream_id: u32, error_code: u32) -> Py<PyAny> {
+    pyo3::types::PyBytes::new(
+        py,
+        &h2::frame::build_rst_stream_frame(stream_id, error_code),
+    )
+    .into()
 }
 
 #[pyfunction]
 #[pyo3(signature = (last_stream_id = 0, error_code = 0, debug_data = None))]
 fn h2_build_goaway_frame(
-    py: Python<'_>, last_stream_id: u32, error_code: u32, debug_data: Option<Vec<u8>>,
-) -> PyObject {
+    py: Python<'_>,
+    last_stream_id: u32,
+    error_code: u32,
+    debug_data: Option<Vec<u8>>,
+) -> Py<PyAny> {
     let d = debug_data.unwrap_or_default();
-    pyo3::types::PyBytes::new(py, &h2::frame::build_goaway_frame(
-        last_stream_id, error_code, &d,
-    )).into()
+    pyo3::types::PyBytes::new(
+        py,
+        &h2::frame::build_goaway_frame(last_stream_id, error_code, &d),
+    )
+    .into()
 }
 
 #[pyfunction]
 #[pyo3(signature = (stream_id, dep_stream, weight, exclusive = false))]
 fn h2_build_priority_frame(
-    py: Python<'_>, stream_id: u32, dep_stream: u32, weight: u8, exclusive: bool,
-) -> PyObject {
-    pyo3::types::PyBytes::new(py, &h2::frame::build_priority_frame(
-        stream_id, dep_stream, weight, exclusive,
-    )).into()
+    py: Python<'_>,
+    stream_id: u32,
+    dep_stream: u32,
+    weight: u8,
+    exclusive: bool,
+) -> Py<PyAny> {
+    pyo3::types::PyBytes::new(
+        py,
+        &h2::frame::build_priority_frame(stream_id, dep_stream, weight, exclusive),
+    )
+    .into()
 }
-
 
 // ── HPACK decoder binding ──────────────────────────────────────────
 
@@ -1088,9 +1128,14 @@ impl PyH2Decoder {
     /// Decode a header-block-fragment. Returns a list of
     /// (name: bytes, value: bytes) tuples.
     fn decode<'py>(
-        &mut self, py: Python<'py>, block: Vec<u8>,
+        &mut self,
+        py: Python<'py>,
+        block: Vec<u8>,
     ) -> PyResult<Vec<(Py<pyo3::types::PyBytes>, Py<pyo3::types::PyBytes>)>> {
-        let pairs = self.inner.decode_headers(&block).map_err(h2_decode_err_to_py)?;
+        let pairs = self
+            .inner
+            .decode_headers(&block)
+            .map_err(h2_decode_err_to_py)?;
         let mut out = Vec::with_capacity(pairs.len());
         for (n, v) in pairs {
             out.push((
@@ -1102,10 +1147,7 @@ impl PyH2Decoder {
     }
 }
 
-
-fn register_h2_submodule<'py>(
-    parent: &Bound<'py, PyModule>,
-) -> PyResult<()> {
+fn register_h2_submodule<'py>(parent: &Bound<'py, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let h2m = PyModule::new(py, "h2")?;
     h2m.add_class::<PyH2Header>()?;
@@ -1128,12 +1170,27 @@ fn register_h2_submodule<'py>(
     h2m.add("FLAG_PADDED", h2::frame::FLAG_PADDED)?;
     h2m.add("FLAG_PRIORITY", h2::frame::FLAG_PRIORITY)?;
     // SETTINGS identifiers.
-    h2m.add("SETTINGS_HEADER_TABLE_SIZE", h2::frame::SETTINGS_HEADER_TABLE_SIZE)?;
+    h2m.add(
+        "SETTINGS_HEADER_TABLE_SIZE",
+        h2::frame::SETTINGS_HEADER_TABLE_SIZE,
+    )?;
     h2m.add("SETTINGS_ENABLE_PUSH", h2::frame::SETTINGS_ENABLE_PUSH)?;
-    h2m.add("SETTINGS_MAX_CONCURRENT_STREAMS", h2::frame::SETTINGS_MAX_CONCURRENT_STREAMS)?;
-    h2m.add("SETTINGS_INITIAL_WINDOW_SIZE", h2::frame::SETTINGS_INITIAL_WINDOW_SIZE)?;
-    h2m.add("SETTINGS_MAX_FRAME_SIZE", h2::frame::SETTINGS_MAX_FRAME_SIZE)?;
-    h2m.add("SETTINGS_MAX_HEADER_LIST_SIZE", h2::frame::SETTINGS_MAX_HEADER_LIST_SIZE)?;
+    h2m.add(
+        "SETTINGS_MAX_CONCURRENT_STREAMS",
+        h2::frame::SETTINGS_MAX_CONCURRENT_STREAMS,
+    )?;
+    h2m.add(
+        "SETTINGS_INITIAL_WINDOW_SIZE",
+        h2::frame::SETTINGS_INITIAL_WINDOW_SIZE,
+    )?;
+    h2m.add(
+        "SETTINGS_MAX_FRAME_SIZE",
+        h2::frame::SETTINGS_MAX_FRAME_SIZE,
+    )?;
+    h2m.add(
+        "SETTINGS_MAX_HEADER_LIST_SIZE",
+        h2::frame::SETTINGS_MAX_HEADER_LIST_SIZE,
+    )?;
     // Functions.
     h2m.add_function(pyo3::wrap_pyfunction!(h2_encode_headers, &h2m)?)?;
     h2m.add_function(pyo3::wrap_pyfunction!(h2_build_probe, &h2m)?)?;
@@ -1151,15 +1208,33 @@ fn register_h2_submodule<'py>(
     h2m.setattr("encode_headers", h2m.getattr("h2_encode_headers")?)?;
     h2m.setattr("build_probe", h2m.getattr("h2_build_probe")?)?;
     h2m.setattr("build_raw_frame", h2m.getattr("h2_build_raw_frame")?)?;
-    h2m.setattr("build_settings_frame", h2m.getattr("h2_build_settings_frame")?)?;
-    h2m.setattr("build_headers_frame", h2m.getattr("h2_build_headers_frame")?)?;
-    h2m.setattr("build_continuation_frame", h2m.getattr("h2_build_continuation_frame")?)?;
+    h2m.setattr(
+        "build_settings_frame",
+        h2m.getattr("h2_build_settings_frame")?,
+    )?;
+    h2m.setattr(
+        "build_headers_frame",
+        h2m.getattr("h2_build_headers_frame")?,
+    )?;
+    h2m.setattr(
+        "build_continuation_frame",
+        h2m.getattr("h2_build_continuation_frame")?,
+    )?;
     h2m.setattr("build_data_frame", h2m.getattr("h2_build_data_frame")?)?;
-    h2m.setattr("build_window_update_frame", h2m.getattr("h2_build_window_update_frame")?)?;
+    h2m.setattr(
+        "build_window_update_frame",
+        h2m.getattr("h2_build_window_update_frame")?,
+    )?;
     h2m.setattr("build_ping_frame", h2m.getattr("h2_build_ping_frame")?)?;
-    h2m.setattr("build_rst_stream_frame", h2m.getattr("h2_build_rst_stream_frame")?)?;
+    h2m.setattr(
+        "build_rst_stream_frame",
+        h2m.getattr("h2_build_rst_stream_frame")?,
+    )?;
     h2m.setattr("build_goaway_frame", h2m.getattr("h2_build_goaway_frame")?)?;
-    h2m.setattr("build_priority_frame", h2m.getattr("h2_build_priority_frame")?)?;
+    h2m.setattr(
+        "build_priority_frame",
+        h2m.getattr("h2_build_priority_frame")?,
+    )?;
     // Both `parent.add()` to attach as parent attribute AND register
     // in sys.modules so `import blasthttp.h2` finds it.
     parent.add("h2", &h2m)?;
@@ -1168,7 +1243,6 @@ fn register_h2_submodule<'py>(
         .set_item("blasthttp.h2", h2m)?;
     Ok(())
 }
-
 
 // ── Module registration ───────────────────────────────────────────
 

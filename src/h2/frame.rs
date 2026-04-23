@@ -30,11 +30,11 @@ pub const FRAME_WINDOW_UPDATE: u8 = 0x08;
 pub const FRAME_CONTINUATION: u8 = 0x09;
 
 // ── Flag bits (overlap across frame types per spec) ────────────
-pub const FLAG_END_STREAM: u8 = 0x01;    // DATA, HEADERS
-pub const FLAG_ACK: u8 = 0x01;           // SETTINGS, PING (same bit, different name)
-pub const FLAG_END_HEADERS: u8 = 0x04;   // HEADERS, CONTINUATION, PUSH_PROMISE
-pub const FLAG_PADDED: u8 = 0x08;        // DATA, HEADERS, PUSH_PROMISE
-pub const FLAG_PRIORITY: u8 = 0x20;      // HEADERS
+pub const FLAG_END_STREAM: u8 = 0x01; // DATA, HEADERS
+pub const FLAG_ACK: u8 = 0x01; // SETTINGS, PING (same bit, different name)
+pub const FLAG_END_HEADERS: u8 = 0x04; // HEADERS, CONTINUATION, PUSH_PROMISE
+pub const FLAG_PADDED: u8 = 0x08; // DATA, HEADERS, PUSH_PROMISE
+pub const FLAG_PRIORITY: u8 = 0x20; // HEADERS
 
 // ── SETTINGS identifiers (RFC 9113 §6.5.2) ─────────────────────
 pub const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x01;
@@ -43,7 +43,6 @@ pub const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x03;
 pub const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x04;
 pub const SETTINGS_MAX_FRAME_SIZE: u16 = 0x05;
 pub const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x06;
-
 
 /// Build a raw frame header + payload. Exposed both for our own
 /// internal use and as a "final escape hatch" researcher-level
@@ -118,9 +117,7 @@ pub fn build_headers_frame(opts: HeadersFrameOpts<'_>) -> Vec<u8> {
     }
     payload.extend_from_slice(opts.header_block);
     // Padding bytes.
-    for _ in 0..opts.padding {
-        payload.push(0);
-    }
+    payload.resize(payload.len() + opts.padding as usize, 0);
     let mut flags = 0u8;
     if opts.end_stream {
         flags |= FLAG_END_STREAM;
@@ -139,30 +136,19 @@ pub fn build_headers_frame(opts: HeadersFrameOpts<'_>) -> Vec<u8> {
 
 /// CONTINUATION frame. Used when a HEADERS (or PUSH_PROMISE) block
 /// is split across multiple frames.
-pub fn build_continuation_frame(
-    header_block: &[u8],
-    stream_id: u32,
-    end_headers: bool,
-) -> Vec<u8> {
+pub fn build_continuation_frame(header_block: &[u8], stream_id: u32, end_headers: bool) -> Vec<u8> {
     let flags = if end_headers { FLAG_END_HEADERS } else { 0 };
     build_raw_frame(FRAME_CONTINUATION, flags, stream_id, header_block)
 }
 
 /// DATA frame.
-pub fn build_data_frame(
-    data: &[u8],
-    stream_id: u32,
-    end_stream: bool,
-    padding: u8,
-) -> Vec<u8> {
+pub fn build_data_frame(data: &[u8], stream_id: u32, end_stream: bool, padding: u8) -> Vec<u8> {
     let mut payload = Vec::new();
     if padding > 0 {
         payload.push(padding);
     }
     payload.extend_from_slice(data);
-    for _ in 0..padding {
-        payload.push(0);
-    }
+    payload.resize(payload.len() + padding as usize, 0);
     let mut flags = 0u8;
     if end_stream {
         flags |= FLAG_END_STREAM;
@@ -187,11 +173,7 @@ pub fn build_rst_stream_frame(stream_id: u32, error_code: u32) -> Vec<u8> {
     build_raw_frame(FRAME_RST_STREAM, 0, stream_id, &error_code.to_be_bytes())
 }
 
-pub fn build_goaway_frame(
-    last_stream_id: u32,
-    error_code: u32,
-    debug_data: &[u8],
-) -> Vec<u8> {
+pub fn build_goaway_frame(last_stream_id: u32, error_code: u32, debug_data: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(8 + debug_data.len());
     payload.extend_from_slice(&(last_stream_id & 0x7FFF_FFFF).to_be_bytes());
     payload.extend_from_slice(&error_code.to_be_bytes());
@@ -214,7 +196,6 @@ pub fn build_priority_frame(
     payload.push(weight);
     build_raw_frame(FRAME_PRIORITY, 0, stream_id, &payload)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -314,8 +295,8 @@ mod tests {
     fn goaway_frame_encoding() {
         let f = build_goaway_frame(7, 1, b"debug");
         assert_eq!(f[3], FRAME_GOAWAY);
-        assert_eq!(&f[9..13], &[0, 0, 0, 7]);   // last_stream_id
-        assert_eq!(&f[13..17], &[0, 0, 0, 1]);  // error_code
+        assert_eq!(&f[9..13], &[0, 0, 0, 7]); // last_stream_id
+        assert_eq!(&f[13..17], &[0, 0, 0, 1]); // error_code
         assert_eq!(&f[17..], b"debug");
     }
 }

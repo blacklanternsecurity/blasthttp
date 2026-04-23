@@ -190,11 +190,15 @@ fn encode_alpn_protocols(protos: &[String]) -> Result<Vec<u8>, ClientError> {
     for p in protos {
         let bytes = p.as_bytes();
         if bytes.is_empty() {
-            return Err(ClientError::tls("ALPN protocol name cannot be empty".to_string()));
+            return Err(ClientError::tls(
+                "ALPN protocol name cannot be empty".to_string(),
+            ));
         }
         if bytes.len() > 255 {
             return Err(ClientError::tls(format!(
-                "ALPN protocol name too long ({}B > 255): {}", bytes.len(), p
+                "ALPN protocol name too long ({}B > 255): {}",
+                bytes.len(),
+                p
             )));
         }
         out.push(bytes.len() as u8);
@@ -202,7 +206,6 @@ fn encode_alpn_protocols(protos: &[String]) -> Result<Vec<u8>, ClientError> {
     }
     Ok(out)
 }
-
 
 fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
     match s.to_lowercase().as_str() {
@@ -614,7 +617,14 @@ pub(crate) async fn connect_stream(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
-) -> Result<(Box<dyn IoReadWrite + Send + Unpin>, Option<CertInfo>, Option<String>), ClientError> {
+) -> Result<
+    (
+        Box<dyn IoReadWrite + Send + Unpin>,
+        Option<CertInfo>,
+        Option<String>,
+    ),
+    ClientError,
+> {
     use super::proxy::{self, ProxyScheme};
 
     let v = config.verbosity;
@@ -718,9 +728,9 @@ pub(crate) async fn connect_stream(
         ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
     }
     if let Some(ref ciphers) = config.cipher_string {
-        ssl_builder.set_cipher_list(ciphers).map_err(|e| {
-            ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
-        })?;
+        ssl_builder
+            .set_cipher_list(ciphers)
+            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
     }
     if let Some(ref min_ver) = config.min_tls_version {
         let version = parse_tls_version(min_ver)?;

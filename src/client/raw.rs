@@ -230,8 +230,7 @@ mod tests {
     #[tokio::test]
     async fn connect_unreachable_errors() {
         // Port 1 is almost certainly not listening.
-        let result =
-            RawConnection::connect("http://127.0.0.1:1", &plain_config()).await;
+        let result = RawConnection::connect("http://127.0.0.1:1", &plain_config()).await;
         assert!(result.is_err());
     }
 

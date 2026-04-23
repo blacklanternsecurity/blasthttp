@@ -38,9 +38,8 @@ pub fn encoded_len(input: &[u8]) -> usize {
     for &b in input {
         bits += HUFFMAN_TABLE[b as usize].1 as usize;
     }
-    (bits + 7) / 8
+    bits.div_ceil(8)
 }
-
 
 /// Decode HPACK Huffman-encoded bytes back to raw. Uses the lazily-
 /// built binary prefix tree. Per RFC 7541 §5.2, a byte-boundary EOS
@@ -119,7 +118,8 @@ static HUFFMAN_TREE: OnceLock<Vec<HuffNode>> = OnceLock::new();
 fn huffman_tree() -> &'static [HuffNode] {
     HUFFMAN_TREE.get_or_init(|| {
         let mut tree: Vec<HuffNode> = vec![HuffNode {
-            left: 0, right: 0,
+            left: 0,
+            right: 0,
             symbol: None,
             all_ones_depth: 0,
             prefix_of_eos: true,
@@ -146,7 +146,8 @@ fn insert_symbol(tree: &mut Vec<HuffNode>, code: u32, code_len: u32, symbol: u32
             } else {
                 let new_idx = tree.len();
                 tree.push(HuffNode {
-                    left: 0, right: 0,
+                    left: 0,
+                    right: 0,
                     symbol: None,
                     all_ones_depth: 0,
                     prefix_of_eos: false,
@@ -154,20 +155,19 @@ fn insert_symbol(tree: &mut Vec<HuffNode>, code: u32, code_len: u32, symbol: u32
                 tree[idx].left = new_idx;
                 new_idx
             }
+        } else if tree[idx].right != 0 {
+            tree[idx].right
         } else {
-            if tree[idx].right != 0 {
-                tree[idx].right
-            } else {
-                let new_idx = tree.len();
-                tree.push(HuffNode {
-                    left: 0, right: 0,
-                    symbol: None,
-                    all_ones_depth: parent_all_ones_depth + 1,
-                    prefix_of_eos: parent_prefix_eos,
-                });
-                tree[idx].right = new_idx;
-                new_idx
-            }
+            let new_idx = tree.len();
+            tree.push(HuffNode {
+                left: 0,
+                right: 0,
+                symbol: None,
+                all_ones_depth: parent_all_ones_depth + 1,
+                prefix_of_eos: parent_prefix_eos,
+            });
+            tree[idx].right = new_idx;
+            new_idx
         };
         idx = next;
     }
@@ -248,7 +248,6 @@ const HUFFMAN_TABLE: [(u32, u32); 256] = [
     (0x7ffffeb, 27),(0xffffffe, 28),(0x7ffffec, 27),(0x7ffffed, 27),
     (0x7ffffee, 27),(0x7ffffef, 27),(0x7fffff0, 27),(0x3ffffee, 26),
 ];
-
 
 #[cfg(test)]
 mod tests {

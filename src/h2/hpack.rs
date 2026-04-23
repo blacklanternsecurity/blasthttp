@@ -74,7 +74,7 @@ fn encode_one(h: &Header, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     if h.length_bloat_value > 3 {
         return Err(EncodeError::BloatOutOfRange(h.length_bloat_value));
     }
-    if !h.allow_invalid_name && !h.force_static_index.is_some() && !is_name_valid(&h.name) {
+    if !h.allow_invalid_name && h.force_static_index.is_none() && !is_name_valid(&h.name) {
         return Err(EncodeError::InvalidName);
     }
     if !h.allow_invalid_value && !is_value_valid(&h.value) {
@@ -85,9 +85,9 @@ fn encode_one(h: &Header, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     // choice (with/without/never) and, if the name is by reference
     // to an existing table entry, the start of the index. §6.2.
     let (prefix_pattern, prefix_bits) = match h.indexing {
-        Indexing::With => (0b0100_0000u8, 6u32),    // 01xxxxxx, 6-bit index
-        Indexing::Without => (0b0000_0000, 4),      // 0000xxxx, 4-bit index
-        Indexing::Never => (0b0001_0000, 4),        // 0001xxxx, 4-bit index
+        Indexing::With => (0b0100_0000u8, 6u32), // 01xxxxxx, 6-bit index
+        Indexing::Without => (0b0000_0000, 4),   // 0000xxxx, 4-bit index
+        Indexing::Never => (0b0001_0000, 4),     // 0001xxxx, 4-bit index
     };
 
     // Name: indexed (references static or dynamic table) or literal.
@@ -126,13 +126,7 @@ fn encode_one(h: &Header, out: &mut Vec<u8>) -> Result<(), EncodeError> {
 /// - `bloat`: emit this many extra continuation bytes of value zero
 ///   (with the high bit clear on the last) to produce a deliberate
 ///   overlong encoding. 0 = RFC-compliant minimum length.
-fn write_integer(
-    out: &mut Vec<u8>,
-    value: u32,
-    n: u32,
-    prefix_pattern: u8,
-    bloat: u8,
-) {
+fn write_integer(out: &mut Vec<u8>, value: u32, n: u32, prefix_pattern: u8, bloat: u8) {
     let max_prefix = (1u32 << n) - 1; // e.g. n=5 -> 31
     if value < max_prefix {
         // Fits directly in the n-bit prefix, no continuation needed.
@@ -232,7 +226,6 @@ fn is_value_valid(value: &[u8]) -> bool {
     !value.iter().any(|&b| b == 0x00 || b == 0x0A || b == 0x0D)
 }
 
-
 // ── HPACK decoder ───────────────────────────────────────────────────
 //
 // Stateful decoder (dynamic-table-aware) for reading HPACK-encoded
@@ -297,6 +290,9 @@ const STATIC_TABLE: &[(&[u8], &[u8])] = &[
     (b"via", b""),                           (b"www-authenticate", b""),
 ];
 
+/// One decoded (name, value) pair. Both are raw bytes (HPACK doesn't
+/// constrain header encoding to UTF-8).
+pub type DecodedHeader = (Vec<u8>, Vec<u8>);
 
 /// HPACK decoder with persistent dynamic-table state. Create once
 /// per connection (not per request) since HPACK's whole point is
@@ -334,7 +330,7 @@ impl Decoder {
     /// Mutates internal dynamic-table state as needed; call on the
     /// same decoder instance for all HEADERS/CONTINUATION frames on
     /// one connection.
-    pub fn decode_headers(&mut self, block: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DecodeError> {
+    pub fn decode_headers(&mut self, block: &[u8]) -> Result<Vec<DecodedHeader>, DecodeError> {
         let mut out = Vec::new();
         let mut pos = 0usize;
         while pos < block.len() {
@@ -364,7 +360,10 @@ impl Decoder {
                 let (new_size, new_pos) = read_integer(block, pos, 5)?;
                 pos = new_pos;
                 if new_size > self.max_table_size {
-                    return Err(DecodeError::TableSizeTooLarge(new_size, self.max_table_size));
+                    return Err(DecodeError::TableSizeTooLarge(
+                        new_size,
+                        self.max_table_size,
+                    ));
                 }
                 self.resize_table(new_size);
             } else {
@@ -466,7 +465,9 @@ fn read_integer(buf: &[u8], pos: usize, n: u32) -> Result<(u32, usize), DecodeEr
         let contribution = ((b & 0x7F) as u32)
             .checked_shl(shift)
             .ok_or(DecodeError::IntegerOverflow)?;
-        value = value.checked_add(contribution).ok_or(DecodeError::IntegerOverflow)?;
+        value = value
+            .checked_add(contribution)
+            .ok_or(DecodeError::IntegerOverflow)?;
         if b & 0x80 == 0 {
             return Ok((value, p));
         }
@@ -494,7 +495,6 @@ fn read_string(buf: &[u8], pos: usize) -> Result<(Vec<u8>, usize), DecodeError> 
     };
     Ok((bytes, end))
 }
-
 
 #[cfg(test)]
 mod decoder_tests {
@@ -535,7 +535,10 @@ mod decoder_tests {
         let block = hex("400a637573746f6d2d6b65790d637573746f6d2d686561646572");
         let mut d = Decoder::new();
         let out = d.decode_headers(&block).unwrap();
-        assert_eq!(out, vec![(b"custom-key".to_vec(), b"custom-header".to_vec())]);
+        assert_eq!(
+            out,
+            vec![(b"custom-key".to_vec(), b"custom-header".to_vec())]
+        );
         // Must have been added to dynamic table.
         assert_eq!(d.dynamic_table.len(), 1);
     }
@@ -578,12 +581,15 @@ mod decoder_tests {
         let block = hex("828684410f7777772e6578616d706c652e636f6d");
         let mut d = Decoder::new();
         let out = d.decode_headers(&block).unwrap();
-        assert_eq!(out, vec![
-            (b":method".to_vec(), b"GET".to_vec()),
-            (b":scheme".to_vec(), b"http".to_vec()),
-            (b":path".to_vec(), b"/".to_vec()),
-            (b":authority".to_vec(), b"www.example.com".to_vec()),
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                (b":method".to_vec(), b"GET".to_vec()),
+                (b":scheme".to_vec(), b"http".to_vec()),
+                (b":path".to_vec(), b"/".to_vec()),
+                (b":authority".to_vec(), b"www.example.com".to_vec()),
+            ]
+        );
         // One dynamic entry added (from the incremental-indexing literal).
         assert_eq!(d.dynamic_table.len(), 1);
         assert_eq!(d.dynamic_table[0].0, b":authority");
@@ -599,12 +605,15 @@ mod decoder_tests {
         let block = hex("828684418cf1e3c2e5f23a6ba0ab90f4ff");
         let mut d = Decoder::new();
         let out = d.decode_headers(&block).unwrap();
-        assert_eq!(out, vec![
-            (b":method".to_vec(), b"GET".to_vec()),
-            (b":scheme".to_vec(), b"http".to_vec()),
-            (b":path".to_vec(), b"/".to_vec()),
-            (b":authority".to_vec(), b"www.example.com".to_vec()),
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                (b":method".to_vec(), b"GET".to_vec()),
+                (b":scheme".to_vec(), b"http".to_vec()),
+                (b":path".to_vec(), b"/".to_vec()),
+                (b":authority".to_vec(), b"www.example.com".to_vec()),
+            ]
+        );
     }
 
     // ── Round-trip against our own encoder ───────────────────────
@@ -613,11 +622,15 @@ mod decoder_tests {
     fn round_trip_strict_encoder_decoder() {
         let headers = vec![
             Header {
-                name: b":method".to_vec(), value: b"POST".to_vec(),
+                name: b":method".to_vec(),
+                value: b"POST".to_vec(),
                 indexing: Indexing::With,
-                huffman_name: Some(false), huffman_value: Some(false),
-                allow_invalid_value: false, allow_invalid_name: false,
-                length_bloat_name: 0, length_bloat_value: 0,
+                huffman_name: Some(false),
+                huffman_value: Some(false),
+                allow_invalid_value: false,
+                allow_invalid_name: false,
+                length_bloat_name: 0,
+                length_bloat_value: 0,
                 force_static_index: None,
             },
             Header::new("content-type", "text/html; charset=utf-8"),
@@ -626,11 +639,17 @@ mod decoder_tests {
         let encoded = encode_headers(&headers).unwrap();
         let mut d = Decoder::new();
         let decoded = d.decode_headers(&encoded).unwrap();
-        assert_eq!(decoded, vec![
-            (b":method".to_vec(), b"POST".to_vec()),
-            (b"content-type".to_vec(), b"text/html; charset=utf-8".to_vec()),
-            (b"x-custom-header".to_vec(), b"hello".to_vec()),
-        ]);
+        assert_eq!(
+            decoded,
+            vec![
+                (b":method".to_vec(), b"POST".to_vec()),
+                (
+                    b"content-type".to_vec(),
+                    b"text/html; charset=utf-8".to_vec()
+                ),
+                (b"x-custom-header".to_vec(), b"hello".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -653,7 +672,6 @@ mod decoder_tests {
         assert_eq!(d.dynamic_table.len(), 0);
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -739,9 +757,10 @@ mod tests {
             force_static_index: None,
         };
         let out = encode_headers(&[h]).unwrap();
-        assert_eq!(out, hex(
-            "400a637573746f6d2d6b65790d637573746f6d2d686561646572"
-        ));
+        assert_eq!(
+            out,
+            hex("400a637573746f6d2d6b65790d637573746f6d2d686561646572")
+        );
     }
 
     #[test]

@@ -25,12 +25,12 @@
 //!   request case
 
 pub mod frame;
-pub mod hpack;
 pub mod header;
+pub mod hpack;
 pub mod huffman;
 pub mod probe;
 
 // Re-export the types most callers need.
 pub use header::{Header, Indexing};
 pub use hpack::EncodeError;
-pub use probe::{build_probe, ProbeOpts};
+pub use probe::{ProbeOpts, build_probe};

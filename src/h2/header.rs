@@ -9,10 +9,12 @@
 ///
 /// See RFC 7541 §6.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Indexing {
     /// Literal with incremental indexing. Adds the (name, value) to
     /// the dynamic table so later requests can reference it.
     /// Wire form: `01xxxxxx` prefix.
+    #[default]
     With,
     /// Literal without indexing. Does not modify the dynamic table.
     /// Wire form: `0000xxxx` prefix.
@@ -22,11 +24,6 @@ pub enum Indexing {
     Never,
 }
 
-impl Default for Indexing {
-    fn default() -> Self {
-        Indexing::With
-    }
-}
 
 /// One (name, value) pair plus encoding knobs.
 ///
