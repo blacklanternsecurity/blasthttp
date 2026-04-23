@@ -28,6 +28,7 @@ cargo add blasthttp
 - **All TLS ciphers available by default** — custom-compiled OpenSSL 3.3.2 with legacy provider baked in (RC4, 3DES, export ciphers, SSLv3) so you can connect to anything
 - **No cert validation by default** — offensive-first: connects to self-signed, expired, and misconfigured TLS without extra config
 - **HTTP/2 support** — automatic via ALPN negotiation, falls back to HTTP/1.1
+- **Low-level primitives** — `RawConnection` for byte-level TCP/TLS I/O (bypasses HTTP framing entirely) and `blasthttp.h2` for manual H2 frame construction (includes a permissive HPACK encoder that emits bytes a strict encoder refuses, the building block for H2 smuggling / CRLF-injection tooling)
 - **Response hashing built-in** — MD5, SHA256, and MurmurHash3 computed in Rust for both body and headers, ready for fingerprinting
 
 ## CLI Usage
@@ -181,6 +182,99 @@ client.set_rate_limit(None)
 When multiple callers share the same `BlastHTTP` instance, the rate limiter is global — two concurrent `request_batch()` calls will collectively stay under the limit.
 
 The client-level rate limit takes precedence over the per-call `rate_limit` parameter on `request_batch()`.
+
+`RawConnection` handles returned from `raw_connect()` inherit the client's rate limiter: every `send_bytes` / `read_raw` call on that handle also consumes one token, so a caller that pipelines many ops on a single connection can't burst past the limit.
+
+### RawConnection — byte-level TCP/TLS I/O
+
+`raw_connect()` returns a `RawConnection` handle that exposes the TCP or TLS stream directly. No HTTP parsing, no framing, no re-emission — you write bytes in and read bytes out. Use it to send hand-crafted requests (malformed HTTP/1, raw HTTP/2 frames, non-HTTP protocols) or to peek at raw server responses the way a protocol fuzzer or smuggling detector needs.
+
+```python
+import asyncio
+import blasthttp
+
+async def main():
+    client = blasthttp.BlastHTTP()
+
+    # Open a TLS connection, negotiating h2 via ALPN.
+    conn = await client.raw_connect(
+        "https://example.com/",
+        alpn_protocols=["h2", "http/1.1"],
+    )
+    print("ALPN negotiated:", conn.negotiated_alpn)
+    print("TLS cert CN:", conn.cert_info.common_name if conn.cert_info else None)
+
+    # Send arbitrary bytes — no Content-Length / framing added for you.
+    await conn.send_bytes(
+        b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    )
+
+    # Read with a per-call deadline. Empty bytes = timeout or peer close.
+    data = await conn.read_raw(max_bytes=65536, timeout_ms=2000)
+    print(data[:200])
+
+    await conn.close()
+
+asyncio.run(main())
+```
+
+`raw_connect()` takes all the same TLS knobs as `request()` — `verify_certs`, `cipher_string`, `min_tls_version`, `max_tls_version`, `resolve_ip`, `proxy`. `alpn_protocols` is a list of byte-strings (commonly `["h2", "http/1.1"]`) used in the TLS ALPN extension. After the handshake, `conn.negotiated_alpn` reports which one the server picked (or `None` if no ALPN was negotiated, including all plain-HTTP connections).
+
+### HTTP/2 primitives — `blasthttp.h2`
+
+`blasthttp.h2` is a minimal, **permissive** HTTP/2 toolkit for callers who need to emit custom H2 frames over a `RawConnection`. The encoder deliberately lets you produce bytes a strict implementation refuses (CRLF in header values, invalid header names, forced Huffman on/off, custom indexing choices) — the exact knobs protocol fuzzers and H2 smuggling detectors depend on.
+
+```python
+from blasthttp import h2
+
+# Encode a header block with HPACK.
+block = h2.encode_headers([
+    h2.Header(":method", "GET"),
+    h2.Header(":path", "/"),
+    h2.Header(":authority", "example.com"),
+    h2.Header(":scheme", "https"),
+    # Permissive escape hatch: emit CRLF inside a value for
+    # CRLF-injection testing against H2-to-H1 downgrades.
+    h2.Header(
+        "x-injected", "bogus\r\nX-Smuggled: yes",
+        allow_invalid_value=True, huffman_value=False,
+    ),
+])
+
+# Build a full probe: preface + SETTINGS + HEADERS (+ optional DATA).
+probe = h2.build_probe(
+    [
+        h2.Header(":method", "POST"),
+        h2.Header(":path", "/"),
+        h2.Header(":authority", "example.com"),
+        h2.Header(":scheme", "https"),
+        h2.Header("content-length", "5"),
+    ],
+    body=b"hello",
+)
+
+# Or assemble frames individually for finer control.
+settings = h2.build_settings_frame()
+headers = h2.build_headers_frame(block, stream_id=1, end_stream=False)
+data = h2.build_data_frame(b"hello", stream_id=1, end_stream=True)
+
+# Decode response frames with a stateful decoder (tracks HPACK
+# dynamic-table state across calls).
+dec = h2.Decoder()
+response_headers = dec.decode(block)  # -> [(name: bytes, value: bytes), ...]
+```
+
+`blasthttp.h2` exposes:
+
+- `Header(name, value, **permissiveness)` — a single header-field pair, with flags like `allow_invalid_name`, `allow_invalid_value`, `huffman_name`, `huffman_value`, `indexing`, `force_static_index`, `length_bloat_name`, `length_bloat_value`
+- `encode_headers(headers) -> bytes` — HPACK header-block-fragment
+- `Decoder()` — stateful HPACK decoder (dynamic-table-aware); `decode(block) -> [(name, value), ...]`
+- `build_settings_frame(settings=None, ack=False)`, `build_headers_frame(block, stream_id, end_stream, end_headers, ...)`, `build_data_frame(data, stream_id, end_stream, ...)`, `build_continuation_frame`, `build_rst_stream_frame`, `build_goaway_frame`, `build_ping_frame`, `build_priority_frame`, `build_window_update_frame`, `build_raw_frame` (escape hatch for malformed frames)
+- `build_probe(headers, body=None, ...)` — one-shot preface + SETTINGS + HEADERS + optional DATA builder with every knob from the underlying Rust `ProbeOpts` exposed as a keyword argument
+- `PREFACE` — the H2 connection preface bytes
+- Frame-type + flag constants: `FRAME_HEADERS`, `FRAME_DATA`, `FRAME_SETTINGS`, `FRAME_CONTINUATION`, `FRAME_RST_STREAM`, `FRAME_GOAWAY`, `FRAME_PING`, `FRAME_PRIORITY`, `FRAME_WINDOW_UPDATE`, `FLAG_END_HEADERS`, `FLAG_END_STREAM`, `FLAG_ACK`, `FLAG_PADDED`, `FLAG_PRIORITY`
+
+This isn't a full H2 client — no stream state machine, no flow control, no HTTP-level response parsing. It's the bytes in, bytes out. Pair with `RawConnection` for end-to-end control.
 
 ## Building
 
