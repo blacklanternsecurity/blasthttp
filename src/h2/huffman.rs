@@ -41,6 +41,139 @@ pub fn encoded_len(input: &[u8]) -> usize {
     (bits + 7) / 8
 }
 
+
+/// Decode HPACK Huffman-encoded bytes back to raw. Uses the lazily-
+/// built binary prefix tree. Per RFC 7541 §5.2, a byte-boundary EOS
+/// padding (up to 7 bits of 1s) is ignored at the end; any longer
+/// all-ones tail or an embedded EOS-symbol (length 30) is a decode
+/// error.
+pub fn decode(input: &[u8]) -> Result<Vec<u8>, HuffmanError> {
+    let tree = huffman_tree();
+    let mut out = Vec::with_capacity(input.len());
+    let mut node_idx = 0usize;
+    let mut bits_consumed_in_byte = 0u32;
+    let mut byte_pos = 0usize;
+    while byte_pos < input.len() {
+        let b = input[byte_pos];
+        let bit = (b >> (7 - bits_consumed_in_byte)) & 1;
+        node_idx = if bit == 0 {
+            tree[node_idx].left
+        } else {
+            tree[node_idx].right
+        };
+        bits_consumed_in_byte += 1;
+        if bits_consumed_in_byte == 8 {
+            bits_consumed_in_byte = 0;
+            byte_pos += 1;
+        }
+        let node = &tree[node_idx];
+        if let Some(sym) = node.symbol {
+            if sym == 256 {
+                // EOS symbol embedded in the stream — per RFC must
+                // not appear, decoder error.
+                return Err(HuffmanError::EosInStream);
+            }
+            out.push(sym as u8);
+            node_idx = 0;
+        }
+    }
+    // Trailing partial byte must be all-1s padding (prefix of EOS).
+    // Walking internal nodes on pure 1-bits is fine up to 7 bits.
+    // If we end on an internal node after >7 bits of padding, error.
+    if node_idx != 0 {
+        let node = &tree[node_idx];
+        if node.all_ones_depth > 7 || !node.prefix_of_eos {
+            return Err(HuffmanError::BadPadding);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HuffmanError {
+    #[error("Huffman EOS symbol appeared in the input stream")]
+    EosInStream,
+    #[error("invalid Huffman padding at end of input")]
+    BadPadding,
+}
+
+/// Single node of the Huffman decode tree. Leaves carry a symbol.
+/// Internal nodes track `all_ones_depth` (how deep a chain of 1-bit
+/// steps we've walked) and `prefix_of_eos` (whether the path from
+/// the root to this node is a prefix of the 30-bit EOS code) so the
+/// decoder can accept trailing ≤7 bits of 1s as EOS-prefix padding
+/// and reject anything else.
+#[derive(Clone, Copy)]
+struct HuffNode {
+    left: usize,         // 0-bit child (default 0 = self-loop for leaves)
+    right: usize,        // 1-bit child
+    symbol: Option<u32>, // Some(byte) for leaves, Some(256) for EOS, None for internal
+    all_ones_depth: u32,
+    prefix_of_eos: bool,
+}
+
+use std::sync::OnceLock;
+
+static HUFFMAN_TREE: OnceLock<Vec<HuffNode>> = OnceLock::new();
+
+fn huffman_tree() -> &'static [HuffNode] {
+    HUFFMAN_TREE.get_or_init(|| {
+        let mut tree: Vec<HuffNode> = vec![HuffNode {
+            left: 0, right: 0,
+            symbol: None,
+            all_ones_depth: 0,
+            prefix_of_eos: true,
+        }];
+        // Insert all 256 byte symbols.
+        for (sym, &(code, code_len)) in HUFFMAN_TABLE.iter().enumerate() {
+            insert_symbol(&mut tree, code, code_len, sym as u32);
+        }
+        // Insert EOS (256, code=0x3fff_ffff, 30 bits).
+        insert_symbol(&mut tree, 0x3fff_ffff, 30, 256);
+        tree
+    })
+}
+
+fn insert_symbol(tree: &mut Vec<HuffNode>, code: u32, code_len: u32, symbol: u32) {
+    let mut idx = 0usize;
+    for i in (0..code_len).rev() {
+        let bit = (code >> i) & 1;
+        let parent_all_ones_depth = tree[idx].all_ones_depth;
+        let parent_prefix_eos = tree[idx].prefix_of_eos;
+        let next = if bit == 0 {
+            if tree[idx].left != 0 {
+                tree[idx].left
+            } else {
+                let new_idx = tree.len();
+                tree.push(HuffNode {
+                    left: 0, right: 0,
+                    symbol: None,
+                    all_ones_depth: 0,
+                    prefix_of_eos: false,
+                });
+                tree[idx].left = new_idx;
+                new_idx
+            }
+        } else {
+            if tree[idx].right != 0 {
+                tree[idx].right
+            } else {
+                let new_idx = tree.len();
+                tree.push(HuffNode {
+                    left: 0, right: 0,
+                    symbol: None,
+                    all_ones_depth: parent_all_ones_depth + 1,
+                    prefix_of_eos: parent_prefix_eos,
+                });
+                tree[idx].right = new_idx;
+                new_idx
+            }
+        };
+        idx = next;
+    }
+    tree[idx].symbol = Some(symbol);
+}
+
 /// Huffman codes for each 8-bit byte value (0..=255) plus EOS (256,
 /// 30 bits long, not emitted in practice). Transcribed verbatim from
 /// RFC 7541 Appendix B.
@@ -156,5 +289,42 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn decode_empty_input() {
+        assert_eq!(decode(b"").unwrap(), b"");
+    }
+
+    #[test]
+    fn decode_rfc7541_c_4_1_www_example_com() {
+        let encoded = hex("f1e3c2e5f23a6ba0ab90f4ff");
+        assert_eq!(decode(&encoded).unwrap(), b"www.example.com");
+    }
+
+    #[test]
+    fn decode_rfc7541_c_4_2_no_cache() {
+        assert_eq!(decode(&hex("a8eb10649cbf")).unwrap(), b"no-cache");
+    }
+
+    #[test]
+    fn decode_rfc7541_c_4_3_custom_key_and_value() {
+        assert_eq!(decode(&hex("25a849e95ba97d7f")).unwrap(), b"custom-key");
+        assert_eq!(decode(&hex("25a849e95bb8e8b4bf")).unwrap(), b"custom-value");
+    }
+
+    #[test]
+    fn decode_round_trip_all_byte_values() {
+        // Every byte 0x00..=0xFF.
+        let input: Vec<u8> = (0..=255u8).collect();
+        let encoded = encode(&input);
+        assert_eq!(decode(&encoded).unwrap(), input);
+    }
+
+    #[test]
+    fn decode_accepts_eos_prefix_padding() {
+        // "a" = 0x03, 5 bits → one byte with 3 bits of padding.
+        let encoded = encode(b"a");
+        assert_eq!(decode(&encoded).unwrap(), b"a");
     }
 }

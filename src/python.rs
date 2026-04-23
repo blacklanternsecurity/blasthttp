@@ -1034,12 +1034,55 @@ fn h2_build_priority_frame(
 }
 
 
+// ── HPACK decoder binding ──────────────────────────────────────────
+
+/// Python-exposed HPACK decoder. Holds dynamic-table state across
+/// calls within one connection. Construct once per connection, call
+/// `decode(block)` per HEADERS/CONTINUATION block.
+#[pyclass(name = "Decoder", module = "blasthttp.h2")]
+struct PyH2Decoder {
+    inner: h2::hpack::Decoder,
+}
+
+fn h2_decode_err_to_py(e: h2::hpack::DecodeError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+#[pymethods]
+impl PyH2Decoder {
+    #[new]
+    #[pyo3(signature = (max_table_size = 4096))]
+    fn new(max_table_size: u32) -> Self {
+        Self {
+            inner: h2::hpack::Decoder::with_max_table_size(max_table_size),
+        }
+    }
+
+    /// Decode a header-block-fragment. Returns a list of
+    /// (name: bytes, value: bytes) tuples.
+    fn decode<'py>(
+        &mut self, py: Python<'py>, block: Vec<u8>,
+    ) -> PyResult<Vec<(Py<pyo3::types::PyBytes>, Py<pyo3::types::PyBytes>)>> {
+        let pairs = self.inner.decode_headers(&block).map_err(h2_decode_err_to_py)?;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (n, v) in pairs {
+            out.push((
+                pyo3::types::PyBytes::new(py, &n).into(),
+                pyo3::types::PyBytes::new(py, &v).into(),
+            ));
+        }
+        Ok(out)
+    }
+}
+
+
 fn register_h2_submodule<'py>(
     parent: &Bound<'py, PyModule>,
 ) -> PyResult<()> {
     let py = parent.py();
     let h2m = PyModule::new(py, "h2")?;
     h2m.add_class::<PyH2Header>()?;
+    h2m.add_class::<PyH2Decoder>()?;
     h2m.add("PREFACE", pyo3::types::PyBytes::new(py, h2::frame::PREFACE))?;
     // Frame-type constants (for when callers construct raw frames).
     h2m.add("FRAME_DATA", h2::frame::FRAME_DATA)?;
