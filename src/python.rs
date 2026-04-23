@@ -351,6 +351,7 @@ impl BlastHTTP {
             raw_path,
             request_target,
             resolve_ip,
+            alpn_protocols: None,
             verbosity: 0,
         };
 
@@ -465,6 +466,7 @@ impl BlastHTTP {
             raw_path: None,
             request_target: None,
             resolve_ip: None,
+            alpn_protocols: None,
             verbosity: 0,
         };
 
@@ -509,6 +511,7 @@ impl BlastHTTP {
         max_tls_version=None,
         resolve_ip=None,
         proxy=None,
+        alpn_protocols=None,
     ))]
     fn raw_connect<'py>(
         &self,
@@ -520,6 +523,7 @@ impl BlastHTTP {
         max_tls_version: Option<String>,
         resolve_ip: Option<String>,
         proxy: Option<String>,
+        alpn_protocols: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut config = RequestConfig::new(url.clone());
         config.verify_certs = verify_certs;
@@ -528,6 +532,7 @@ impl BlastHTTP {
         config.max_tls_version = max_tls_version;
         config.resolve_ip = resolve_ip;
         config.proxy = proxy;
+        config.alpn_protocols = alpn_protocols;
 
         let limiter = self.rate_limiter.clone();
 
@@ -603,6 +608,14 @@ impl PyRawConnection {
     #[getter]
     fn cert_info(&self) -> Option<PyCertInfo> {
         self.inner.cert_info().map(|ci| PyCertInfo { inner: ci })
+    }
+
+    /// The ALPN protocol the server selected during the TLS handshake.
+    /// None for plain HTTP, or for HTTPS connections where the server
+    /// didn't advertise ALPN. Common values: "h2", "http/1.1".
+    #[getter]
+    fn negotiated_alpn(&self) -> Option<String> {
+        self.inner.negotiated_alpn()
     }
 }
 
@@ -740,6 +753,7 @@ impl PyBatchConfig {
             raw_path: self.raw_path,
             request_target: self.request_target,
             resolve_ip: self.resolve_ip,
+            alpn_protocols: None,
             verbosity: 0,
         }
     }

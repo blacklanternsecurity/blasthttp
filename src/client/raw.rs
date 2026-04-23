@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 pub struct RawConnection {
     stream: Arc<Mutex<Option<Box<dyn IoReadWrite + Send + Unpin>>>>,
     cert_info: Option<CertInfo>,
+    negotiated_alpn: Option<String>,
 }
 
 impl RawConnection {
@@ -33,10 +34,11 @@ impl RawConnection {
             ClientError::invalid_url(format!("invalid URL '{}': {}", uri_str, e))
         })?;
         let log = new_debug_log();
-        let (stream, cert_info) = connect_stream(&uri, config, &log).await?;
+        let (stream, cert_info, negotiated_alpn) = connect_stream(&uri, config, &log).await?;
         Ok(Self {
             stream: Arc::new(Mutex::new(Some(stream))),
             cert_info,
+            negotiated_alpn,
         })
     }
 
@@ -103,6 +105,14 @@ impl RawConnection {
     /// Certificate info captured during the TLS handshake, if any.
     pub fn cert_info(&self) -> Option<CertInfo> {
         self.cert_info.clone()
+    }
+
+    /// The ALPN protocol the server selected during the TLS handshake,
+    /// if any. None for plain HTTP, or HTTPS connections where the
+    /// server didn't advertise ALPN support. Common values: "h2",
+    /// "http/1.1".
+    pub fn negotiated_alpn(&self) -> Option<String> {
+        self.negotiated_alpn.clone()
     }
 }
 

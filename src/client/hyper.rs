@@ -180,6 +180,30 @@ struct OpenSslConnector {
     cert_slot: CertSlot,
 }
 
+/// Encode a list of ALPN protocol names into the wire format OpenSSL
+/// expects: each protocol prefixed with its length as a single byte,
+/// then the name bytes, concatenated. e.g. ["h2", "http/1.1"] ->
+/// b"\x02h2\x08http/1.1". Returns an error if any protocol name is
+/// empty or longer than 255 bytes (ALPN length prefix is 1 byte).
+fn encode_alpn_protocols(protos: &[String]) -> Result<Vec<u8>, ClientError> {
+    let mut out = Vec::new();
+    for p in protos {
+        let bytes = p.as_bytes();
+        if bytes.is_empty() {
+            return Err(ClientError::tls("ALPN protocol name cannot be empty".to_string()));
+        }
+        if bytes.len() > 255 {
+            return Err(ClientError::tls(format!(
+                "ALPN protocol name too long ({}B > 255): {}", bytes.len(), p
+            )));
+        }
+        out.push(bytes.len() as u8);
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+
 fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
     match s.to_lowercase().as_str() {
         "1.0" | "tls1.0" | "tlsv1.0" => Ok(openssl::ssl::SslVersion::TLS1),
@@ -590,7 +614,7 @@ pub(crate) async fn connect_stream(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
-) -> Result<(Box<dyn IoReadWrite + Send + Unpin>, Option<CertInfo>), ClientError> {
+) -> Result<(Box<dyn IoReadWrite + Send + Unpin>, Option<CertInfo>, Option<String>), ClientError> {
     use super::proxy::{self, ProxyScheme};
 
     let v = config.verbosity;
@@ -679,7 +703,7 @@ pub(crate) async fn connect_stream(
     }
 
     if !is_https {
-        return Ok((Box::new(tcp), None));
+        return Ok((Box::new(tcp), None, None));
     }
 
     ensure_legacy_provider();
@@ -710,10 +734,17 @@ pub(crate) async fn connect_stream(
             .set_max_proto_version(Some(version))
             .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
     }
-    // HTTP/1.1 only on direct connections — request_target/resolve_ip paths
-    // cannot negotiate h2 meaningfully.
+    // ALPN: default to http/1.1-only for backward compatibility with
+    // existing direct-connection callers (request_target/resolve_ip
+    // paths can't meaningfully negotiate h2 anyway). If the caller
+    // explicitly set `alpn_protocols`, honor it — that's how raw H2
+    // callers (e.g. HTTP/2 smuggling probes) opt in.
+    let alpn_wire: Vec<u8> = match &config.alpn_protocols {
+        Some(protos) => encode_alpn_protocols(protos)?,
+        None => b"\x08http/1.1".to_vec(),
+    };
     ssl_builder
-        .set_alpn_protos(b"\x08http/1.1")
+        .set_alpn_protos(&alpn_wire)
         .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
     let ssl_connector = ssl_builder.build();
@@ -736,8 +767,12 @@ pub(crate) async fn connect_stream(
         .map_err(|e| ClientError::tls(format!("TLS handshake failed: {}", e)))?;
 
     let cert_info = extract_cert_info(tls_stream.ssl());
+    let negotiated_alpn = tls_stream
+        .ssl()
+        .selected_alpn_protocol()
+        .and_then(|b| std::str::from_utf8(b).ok().map(String::from));
 
-    Ok((Box::new(tls_stream), cert_info))
+    Ok((Box::new(tls_stream), cert_info, negotiated_alpn))
 }
 
 /// One-shot HTTP/1.1 request over a direct, un-pooled connection. Used when
@@ -752,7 +787,7 @@ async fn dispatch_direct(
     log: &DebugLog,
 ) -> Result<(SingleResponse, Option<CertInfo>), ClientError> {
     let v = config.verbosity;
-    let (stream, cert_info) = connect_stream(target_uri, config, log).await?;
+    let (stream, cert_info, _alpn) = connect_stream(target_uri, config, log).await?;
     let io = hyper_util::rt::TokioIo::new(stream);
 
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
