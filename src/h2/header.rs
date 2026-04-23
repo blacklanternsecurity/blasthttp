@@ -8,8 +8,7 @@
 /// Which HPACK literal representation to use for a header.
 ///
 /// See RFC 7541 §6.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Indexing {
     /// Literal with incremental indexing. Adds the (name, value) to
     /// the dynamic table so later requests can reference it.
@@ -23,7 +22,6 @@ pub enum Indexing {
     /// Wire form: `0001xxxx` prefix.
     Never,
 }
-
 
 /// One (name, value) pair plus encoding knobs.
 ///
