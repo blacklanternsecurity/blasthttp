@@ -29,6 +29,12 @@ pub struct RequestConfig {
     /// Connect TCP to this IP instead of resolving the hostname via DNS
     /// (like curl --resolve). SNI is still set to the original hostname.
     pub resolve_ip: Option<String>,
+    /// ALPN protocol list offered during the TLS handshake. When None,
+    /// raw connections offer only `http/1.1`. Set to e.g.
+    /// `vec!["h2".into()]` to negotiate HTTP/2, or `vec!["h2".into(),
+    /// "http/1.1".into()]` to let the server choose. Only meaningful
+    /// for HTTPS targets; ignored for plain HTTP.
+    pub alpn_protocols: Option<Vec<String>>,
     #[serde(default)]
     pub verbosity: u8,
 }
@@ -55,6 +61,7 @@ impl RequestConfig {
             raw_path: None,
             request_target: None,
             resolve_ip: None,
+            alpn_protocols: None,
             verbosity: 0,
         }
     }

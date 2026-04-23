@@ -54,6 +54,12 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: |
           source .venv/bin/activate
+          # maturin 1.13+ installs `[dependency-groups]` via
+          # `pip install --group`, which requires pip >= 25.1. The
+          # Python versions shipped with actions/setup-python ship
+          # older pip (23.x on 3.10); upgrade first so `develop`
+          # doesn't fail on an unknown `--group` flag.
+          pip install --upgrade pip
           pip install maturin
           maturin develop --release
 
@@ -61,6 +67,16 @@ jobs:
         run: |
           source .venv/bin/activate
           python -c "import blasthttp; print(f'blasthttp {blasthttp.__version__}')"
+
+      - name: Install test dependencies
+        run: |
+          source .venv/bin/activate
+          pip install 'pytest>=8' 'pytest-asyncio>=0.23'
+
+      - name: Run Python tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/python/ -v
 
   version-check:
     needs: python-tests

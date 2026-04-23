@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::client::{ClientError, HttpClient};
@@ -12,30 +13,97 @@ pub struct BatchResult {
 
 // ── Rate limiter ──────────────────────────────────────────────────
 
-/// Simple async rate limiter using a permit-dispenser pattern.
-/// Uses tokio::sync::Mutex because we await (sleep) while holding the lock.
+/// Async rate limiter backed by a single atomic cursor.
+///
+/// `next_ns` records a monotonic-clock offset (in nanoseconds since
+/// construction) at which the NEXT permit becomes available.
+/// `acquire` atomically bumps the cursor by one interval and treats
+/// the OLD value as its dispatch slot — running immediately if that
+/// slot is already past, sleeping until the slot otherwise.
+///
+/// A CAS loop clamps the base to `max(next_ns, now_ns)` so that a
+/// long idle period does not accumulate back-dated slots: a burst
+/// arriving after quiet time starts fresh at `now`, not at whatever
+/// ancient cursor value the limiter was last left at.
+///
+/// The previous implementation held a `tokio::sync::Mutex` across a
+/// `sleep_until`, which had two compounding failures at high RPS
+/// (issue #15):
+///   1. Tokio's timer-wheel resolution (~1ms) floored any sub-ms
+///      `sleep_until`, so a configured 100k RPS interval (10µs)
+///      actually paced dispatch at ~1k QPS.
+///   2. The mutex-across-await serialized every worker single-file
+///      through the limiter, preventing any parallel progress.
+///
+/// Atomics with the sleep OUTSIDE any critical section avoid both —
+/// workers race on one CAS and then sleep independently.
 pub struct RateLimiter {
-    interval: Duration,
-    next: tokio::sync::Mutex<tokio::time::Instant>,
+    interval_ns: u64,
+    start: tokio::time::Instant,
+    next_ns: AtomicU64,
 }
 
 impl RateLimiter {
     pub fn new(requests_per_second: f64) -> Self {
-        let interval = Duration::from_secs_f64(1.0 / requests_per_second);
+        assert!(
+            requests_per_second > 0.0,
+            "RateLimiter requires requests_per_second > 0, got {}",
+            requests_per_second,
+        );
+        // Clamp to ≥1ns so the cursor always makes positive progress,
+        // even at absurd rates. u64 ns gives ~584y of runtime headroom.
+        let interval_ns = (1_000_000_000.0 / requests_per_second).round().max(1.0) as u64;
         RateLimiter {
-            interval,
-            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            interval_ns,
+            start: tokio::time::Instant::now(),
+            next_ns: AtomicU64::new(0),
         }
     }
 
     pub fn interval(&self) -> Duration {
-        self.interval
+        Duration::from_nanos(self.interval_ns)
     }
 
     pub async fn acquire(&self) {
-        let mut next = self.next.lock().await;
-        tokio::time::sleep_until(*next).await;
-        *next = tokio::time::Instant::now() + self.interval;
+        // CAS-bump the cursor. `base` is max(current_cursor, now_ns)
+        // so an idle limiter resets to "now" rather than letting a
+        // stockpile of back-dated slots leak out as a burst.
+        // compare_exchange_weak is the right idiom here — cheaper
+        // than the strong variant, and spurious failures just re-
+        // enter the loop.
+        let slot_ns = loop {
+            let current = self.next_ns.load(Ordering::Relaxed);
+            let now_ns = self.start.elapsed().as_nanos() as u64;
+            let base = current.max(now_ns);
+            let next = base.saturating_add(self.interval_ns);
+            if self
+                .next_ns
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break base;
+            }
+        };
+        // Re-read `now_ns` after the CAS resolved — if we lost a few
+        // rounds, our slot may already be in the past and no sleep
+        // is needed.
+        let now_ns = self.start.elapsed().as_nanos() as u64;
+        if slot_ns <= now_ns {
+            return;
+        }
+        let deficit_ns = slot_ns - now_ns;
+        // Tokio's default timer has ~1ms granularity: a sleep of
+        // 10µs actually returns in ~1ms, which would floor throughput
+        // at ~1k QPS on tight sequential loops. Skip sub-millisecond
+        // sleeps — the cursor has already advanced, so subsequent
+        // acquires accumulate the "debt" and eventually cross the
+        // 1ms threshold where a real sleep kicks in. Aggregate rate
+        // is still capped correctly (e.g. at 100k RPS, one 1ms sleep
+        // lands every 100 acquires).
+        const SUB_MS_SKIP_THRESHOLD_NS: u64 = 1_000_000;
+        if deficit_ns >= SUB_MS_SKIP_THRESHOLD_NS {
+            tokio::time::sleep(Duration::from_nanos(deficit_ns)).await;
+        }
     }
 }
 
@@ -416,6 +484,86 @@ mod tests {
             elapsed < Duration::from_millis(1300),
             "concurrent batches took {:?}, expected < 1300ms",
             elapsed
+        );
+    }
+
+    // ── Issue #15 regression tests ───────────────────────────────
+    //
+    // When `rate_limit` is set well ABOVE realistic throughput (as a
+    // "safety ceiling"), the limiter must impose near-zero overhead
+    // over the unlimited path. The mutex-plus-sleep implementation
+    // that preceded these tests collapsed to ~1 QPS per millisecond-
+    // timer-tick (~1k QPS ceiling) because it held a tokio::sync::
+    // Mutex across sleep_until — serializing every worker single-
+    // file through the limiter at timer-granularity pace.
+
+    #[tokio::test]
+    async fn test_rate_limiter_high_rps_does_not_collapse_to_timer_tick() {
+        // Direct unit-level test on RateLimiter. At 100k RPS the
+        // configured interval is 10µs; the limiter must not round
+        // this up to the ~1ms timer tick and serialize every
+        // acquire at that rate.
+        let limiter = RateLimiter::new(100_000.0);
+        let n = 1000;
+        let start = Instant::now();
+        for _ in 0..n {
+            limiter.acquire().await;
+        }
+        let elapsed = start.elapsed();
+        eprintln!("[bench] 1000 acquires @ 100k RPS: {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "1000 acquires at 100k RPS took {:?}, expected < 250ms \
+             (broken impl collapses to ~1k QPS regardless of \
+             configured rate — see issue #15)",
+            elapsed,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_high_rate_limit_matches_unlimited() {
+        // End-to-end: mirror the issue's scenario. Same workload run
+        // twice — unlimited, then with rate_limit=100k — should take
+        // roughly the same time, modulo scheduler noise.
+        let client = Arc::new(MockClient::new(200, "ok".to_string()));
+        let n = 1000;
+        let make_configs = || -> Vec<RequestConfig> {
+            (0..n)
+                .map(|i| RequestConfig::new(format!("https://{}.com", i)))
+                .collect()
+        };
+
+        // Warm-up so the first timing isn't dominated by one-time
+        // allocations / cache-warming.
+        let _ = send_batch(client.clone(), make_configs(), 100, None, None).await;
+
+        let start = Instant::now();
+        let unlimited = send_batch(client.clone(), make_configs(), 100, None, None).await;
+        let unlimited_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        let limited = send_batch(client.clone(), make_configs(), 100, Some(100_000.0), None).await;
+        let limited_elapsed = start.elapsed();
+
+        assert_eq!(unlimited.len(), n);
+        assert_eq!(limited.len(), n);
+
+        // Additive 200ms tolerance — absorbs scheduler noise while
+        // still catching the 50×+ regression on the broken impl
+        // (~1s for 1000 requests vs tens of ms unlimited).
+        let overhead = limited_elapsed.saturating_sub(unlimited_elapsed);
+        eprintln!(
+            "[bench] 1000-req batch: unlimited={:?}, limited@100k={:?}, overhead={:?}",
+            unlimited_elapsed, limited_elapsed, overhead,
+        );
+        assert!(
+            overhead < Duration::from_millis(200),
+            "rate-limited (100k RPS cap) took {:?}; unlimited took \
+             {:?}; overhead {:?} exceeds 200ms tolerance — see \
+             issue #15",
+            limited_elapsed,
+            unlimited_elapsed,
+            overhead,
         );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "blasthttp"
-version = "0.2.0"
+version = "0.3.2"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
 license = "GPL-3.0"
@@ -19,6 +19,9 @@ python = ["dep:pyo3", "dep:pyo3-async-runtimes", "pyo3/extension-module"]
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+# Derive macros for h2 module error types
+thiserror = "2"
 
 # HTTP - our single-stack foundation
 hyper = { version = "1", features = ["client", "http1", "http2"] }
