@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 
 [tool.maturin]
 features = ["python"]
+module-name = "blasthttp._native"
+python-source = "python"
 
 [tool.uv]
 # maturin manages the package install — don't let uv overwrite it

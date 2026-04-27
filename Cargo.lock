@@ -105,6 +105,7 @@ dependencies = [
  "bytes",
  "clap",
  "flate2",
+ "futures",
  "http",
  "http-body-util",
  "hyper",
