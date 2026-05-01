@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::stream::{self, Stream, StreamExt};
+
 use crate::client::{ClientError, HttpClient};
 use crate::config::RequestConfig;
 use crate::response::Response;
@@ -109,23 +111,20 @@ impl RateLimiter {
 
 // ── Batch dispatch ────────────────────────────────────────────────
 
-pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
-    client: Arc<C>,
-    configs: Vec<RequestConfig>,
-    concurrency: usize,
-    rate_limit: Option<f64>,
-    shared_limiter: Option<Arc<RateLimiter>>,
-) -> Vec<BatchResult> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    // When both a client-level and per-call rate limit are set, use the more
-    // restrictive (lower RPS) of the two. This lets modules enforce a tighter
-    // rate than the global without overriding the global for other callers.
-    let limiter = match (shared_limiter, rate_limit) {
+/// Pick the effective rate limiter for a batch call.
+///
+/// When both a client-level and per-call rate limit are set, use the more
+/// restrictive (lower RPS) of the two. This lets modules enforce a tighter
+/// rate than the global without overriding the global for other callers.
+fn merge_limiters(
+    shared: Option<Arc<RateLimiter>>,
+    per_call: Option<f64>,
+) -> Option<Arc<RateLimiter>> {
+    match (shared, per_call) {
         (Some(shared), Some(per_call_rps)) => {
             let shared_interval = shared.interval();
             let per_call_interval = Duration::from_secs_f64(1.0 / per_call_rps);
             if per_call_interval > shared_interval {
-                // Per-call limit is more restrictive (slower), use it
                 Some(Arc::new(RateLimiter::new(per_call_rps)))
             } else {
                 Some(shared)
@@ -134,7 +133,18 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
         (Some(shared), None) => Some(shared),
         (None, Some(rps)) => Some(Arc::new(RateLimiter::new(rps))),
         (None, None) => None,
-    };
+    }
+}
+
+pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
+    client: Arc<C>,
+    configs: Vec<RequestConfig>,
+    concurrency: usize,
+    rate_limit: Option<f64>,
+    shared_limiter: Option<Arc<RateLimiter>>,
+) -> Vec<BatchResult> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let limiter = merge_limiters(shared_limiter, rate_limit);
     let mut handles = Vec::new();
 
     for config in configs {
@@ -166,6 +176,77 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
         }
     }
     results
+}
+
+/// Streaming variant of `send_batch`. Yields `BatchResult`s in completion
+/// order (out-of-dispatch-order) as each request finishes, so a slow request
+/// doesn't block faster peers that follow it in the input list.
+///
+/// Architecture: a driver task spawns one tokio task per request and pipes
+/// completed `BatchResult`s into an unbounded mpsc channel; the returned
+/// stream is the receiver end. Each request runs as its own spawned task so
+/// HTTP work keeps progressing while the consumer (e.g. Python) is busy
+/// iterating a returned batch — the same in-flight model as `send_batch`.
+///
+/// `buffer_unordered` is intentionally avoided: its inner futures only make
+/// progress while the stream is being polled. While Python iterates a
+/// 1000-item batch, no one polls the stream, so 100 in-flight HTTP futures
+/// would stall — measured at ~3.7× throughput regression. blastdns gets
+/// away with `buffer_unordered` because its actual work runs on persistent
+/// worker tasks queued via crossfire; the stream just multiplexes oneshot
+/// waits. blasthttp has no such workers, so we spawn per request.
+///
+/// Spawning has to happen on the runtime, but `send_batch_stream` is called
+/// from a synchronous PyO3 constructor that isn't itself on a tokio task.
+/// `stream::once(async { ... }).flatten()` defers the driver-spawn into the
+/// stream's first poll, which happens inside `PyBatchResultIterator`'s
+/// `__anext__` (a `future_into_py` block running on the tokio runtime).
+///
+/// Concurrency is gated *before* spawn by a semaphore acquire on the driver,
+/// so at most `concurrency` requests are in-flight at any time. Rate-limit
+/// acquire happens before the semaphore so dispatch pacing matches
+/// `send_batch`. In-flight tasks are NOT cancelled if the consumer drops
+/// the stream — they run to completion and their sends fail silently. This
+/// also matches `send_batch`.
+pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
+    client: Arc<C>,
+    configs: Vec<RequestConfig>,
+    concurrency: usize,
+    rate_limit: Option<f64>,
+    shared_limiter: Option<Arc<RateLimiter>>,
+) -> impl Stream<Item = BatchResult> + Send + 'static {
+    let limiter = merge_limiters(shared_limiter, rate_limit);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+    stream::once(async move {
+        let (tx, rx) = futures::channel::mpsc::unbounded::<BatchResult>();
+
+        tokio::spawn(async move {
+            for config in configs {
+                if let Some(ref l) = limiter {
+                    l.acquire().await;
+                }
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let client = client.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let url = config.url.clone();
+                    let result = client.send(&config).await;
+                    let _ = tx.unbounded_send(BatchResult { url, result });
+                });
+            }
+            // Driver's `tx` clone drops here. Channel closes once every
+            // per-request task's `tx` clone also drops (i.e. all sends
+            // done), signaling stream end to the consumer.
+        });
+
+        rx
+    })
+    .flatten()
 }
 
 #[cfg(test)]

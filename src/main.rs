@@ -32,6 +32,10 @@ struct Cli {
     #[arg(short = 'c', long, default_value = "50")]
     concurrency: usize,
 
+    /// Rate limit in requests per second (batch mode; unlimited by default)
+    #[arg(long = "rate-limit")]
+    rate_limit: Option<f64>,
+
     /// Enable TLS certificate validation (off by default)
     #[arg(long)]
     verify: bool,
@@ -179,7 +183,7 @@ async fn run_batch(cli: &Cli, file_path: &str) {
         .collect();
 
     let client = Arc::new(HyperClient::new());
-    let results = batch::send_batch(client, configs, cli.concurrency, None, None).await;
+    let results = batch::send_batch(client, configs, cli.concurrency, cli.rate_limit, None).await;
 
     for r in results {
         match r.result {

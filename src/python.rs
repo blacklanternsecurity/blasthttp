@@ -3,12 +3,17 @@
 // Kept separate from Rust structs so the Python API can diverge freely
 // (e.g. complex request builders for Phase 4 raw byte control).
 
-use pyo3::exceptions::PyRuntimeError;
+use futures::stream::{Stream, StreamExt};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::time::Instant;
 
-use crate::batch::{self, RateLimiter};
+use crate::batch::{self, BatchResult, RateLimiter};
 use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
 use crate::client::raw;
@@ -257,6 +262,86 @@ impl PyBatchResult {
     }
 }
 
+fn to_py_batch_result(r: BatchResult) -> PyBatchResult {
+    let (response, error) = match r.result {
+        Ok(resp) => (Some(resp), None),
+        Err(e) => (None, Some(e.message)),
+    };
+    PyBatchResult {
+        url: r.url,
+        response,
+        error,
+    }
+}
+
+// ── Streaming batch iterator ──────────────────────────────────────
+
+/// Async iterator exposed to Python for `request_batch_stream`. Each
+/// `__anext__` drains the underlying stream into a batch (up to 1000
+/// items or 200ms — whichever comes first) and returns the batch as a
+/// `list[BatchResult]`. Callers iterate with:
+///
+///     async for batch in client.request_batch_stream(configs):
+///         for r in batch:
+///             ...
+///
+/// Two reasons for batching at this boundary:
+///   1. Throughput. Each `__anext__` is a full Python↔Rust round-trip
+///      (`future_into_py`, GIL release/reacquire, asyncio scheduling).
+///      At 100k+ QPS, paying that per result caps us roughly an order
+///      of magnitude below non-streaming. Batching ~1000 amortizes it.
+///   2. Streaming latency. The 200ms timeout is the actual streaming
+///      property: even when results trickle in slowly, partial batches
+///      flush after 200ms so the consumer is never starved.
+///
+/// Delicate bits (mirrors blastdns's PyBatchIterator — changing these
+/// can deadlock Python's event loop or leak tasks):
+///   • TokioMutex, not std::sync::Mutex: the guard crosses .await.
+///   • future_into_py releases the GIL while polling; do NOT
+///     Python::attach inside the loop.
+///   • PyStopAsyncIteration is only raised when a NEW __anext__ call
+///     finds both the stream empty AND the batch empty. If the stream
+///     ends mid-batch, return what we have and let the next call raise.
+#[pyclass(name = "BatchResultIterator")]
+pub struct PyBatchResultIterator {
+    inner: Arc<TokioMutex<Pin<Box<dyn Stream<Item = BatchResult> + Send>>>>,
+}
+
+#[pymethods]
+impl PyBatchResultIterator {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let mut stream = inner.lock().await;
+            let mut batch: Vec<PyBatchResult> = Vec::new();
+            let start = Instant::now();
+            let timeout = Duration::from_millis(200);
+
+            loop {
+                if batch.len() >= 1000 || (!batch.is_empty() && start.elapsed() >= timeout) {
+                    return Ok(batch);
+                }
+
+                match stream.next().await {
+                    Some(r) => batch.push(to_py_batch_result(r)),
+                    None => {
+                        if batch.is_empty() {
+                            return Err(PyStopAsyncIteration::new_err("end of stream"));
+                        } else {
+                            return Ok(batch);
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
 // ── Main client class ─────────────────────────────────────────────
 
 #[pyclass]
@@ -401,22 +486,47 @@ impl BlastHTTP {
             )
             .await;
 
-            let py_results: Vec<PyBatchResult> = results
-                .into_iter()
-                .map(|r| {
-                    let (response, error) = match r.result {
-                        Ok(resp) => (Some(resp), None),
-                        Err(e) => (None, Some(e.message)),
-                    };
-                    PyBatchResult {
-                        url: r.url,
-                        response,
-                        error,
-                    }
-                })
-                .collect();
+            let py_results: Vec<PyBatchResult> =
+                results.into_iter().map(to_py_batch_result).collect();
 
             Ok(py_results)
+        })
+    }
+
+    /// Streaming variant of request_batch. Returns an async iterator that
+    /// yields `list[BatchResult]` chunks as requests complete, in
+    /// completion order — a slow request doesn't block faster peers
+    /// behind it. Each chunk holds up to 1000 results or 200ms worth,
+    /// whichever fills first; partial chunks flush on the timeout so the
+    /// consumer is never starved when results trickle in.
+    ///
+    /// Iterate as:
+    ///
+    ///     async for batch in client.request_batch_stream(configs):
+    ///         for r in batch:
+    ///             ...
+    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    fn request_batch_stream(
+        &self,
+        configs: Vec<PyBatchConfig>,
+        concurrency: usize,
+        rate_limit: Option<f64>,
+    ) -> PyResult<PyBatchResultIterator> {
+        let request_configs: Vec<RequestConfig> = configs
+            .into_iter()
+            .map(|c| c.into_request_config())
+            .collect();
+
+        let stream = batch::send_batch_stream(
+            self.client.clone(),
+            request_configs,
+            concurrency,
+            rate_limit,
+            self.rate_limiter.clone(),
+        );
+
+        Ok(PyBatchResultIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(stream))),
         })
     }
 
@@ -1255,6 +1365,7 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // so Python can reference them for type hints / isinstance checks
     m.add_class::<PyResponse>()?;
     m.add_class::<PyBatchResult>()?;
+    m.add_class::<PyBatchResultIterator>()?;
     m.add_class::<PyCertInfo>()?;
     m.add_class::<PyResponseHash>()?;
     m.add_class::<PyRedirectHop>()?;
