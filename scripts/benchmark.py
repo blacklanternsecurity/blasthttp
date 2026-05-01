@@ -218,13 +218,14 @@ async def benchmark_blasthttp_python_stream(urls, workers, rate_limit=None):
     success = 0
     errors = 0
     start = time.perf_counter()
-    async for r in client.request_batch_stream(
+    async for batch in client.request_batch_stream(
         configs, concurrency=workers, rate_limit=rate_limit
     ):
-        if r.success:
-            success += 1
-        else:
-            errors += 1
+        for r in batch:
+            if r.success:
+                success += 1
+            else:
+                errors += 1
     total_time = time.perf_counter() - start
 
     qps = len(urls) / total_time if total_time > 0 else 0

@@ -278,7 +278,21 @@ fn to_py_batch_result(r: BatchResult) -> PyBatchResult {
 
 /// Async iterator exposed to Python for `request_batch_stream`. Each
 /// `__anext__` drains the underlying stream into a batch (up to 1000
-/// items or 200ms) to amortize the Python↔Rust boundary cross.
+/// items or 200ms — whichever comes first) and returns the batch as a
+/// `list[BatchResult]`. Callers iterate with:
+///
+///     async for batch in client.request_batch_stream(configs):
+///         for r in batch:
+///             ...
+///
+/// Two reasons for batching at this boundary:
+///   1. Throughput. Each `__anext__` is a full Python↔Rust round-trip
+///      (`future_into_py`, GIL release/reacquire, asyncio scheduling).
+///      At 100k+ QPS, paying that per result caps us roughly an order
+///      of magnitude below non-streaming. Batching ~1000 amortizes it.
+///   2. Streaming latency. The 200ms timeout is the actual streaming
+///      property: even when results trickle in slowly, partial batches
+///      flush after 200ms so the consumer is never starved.
 ///
 /// Delicate bits (mirrors blastdns's PyBatchIterator — changing these
 /// can deadlock Python's event loop or leak tasks):
@@ -288,7 +302,6 @@ fn to_py_batch_result(r: BatchResult) -> PyBatchResult {
 ///   • PyStopAsyncIteration is only raised when a NEW __anext__ call
 ///     finds both the stream empty AND the batch empty. If the stream
 ///     ends mid-batch, return what we have and let the next call raise.
-///   • Dropping the PyBatchResultIterator cancels in-flight sends.
 #[pyclass(name = "BatchResultIterator")]
 pub struct PyBatchResultIterator {
     inner: Arc<TokioMutex<Pin<Box<dyn Stream<Item = BatchResult> + Send>>>>,
@@ -481,10 +494,17 @@ impl BlastHTTP {
     }
 
     /// Streaming variant of request_batch. Returns an async iterator that
-    /// yields `BatchResult` batches (lists) as requests complete, in
-    /// completion order — a slow request doesn't block faster peers behind
-    /// it. The public Python wrapper unwraps each batch into individual
-    /// BatchResult objects.
+    /// yields `list[BatchResult]` chunks as requests complete, in
+    /// completion order — a slow request doesn't block faster peers
+    /// behind it. Each chunk holds up to 1000 results or 200ms worth,
+    /// whichever fills first; partial chunks flush on the timeout so the
+    /// consumer is never starved when results trickle in.
+    ///
+    /// Iterate as:
+    ///
+    ///     async for batch in client.request_batch_stream(configs):
+    ///         for r in batch:
+    ///             ...
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch_stream(
         &self,
@@ -1326,24 +1346,18 @@ fn register_h2_submodule<'py>(parent: &Bound<'py, PyModule>) -> PyResult<()> {
         h2m.getattr("h2_build_priority_frame")?,
     )?;
     // Both `parent.add()` to attach as parent attribute AND register
-    // in sys.modules. The Python wrapper at python/blasthttp/__init__.py
-    // additionally aliases this module to `blasthttp.h2` so users can
-    // `import blasthttp.h2` without going through `._native`.
+    // in sys.modules so `import blasthttp.h2` finds it.
     parent.add("h2", &h2m)?;
     py.import("sys")?
         .getattr("modules")?
-        .set_item("blasthttp._native.h2", h2m)?;
+        .set_item("blasthttp.h2", h2m)?;
     Ok(())
 }
 
 // ── Module registration ───────────────────────────────────────────
 
-// Module name matches the final segment of `module-name = "blasthttp._native"`
-// in pyproject.toml. The outer `blasthttp` package is a Python wrapper at
-// python/blasthttp/__init__.py that re-exports from here and layers a
-// streaming `request_batch_stream` unwrap on top of BlastHTTP.
 #[pymodule]
-fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<BlastHTTP>()?;
     m.add_class::<PyBatchConfig>()?;
