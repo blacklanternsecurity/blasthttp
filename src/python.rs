@@ -455,11 +455,31 @@ impl BlastHTTP {
         })
     }
 
-    /// Send a batch of requests concurrently. Returns list of BatchResult objects.
-    /// Each result has .url, .response (or None), and .error (or None).
-    /// rate_limit: max requests per second (None = unlimited).
-    /// If both set_rate_limit() and rate_limit are set, the more restrictive
-    /// (lower RPS) limit is used.
+    /// Send a batch of requests concurrently and await all of them.
+    ///
+    /// Returns a `list[BatchResult]` once every request has finished — the
+    /// list is in input order, regardless of which requests completed
+    /// first. Each `BatchResult` has `.url`, `.response` (or `None` on
+    /// failure), and `.error` (or `None` on success).
+    ///
+    /// Use this when you want the full result set in one shot. Use
+    /// `request_batch_stream` instead if you want to start processing
+    /// results as soon as they complete (e.g. so a slow request doesn't
+    /// block faster peers behind it).
+    ///
+    /// Example:
+    ///
+    ///     results = await client.request_batch(configs, concurrency=100)
+    ///     for r in results:
+    ///         if r.success:
+    ///             ...
+    ///
+    /// Args:
+    ///   configs: List of `BatchConfig` objects describing each request.
+    ///   concurrency: Maximum simultaneous in-flight requests. Default 50.
+    ///   rate_limit: Optional cap on dispatch rate (requests/sec). `None`
+    ///     means no per-call cap. If `set_rate_limit()` is also active on
+    ///     the client, the more restrictive (lower RPS) limit wins.
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch<'py>(
         &self,
@@ -493,18 +513,36 @@ impl BlastHTTP {
         })
     }
 
-    /// Streaming variant of request_batch. Returns an async iterator that
-    /// yields `list[BatchResult]` chunks as requests complete, in
-    /// completion order — a slow request doesn't block faster peers
-    /// behind it. Each chunk holds up to 1000 results or 200ms worth,
-    /// whichever fills first; partial chunks flush on the timeout so the
-    /// consumer is never starved when results trickle in.
+    /// Streaming variant of `request_batch`. Returns an async iterator
+    /// that yields `list[BatchResult]` chunks as requests complete, in
+    /// completion order — a slow request never blocks faster peers
+    /// behind it in the input list.
     ///
-    /// Iterate as:
+    /// Each yielded chunk holds up to 1000 `BatchResult`s or up to ~200ms
+    /// worth, whichever fills first; partial chunks flush on the timeout
+    /// so the consumer is never starved when results trickle in slowly.
+    /// The chunked shape is intentional — one boundary-crossing per
+    /// chunk amortizes the per-`__anext__` overhead and lets streaming
+    /// keep pace with the all-at-once `request_batch` throughput.
     ///
-    ///     async for batch in client.request_batch_stream(configs):
+    /// Use this when you want to overlap consumer work with in-flight
+    /// HTTP I/O, or when partial results are useful before the slowest
+    /// request finishes. Use `request_batch` instead when you just want
+    /// the whole list at the end.
+    ///
+    /// Example:
+    ///
+    ///     async for batch in client.request_batch_stream(configs, concurrency=100):
     ///         for r in batch:
-    ///             ...
+    ///             if r.success:
+    ///                 ...
+    ///
+    /// Args:
+    ///   configs: List of `BatchConfig` objects describing each request.
+    ///   concurrency: Maximum simultaneous in-flight requests. Default 50.
+    ///   rate_limit: Optional cap on dispatch rate (requests/sec). `None`
+    ///     means no per-call cap. If `set_rate_limit()` is also active on
+    ///     the client, the more restrictive (lower RPS) limit wins.
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch_stream(
         &self,

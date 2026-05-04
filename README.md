@@ -118,7 +118,7 @@ async def main():
     response = await client.request("https://example.com")
     print(response.status, len(response.body))
 
-    # Batch requests
+    # Batch requests — full result list at the end
     configs = [
         blasthttp.BatchConfig("https://a.com"),
         blasthttp.BatchConfig("https://b.com", method="POST", body="data"),
@@ -128,11 +128,28 @@ async def main():
         if r.success:
             print(r.url, r.response.status)
 
+    # Streaming batch — process results as they complete
+    async for batch in client.request_batch_stream(configs, concurrency=50):
+        for r in batch:
+            if r.success:
+                print(r.url, r.response.status)
+
     # Download to file
     await client.download("https://example.com/file.zip", "/tmp/file.zip")
 
 asyncio.run(main())
 ```
+
+### Batch vs. streaming batch
+
+Two shapes for issuing the same workload — pick whichever matches how you want to consume the results:
+
+| | Returns | Consume with | When to use |
+|---|---|---|---|
+| `request_batch(configs, ...)` | `list[BatchResult]` after every request finishes | `results = await ...; for r in results:` | You want the full set in one shot. |
+| `request_batch_stream(configs, ...)` | async iterator of `list[BatchResult]` chunks, in completion order | `async for batch in ...: for r in batch:` | A slow request shouldn't block faster peers behind it; you want to overlap consumer work with in-flight HTTP I/O; partial results are useful before the slowest finishes. |
+
+`request_batch_stream` yields up to 1000 results per chunk, or whatever has accumulated after ~200ms — the timeout flushes partial chunks so the consumer is never starved when results trickle in slowly. Both functions accept the same `(configs, concurrency=50, rate_limit=None)` arguments and respect `set_rate_limit()` identically.
 
 ### DNS Pinning & Request-Line Control
 
@@ -162,7 +179,7 @@ response = await client.request(
 
 ### Global Rate Limiting
 
-Set a client-level rate limit (requests per second) that applies to **all** request methods — `request()`, `request_batch()`, and `download()`:
+Set a client-level rate limit (requests per second) that applies to **all** request methods — `request()`, `request_batch()`, `request_batch_stream()`, and `download()`:
 
 ```python
 client = blasthttp.BlastHTTP()
@@ -179,9 +196,9 @@ client.set_rate_limit(0)
 client.set_rate_limit(None)
 ```
 
-When multiple callers share the same `BlastHTTP` instance, the rate limiter is global — two concurrent `request_batch()` calls will collectively stay under the limit.
+When multiple callers share the same `BlastHTTP` instance, the rate limiter is global — two concurrent `request_batch()` (or `request_batch_stream()`) calls will collectively stay under the limit.
 
-The client-level rate limit takes precedence over the per-call `rate_limit` parameter on `request_batch()`.
+The client-level rate limit takes precedence over the per-call `rate_limit` parameter on `request_batch()` / `request_batch_stream()`.
 
 `RawConnection` handles returned from `raw_connect()` inherit the client's rate limiter: every `send_bytes` / `read_raw` call on that handle also consumes one token, so a caller that pipelines many ops on a single connection can't burst past the limit.
 
