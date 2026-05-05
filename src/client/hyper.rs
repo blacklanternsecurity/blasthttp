@@ -7,8 +7,10 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Once};
 use std::task::{Context, Poll};
@@ -78,6 +80,29 @@ fn ensure_legacy_provider() {
 /// Shared slot where the connector writes cert info during TLS handshake.
 /// `send_inner` reads it after the response comes back.
 type CertSlot = Arc<Mutex<Option<CertInfo>>>;
+
+/// Shared map where the connector records the peer IP for every TCP
+/// connection it opens, keyed on `"host:port"` (the authority of the
+/// requested URI). `send_inner` looks the entry up after each redirect
+/// hop so it can stamp the right IP on each `RedirectHop`. The map
+/// only grows — pooled-connection reuse re-reads the existing entry,
+/// new connections to the same host overwrite it (DNS round-robin
+/// will lag, but the value will always be an IP that *was* used).
+type PeerSlot = Arc<Mutex<HashMap<String, IpAddr>>>;
+
+/// Build the lookup key for `PeerSlot` from a URI's host and port.
+/// HTTPS defaults to 443, everything else to 80 — matches what
+/// `HttpConnector` uses when it dials the OS resolver.
+fn peer_slot_key(uri: &http::Uri) -> Option<String> {
+    let host = uri.host()?;
+    let default_port = if uri.scheme_str() == Some("https") {
+        443
+    } else {
+        80
+    };
+    let port = uri.port_u16().unwrap_or(default_port);
+    Some(format!("{}:{}", host, port))
+}
 
 fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
     let cert = ssl.peer_certificate()?;
@@ -178,6 +203,10 @@ struct OpenSslConnector {
     ssl: openssl::ssl::SslConnector,
     // Shared slot for cert info — written during handshake, read after response
     cert_slot: CertSlot,
+    // Shared map of peer IPs — written when a fresh TCP connection is
+    // opened, read after each redirect hop so the right IP gets stamped
+    // on the `RedirectHop` (or final `Response`).
+    peer_slot: PeerSlot,
 }
 
 /// Encode a list of ALPN protocol names into the wire format OpenSSL
@@ -221,7 +250,11 @@ fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
 }
 
 impl OpenSslConnector {
-    fn new(config: &RequestConfig, cert_slot: CertSlot) -> Result<Self, ClientError> {
+    fn new(
+        config: &RequestConfig,
+        cert_slot: CertSlot,
+        peer_slot: PeerSlot,
+    ) -> Result<Self, ClientError> {
         // Ensure legacy ciphers (RC4, DES, etc.) are available
         ensure_legacy_provider();
 
@@ -271,6 +304,7 @@ impl OpenSslConnector {
             http,
             ssl,
             cert_slot,
+            peer_slot,
         })
     }
 }
@@ -374,13 +408,26 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
     fn call(&mut self, uri: http::Uri) -> Self::Future {
         let host = uri.host().unwrap_or("").to_string();
         let is_https = uri.scheme_str() == Some("https");
+        // Compute the slot key from the original URI before we hand it
+        // off to hyper's HttpConnector — that's the authority callers
+        // will look up by.
+        let slot_key = peer_slot_key(&uri);
         let http_fut = self.http.call(uri);
         let ssl_connector = self.ssl.clone();
         let cert_slot = self.cert_slot.clone();
+        let peer_slot = self.peer_slot.clone();
 
         Box::pin(async move {
             let tcp = http_fut.await?;
             let tcp_stream = tcp.into_inner();
+
+            // Record peer IP for this fresh connection. Best-effort —
+            // failure to read peer_addr (vanishingly rare) is not fatal.
+            if let (Some(key), Ok(peer)) = (slot_key, tcp_stream.peer_addr())
+                && let Ok(mut map) = peer_slot.lock()
+            {
+                map.insert(key, peer.ip());
+            }
 
             // Plain HTTP — return raw TCP stream, no TLS handshake
             if !is_https {
@@ -440,6 +487,7 @@ type Socks5ProxyClient =
 struct CachedClient {
     inner: AnyClient,
     cert_slot: CertSlot,
+    peer_slot: PeerSlot,
 }
 
 #[derive(Clone)]
@@ -528,7 +576,8 @@ impl HyperClient {
         }
 
         let cert_slot: CertSlot = Arc::new(Mutex::new(None));
-        let connector = OpenSslConnector::new(config, cert_slot.clone())?;
+        let peer_slot: PeerSlot = Arc::new(Mutex::new(HashMap::new()));
+        let connector = OpenSslConnector::new(config, cert_slot.clone(), peer_slot.clone())?;
         let builder = Client::builder(TokioExecutor::new());
 
         let inner = match mode {
@@ -559,7 +608,11 @@ impl HyperClient {
             }
         };
 
-        let cached = CachedClient { inner, cert_slot };
+        let cached = CachedClient {
+            inner,
+            cert_slot,
+            peer_slot,
+        };
         guard.insert(mode.clone(), cached.clone());
         Ok(cached)
     }
@@ -622,6 +675,7 @@ pub(crate) async fn connect_stream(
         Box<dyn IoReadWrite + Send + Unpin>,
         Option<CertInfo>,
         Option<String>,
+        Option<IpAddr>,
     ),
     ClientError,
 > {
@@ -673,6 +727,16 @@ pub(crate) async fn connect_stream(
             ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
         })?;
 
+    // Capture peer IP for the target. When a proxy is in use, peer_addr
+    // points at the proxy — useless to callers asking "what IP served
+    // the request" — so report None for proxied connections. resolve_ip
+    // is fine here: peer_addr will reflect whichever IP we forced.
+    let peer_ip: Option<IpAddr> = if proxy_config.is_some() {
+        None
+    } else {
+        tcp.peer_addr().ok().map(|a| a.ip())
+    };
+
     // Disable Nagle on raw-path sockets. RawConnection callers send timing-
     // sensitive byte sequences (consecutive requests, split-then-flush
     // patterns) where Nagle's coalescing delay can cost the attack or let
@@ -713,7 +777,7 @@ pub(crate) async fn connect_stream(
     }
 
     if !is_https {
-        return Ok((Box::new(tcp), None, None));
+        return Ok((Box::new(tcp), None, None, peer_ip));
     }
 
     ensure_legacy_provider();
@@ -782,7 +846,7 @@ pub(crate) async fn connect_stream(
         .selected_alpn_protocol()
         .and_then(|b| std::str::from_utf8(b).ok().map(String::from));
 
-    Ok((Box::new(tls_stream), cert_info, negotiated_alpn))
+    Ok((Box::new(tls_stream), cert_info, negotiated_alpn, peer_ip))
 }
 
 /// One-shot HTTP/1.1 request over a direct, un-pooled connection. Used when
@@ -795,9 +859,9 @@ async fn dispatch_direct(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
-) -> Result<(SingleResponse, Option<CertInfo>), ClientError> {
+) -> Result<(SingleResponse, Option<CertInfo>, Option<IpAddr>), ClientError> {
     let v = config.verbosity;
-    let (stream, cert_info, _alpn) = connect_stream(target_uri, config, log).await?;
+    let (stream, cert_info, _alpn, peer_ip) = connect_stream(target_uri, config, log).await?;
     let io = hyper_util::rt::TokioIo::new(stream);
 
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
@@ -843,7 +907,7 @@ async fn dispatch_direct(
     })?;
 
     let resp = parse_response(hyper_response, config, log).await?;
-    Ok((resp, cert_info))
+    Ok((resp, cert_info, peer_ip))
 }
 
 /// Stream types returned by `connect_stream`: plain TCP or TLS over TCP.
@@ -1213,18 +1277,13 @@ impl HyperClient {
         // Bypasses the cached connection pool — opens a fresh TCP connection.
         if config.resolve_ip.is_some() || config.request_target.is_some() {
             let redirect_chain: Vec<RedirectHop> = Vec::new();
-            let (resp, cert_info) = dispatch_direct(&uri, config, log).await?;
+            let (resp, cert_info, peer_ip) = dispatch_direct(&uri, config, log).await?;
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
             // No redirect following for dispatch_direct — these are specialized
             // requests (host_header, SSRF) that need exact control.
-            let body = String::from_utf8(resp.body_bytes.clone())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
-
             let elapsed_ms = start.elapsed().as_millis() as u64;
-            let hash = crate::response::ResponseHash::compute(&resp.body_bytes, &resp.headers);
-
             let debug_log = log.lock().map(|guard| guard.clone()).unwrap_or_default();
 
             return Ok(Response {
@@ -1232,12 +1291,17 @@ impl HyperClient {
                 status: resp.status,
                 headers: resp.headers,
                 body_bytes: resp.body_bytes,
-                body,
                 elapsed_ms,
                 redirect_chain,
                 cert_info,
-                hash,
+                peer_ip: peer_ip.map(|ip| ip.to_string()),
+                request_url: config.url.clone(),
+                request_method: config.method().to_string(),
                 debug_log,
+                body_cache: std::sync::OnceLock::new(),
+                raw_headers_cache: std::sync::OnceLock::new(),
+                cookies_cache: std::sync::OnceLock::new(),
+                hash_cache: std::sync::OnceLock::new(),
             });
         }
 
@@ -1262,6 +1326,19 @@ impl HyperClient {
         let mut redirect_chain: Vec<RedirectHop> = Vec::new();
         let mut hops = 0u32;
 
+        // Per-hop peer IP lookup. Returns None when:
+        //   • the request went through a proxy (the connector recorded
+        //     the proxy IP under the proxy's authority, so the target's
+        //     authority isn't in the map)
+        //   • forward-proxy dispatch (bypasses the connector entirely)
+        //   • peer_addr() failed at connect time (vanishingly rare)
+        let lookup_peer_ip = |target_uri: &http::Uri| -> Option<String> {
+            let key = peer_slot_key(target_uri)?;
+            let cached = cached.as_ref()?;
+            let map = cached.peer_slot.lock().ok()?;
+            map.get(&key).map(|ip| ip.to_string())
+        };
+
         loop {
             let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
                 dispatch_forward_proxy(proxy_url, &uri, config, log).await?
@@ -1270,6 +1347,8 @@ impl HyperClient {
             };
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
+
+            let hop_peer_ip = lookup_peer_ip(&uri);
 
             if is_redirect(resp.status) && config.should_follow_redirects() {
                 hops += 1;
@@ -1295,19 +1374,19 @@ impl HyperClient {
                 redirect_chain.push(RedirectHop {
                     url: uri.to_string(),
                     status: resp.status,
+                    peer_ip: hop_peer_ip,
                 });
 
                 uri = next_uri;
                 continue;
             }
 
-            let body = String::from_utf8(resp.body_bytes.clone())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&resp.body_bytes).to_string());
-
             let cert_info = cached
                 .as_ref()
                 .and_then(|c| c.cert_slot.lock().ok())
                 .and_then(|guard| guard.clone());
+
+            let peer_ip = hop_peer_ip;
 
             let elapsed_ms = start.elapsed().as_millis() as u64;
             debug_record(
@@ -1326,8 +1405,6 @@ impl HyperClient {
                 debug_record(log, v, 1, &format!("   Cert SANs: {:?}", info.sans));
             }
 
-            let hash = crate::response::ResponseHash::compute(&resp.body_bytes, &resp.headers);
-
             // Extract collected debug messages
             let debug_log = log.lock().map(|guard| guard.clone()).unwrap_or_default();
 
@@ -1336,12 +1413,17 @@ impl HyperClient {
                 status: resp.status,
                 headers: resp.headers,
                 body_bytes: resp.body_bytes,
-                body,
                 elapsed_ms,
                 redirect_chain,
                 cert_info,
-                hash,
+                peer_ip,
+                request_url: config.url.clone(),
+                request_method: config.method().to_string(),
                 debug_log,
+                body_cache: std::sync::OnceLock::new(),
+                raw_headers_cache: std::sync::OnceLock::new(),
+                cookies_cache: std::sync::OnceLock::new(),
+                hash_cache: std::sync::OnceLock::new(),
             });
         }
     }

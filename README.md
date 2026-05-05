@@ -56,15 +56,23 @@ blasthttp https://legacy-server.com --min-tls 1.0 --ciphers "RC4-SHA"
 blasthttp https://example.com -v
 ```
 
-Output is JSON (one object per response), including status, headers, redirect chain, TLS cert info, and content hashes:
+Output is JSON (one object per response), including status, headers, redirect chain with per-hop peer IP, TLS cert info, content hashes, parsed cookies, and the actual TCP peer IP for the final hop:
 
 ```json
 {
-  "url": "https://example.com",
+  "url": "https://example.com/",
   "status": 200,
+  "request_url": "https://example.com",
+  "request_method": "GET",
   "headers": [["content-type", "text/html"], ...],
+  "raw_headers": "content-type: text/html\r\n...",
+  "body": "<!doctype html>...",
+  "cookies": {"session": "abc123"},
   "elapsed_ms": 120,
-  "redirect_chain": [],
+  "peer_ip": "93.184.215.14",
+  "redirect_chain": [
+    {"url": "http://example.com/", "status": 301, "peer_ip": "93.184.215.14"}
+  ],
   "cert_info": {
     "common_name": "example.com",
     "sans": ["example.com", "www.example.com"],
@@ -114,9 +122,16 @@ import blasthttp
 async def main():
     client = blasthttp.BlastHTTP()
 
-    # Single request
-    response = await client.request("https://example.com")
-    print(response.status, len(response.body))
+    # Single request — Response is httpx-style
+    r = await client.request("https://example.com")
+    print(r.status_code, r.is_success)            # 200, True
+    print(r.headers["Content-Type"])              # case-insensitive
+    print(r.peer_ip)                              # actual TCP peer IP
+    print(r.text[:80])                            # UTF-8 body (lazy)
+    print(r.hash.body_md5)                        # md5/sha256/mmh3 (lazy)
+    print(r.cookies)                              # Set-Cookie parsed (lazy)
+    print(r.request.url, r.request.method)        # original (pre-redirect)
+    r.raise_for_status()                          # raises HTTPStatusError on 4xx/5xx
 
     # Batch requests — full result list at the end
     configs = [
@@ -126,13 +141,13 @@ async def main():
     results = await client.request_batch(configs, concurrency=50)
     for r in results:
         if r.success:
-            print(r.url, r.response.status)
+            print(r.url, r.response.status_code, r.response.peer_ip)
 
     # Streaming batch — process results as they complete
     async for batch in client.request_batch_stream(configs, concurrency=50):
         for r in batch:
             if r.success:
-                print(r.url, r.response.status)
+                print(r.url, r.response.status_code)
 
     # Download to file
     await client.download("https://example.com/file.zip", "/tmp/file.zip")
@@ -140,9 +155,36 @@ async def main():
 asyncio.run(main())
 ```
 
+### Response API
+
+`Response` follows the httpx convention so it works as a drop-in for httpx-flavored consumers:
+
+| Attribute | Type | Notes |
+|---|---|---|
+| `status` / `status_code` | `int` | HTTP status code |
+| `is_success` | `bool` | `True` for 2xx-3xx |
+| `url` | `str` | final URL (after redirects) |
+| `text` / `body` | `str` | UTF-8 decoded body (lazy) |
+| `content` / `body_bytes` | `bytes` | raw body |
+| `headers` | `Headers` | case-insensitive, mutable; `headers["Content-Type"]` works either case |
+| `cookies` | `dict[str, str]` | parsed `Set-Cookie` (lazy) |
+| `raw_headers` | `str` | canonical `Name: Value\r\n…` form (lazy) |
+| `hash` | `ResponseHash` | md5 / sha256 / mmh3 of body and headers (lazy) |
+| `cert_info` | `CertInfo \| None` | TLS cert details from the handshake |
+| `peer_ip` | `str \| None` | actual IP of the final hop's TCP connection; `None` when proxied |
+| `redirect_chain` | `list[RedirectHop]` | each hop carries its own `peer_ip` |
+| `elapsed_ms` / `elapsed` | `int` / `timedelta` | total request time |
+| `request` | `Request` | original `request.url` and `request.method` |
+| `json()` | callable | `json.loads(self.text)` |
+| `raise_for_status()` | callable | raises `HTTPStatusError` on 4xx/5xx |
+
+`body`, `raw_headers`, `cookies`, and `hash` are lazy — first access computes, subsequent accesses are free. Hashing a 10 MB body is real work; batch jobs that filter on `status` and never look at the body don't pay for it.
+
+`headers` is a `Headers` instance (case-insensitive view), not a list of tuples. Iterate with `.items()` to get `(name, value)` pairs preserving original case and duplicate names (e.g. multiple `Set-Cookie`).
+
 ### Batch vs. streaming batch
 
-Two shapes for issuing the same workload — pick whichever matches how you want to consume the results:
+Two ways to issue the same workload — pick whichever matches how you want to consume the results:
 
 | | Returns | Consume with | When to use |
 |---|---|---|---|

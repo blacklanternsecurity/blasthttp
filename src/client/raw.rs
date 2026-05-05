@@ -12,6 +12,7 @@ use crate::config::RequestConfig;
 use crate::debug::new_debug_log;
 use crate::response::CertInfo;
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,7 @@ pub struct RawConnection {
     stream: Arc<Mutex<Option<Box<dyn IoReadWrite + Send + Unpin>>>>,
     cert_info: Option<CertInfo>,
     negotiated_alpn: Option<String>,
+    peer_ip: Option<IpAddr>,
 }
 
 impl RawConnection {
@@ -34,11 +36,13 @@ impl RawConnection {
             ClientError::invalid_url(format!("invalid URL '{}': {}", uri_str, e))
         })?;
         let log = new_debug_log();
-        let (stream, cert_info, negotiated_alpn) = connect_stream(&uri, config, &log).await?;
+        let (stream, cert_info, negotiated_alpn, peer_ip) =
+            connect_stream(&uri, config, &log).await?;
         Ok(Self {
             stream: Arc::new(Mutex::new(Some(stream))),
             cert_info,
             negotiated_alpn,
+            peer_ip,
         })
     }
 
@@ -113,6 +117,13 @@ impl RawConnection {
     /// "http/1.1".
     pub fn negotiated_alpn(&self) -> Option<String> {
         self.negotiated_alpn.clone()
+    }
+
+    /// IP actually used for this connection's TCP socket. `None` if a
+    /// proxy was configured (peer_addr would be the proxy, not the
+    /// target) or if the OS refused `peer_addr()`.
+    pub fn peer_ip(&self) -> Option<String> {
+        self.peer_ip.map(|ip| ip.to_string())
     }
 }
 

@@ -4,11 +4,13 @@
 // (e.g. complex request builders for Phase 4 raw byte control).
 
 use futures::stream::{Stream, StreamExt};
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant;
@@ -127,20 +129,184 @@ impl PyRedirectHop {
     fn status(&self) -> u16 {
         self.inner.status
     }
+    /// IP actually used for this hop's TCP connection.
+    /// None if the request went through a proxy.
+    #[getter]
+    fn peer_ip(&self) -> Option<String> {
+        self.inner.peer_ip.clone()
+    }
 
     fn __repr__(&self) -> String {
         format!(
-            "RedirectHop(url='{}', status={})",
-            self.inner.url, self.inner.status
+            "RedirectHop(url='{}', status={}, peer_ip={:?})",
+            self.inner.url, self.inner.status, self.inner.peer_ip,
         )
     }
 }
+
+// ── Headers (case-insensitive dict-like) ──────────────────────────
+
+/// Case-insensitive headers view, mutable. Lookups (`h["Content-Type"]`
+/// or `h["content-type"]`) hit the same entry. Iteration yields
+/// lower-cased unique keys (Python dict / httpx convention). Use
+/// `.items()` to iterate `(name, value)` tuples preserving original
+/// case and duplicate names (e.g. multiple `Set-Cookie`).
+#[pyclass(name = "Headers", mapping)]
+pub struct PyHeaders {
+    /// Original list (preserves order, original casing, duplicates).
+    list: Vec<(String, String)>,
+    /// Lower-case key → last-value-wins (used for direct lookup).
+    lookup: HashMap<String, String>,
+}
+
+impl PyHeaders {
+    fn from_list(list: Vec<(String, String)>) -> Self {
+        let mut lookup = HashMap::with_capacity(list.len());
+        for (k, v) in &list {
+            lookup.insert(k.to_ascii_lowercase(), v.clone());
+        }
+        PyHeaders { list, lookup }
+    }
+}
+
+#[pymethods]
+impl PyHeaders {
+    #[new]
+    fn new(headers: Option<Vec<(String, String)>>) -> Self {
+        Self::from_list(headers.unwrap_or_default())
+    }
+
+    fn __getitem__(&self, key: &str) -> PyResult<String> {
+        self.lookup
+            .get(&key.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))
+    }
+
+    fn __setitem__(&mut self, key: String, value: String) {
+        let lower = key.to_ascii_lowercase();
+        // Drop any existing entries with this name (case-insensitive).
+        self.list.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+        self.list.push((key, value.clone()));
+        self.lookup.insert(lower, value);
+    }
+
+    fn __delitem__(&mut self, key: &str) -> PyResult<()> {
+        let lower = key.to_ascii_lowercase();
+        if self.lookup.remove(&lower).is_none() {
+            return Err(pyo3::exceptions::PyKeyError::new_err(key.to_string()));
+        }
+        self.list.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
+        Ok(())
+    }
+
+    fn __contains__(&self, key: &str) -> bool {
+        self.lookup.contains_key(&key.to_ascii_lowercase())
+    }
+
+    fn __len__(&self) -> usize {
+        self.lookup.len()
+    }
+
+    /// Iterate over lower-cased unique keys (Python dict convention).
+    fn __iter__<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.lookup.keys().cloned().collect();
+        let list = pyo3::types::PyList::new(py, keys)?;
+        Ok(list.try_iter()?.into_any())
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        // Compare against another PyHeaders or a Python dict.
+        if let Ok(other_h) = other.cast::<PyHeaders>() {
+            return Ok(self.lookup == other_h.borrow().lookup);
+        }
+        if let Ok(d) = other.cast::<pyo3::types::PyDict>() {
+            // Lower-case both sides before comparing.
+            let mut other_map = HashMap::with_capacity(d.len());
+            for (k, v) in d.iter() {
+                let k_str: String = k.extract()?;
+                let v_str: String = v.extract()?;
+                other_map.insert(k_str.to_ascii_lowercase(), v_str);
+            }
+            return Ok(self.lookup == other_map);
+        }
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Headers({:?})", self.list)
+    }
+
+    /// `(name, value)` pairs preserving original casing and duplicates.
+    fn items(&self) -> Vec<(String, String)> {
+        self.list.clone()
+    }
+
+    /// Lower-cased unique keys.
+    fn keys(&self) -> Vec<String> {
+        self.lookup.keys().cloned().collect()
+    }
+
+    /// Values corresponding to the unique keys (last-value-wins).
+    fn values(&self) -> Vec<String> {
+        self.lookup.values().cloned().collect()
+    }
+
+    /// Case-insensitive lookup with default.
+    #[pyo3(signature = (key, default=None))]
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        if let Some(v) = self.lookup.get(&key.to_ascii_lowercase()) {
+            return Ok(Some(v.clone().into_py_any(py)?));
+        }
+        Ok(default)
+    }
+}
+
+// ── Request (httpx-style request companion) ───────────────────────
+
+/// Minimal request-side companion to a Response. Exposes the
+/// originally-requested URL and HTTP method — useful for logging
+/// and for consumers that follow the httpx API (`r.request.url`).
+#[pyclass(name = "Request")]
+pub struct PyRequest {
+    #[pyo3(get)]
+    url: String,
+    #[pyo3(get)]
+    method: String,
+}
+
+#[pymethods]
+impl PyRequest {
+    fn __repr__(&self) -> String {
+        format!("Request(method='{}', url='{}')", self.method, self.url)
+    }
+}
+
+// ── HTTPStatusError exception ─────────────────────────────────────
+
+pyo3::create_exception!(
+    blasthttp,
+    HTTPStatusError,
+    pyo3::exceptions::PyException,
+    "Raised by Response.raise_for_status() when the response status is 4xx or 5xx."
+);
 
 // ── Response wrapper ──────────────────────────────────────────────
 
 #[pyclass(name = "Response")]
 struct PyResponse {
     inner: Response,
+    /// Cached headers wrapper. Built on first access and reused so
+    /// mutations (`r.headers["x"] = "y"`) persist across reads.
+    headers_cache: OnceLock<Py<PyHeaders>>,
+    /// Cached Request companion. `r.request is r.request` is True.
+    request_cache: OnceLock<Py<PyRequest>>,
 }
 
 #[pymethods]
@@ -153,13 +319,39 @@ impl PyResponse {
     fn status(&self) -> u16 {
         self.inner.status
     }
+    /// httpx-style alias for `status`. Returns the same integer.
     #[getter]
-    fn body(&self) -> String {
-        self.inner.body.clone()
+    fn status_code(&self) -> u16 {
+        self.inner.status
+    }
+    /// `True` for status codes in the 2xx-3xx range.
+    #[getter]
+    fn is_success(&self) -> bool {
+        self.inner.is_success()
+    }
+    /// UTF-8 decoded body. Same as `text`. Lazily decoded — not paid
+    /// for unless read.
+    #[getter]
+    fn body(&self) -> &str {
+        self.inner.body()
+    }
+    /// httpx-style alias for `body` — UTF-8 decoded body.
+    #[getter]
+    fn text(&self) -> &str {
+        self.inner.body()
     }
     #[getter]
     fn elapsed_ms(&self) -> u64 {
         self.inner.elapsed_ms
+    }
+
+    /// httpx-style `elapsed` as a `datetime.timedelta`.
+    #[getter]
+    fn elapsed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDelta>> {
+        let ms = self.inner.elapsed_ms as i32;
+        let seconds = ms / 1000;
+        let microseconds = (ms % 1000) * 1000;
+        pyo3::types::PyDelta::new(py, 0, seconds, microseconds, false)
     }
 
     /// Raw body as Python bytes (avoids UTF-8 decode for binary responses)
@@ -168,11 +360,61 @@ impl PyResponse {
         &self.inner.body_bytes
     }
 
-    /// Response headers as list of (name, value) tuples.
-    /// List, not dict — HTTP allows duplicate header names (e.g. Set-Cookie).
+    /// httpx-style alias for `body_bytes` — raw body as Python bytes.
     #[getter]
-    fn headers(&self) -> Vec<(String, String)> {
-        self.inner.headers.clone()
+    fn content(&self) -> &[u8] {
+        &self.inner.body_bytes
+    }
+
+    /// The originally-requested URL and method (httpx-style
+    /// `r.request.url` / `r.request.method`). Cached, so
+    /// `r.request is r.request` is True.
+    #[getter]
+    fn request<'py>(&self, py: Python<'py>) -> PyResult<Py<PyRequest>> {
+        if let Some(cached) = self.request_cache.get() {
+            return Ok(cached.clone_ref(py));
+        }
+        let req = PyRequest {
+            url: self.inner.request_url.clone(),
+            method: self.inner.request_method.clone(),
+        };
+        let bound = Py::new(py, req)?;
+        let _ = self.request_cache.set(bound.clone_ref(py));
+        Ok(bound)
+    }
+
+    /// Response headers as a case-insensitive `Headers` view.
+    /// The same instance is returned on every read, so mutations
+    /// (`del r.headers["server"]`, `r.headers["x-foo"] = "bar"`)
+    /// persist. Use `r.headers.items()` to iterate `(name, value)`
+    /// tuples preserving original case and duplicate names.
+    #[getter]
+    fn headers<'py>(&self, py: Python<'py>) -> PyResult<Py<PyHeaders>> {
+        if let Some(cached) = self.headers_cache.get() {
+            return Ok(cached.clone_ref(py));
+        }
+        let h = PyHeaders::from_list(self.inner.headers.clone());
+        let bound = Py::new(py, h)?;
+        // Set may race; if another thread won, just use that value.
+        let _ = self.headers_cache.set(bound.clone_ref(py));
+        Ok(bound)
+    }
+
+    /// Canonical `Name: Value\r\nName: Value` form of `headers`. Same
+    /// string used to compute `hash.header_*`. Computed and cached on
+    /// first access — repeated reads are free.
+    #[getter]
+    fn raw_headers(&self) -> &str {
+        self.inner.raw_headers()
+    }
+
+    /// Cookies parsed from `Set-Cookie` headers as a `dict[str, str]`.
+    /// Only the `name=value` pair before any attributes is kept; on
+    /// duplicates the last `Set-Cookie` wins. Computed and cached on
+    /// first access.
+    #[getter]
+    fn cookies(&self) -> HashMap<String, String> {
+        self.inner.cookies().clone()
     }
 
     /// TLS certificate info (None for plain HTTP)
@@ -184,11 +426,21 @@ impl PyResponse {
             .map(|c| PyCertInfo { inner: c })
     }
 
-    /// Content hashes for fingerprinting
+    /// IP actually used for the final hop's TCP connection.
+    /// None if the request went through a proxy (the peer there is the
+    /// proxy, not the target).
+    #[getter]
+    fn peer_ip(&self) -> Option<String> {
+        self.inner.peer_ip.clone()
+    }
+
+    /// Content hashes for fingerprinting. Computed and cached on
+    /// first access — md5+sha256+mmh3 of body and headers are real
+    /// CPU work, so consumers that don't need them don't pay for them.
     #[getter]
     fn hash(&self) -> PyResponseHash {
         PyResponseHash {
-            inner: self.inner.hash.clone(),
+            inner: self.inner.hash().clone(),
         }
     }
 
@@ -215,6 +467,38 @@ impl PyResponse {
             self.inner.url, self.inner.status
         )
     }
+
+    /// Always `True`. Mirrors httpx — a Response object is truthy
+    /// regardless of status, so `if response:` checks "did we get a
+    /// response at all", not "was it successful". Use `is_success`
+    /// or `raise_for_status()` for that.
+    fn __bool__(&self) -> bool {
+        true
+    }
+
+    /// Parse the body as JSON. Equivalent to `json.loads(response.text)`
+    /// — raises `json.JSONDecodeError` on invalid JSON.
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let json_module = py.import("json")?;
+        json_module.call_method1("loads", (self.inner.body(),))
+    }
+
+    /// Raise `HTTPStatusError` if the status is 4xx or 5xx.
+    /// No-op for 1xx-3xx. Mirrors httpx and requests.
+    fn raise_for_status(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let status = slf.inner.status;
+        if (400..600).contains(&status) {
+            let msg = format!("HTTP {} for url '{}'", status, slf.inner.url);
+            let py = slf.py();
+            let err = HTTPStatusError::new_err(msg);
+            // Attach the Response object on the exception so callers
+            // can inspect it (httpx convention: `e.response`).
+            let response_obj: Py<PyResponse> = slf.into();
+            err.value(py).setattr("response", response_obj)?;
+            return Err(err);
+        }
+        Ok(())
+    }
 }
 
 // ── BatchResult wrapper ───────────────────────────────────────────
@@ -238,7 +522,11 @@ impl PyBatchResult {
     /// The response object (None if the request failed)
     #[getter]
     fn response(&self) -> Option<PyResponse> {
-        self.response.clone().map(|r| PyResponse { inner: r })
+        self.response.clone().map(|r| PyResponse {
+            inner: r,
+            headers_cache: OnceLock::new(),
+            request_cache: OnceLock::new(),
+        })
     }
 
     /// Error message (None if the request succeeded)
@@ -281,9 +569,11 @@ fn to_py_batch_result(r: BatchResult) -> PyBatchResult {
 /// items or 200ms — whichever comes first) and returns the batch as a
 /// `list[BatchResult]`. Callers iterate with:
 ///
-///     async for batch in client.request_batch_stream(configs):
-///         for r in batch:
-///             ...
+/// ```text
+/// async for batch in client.request_batch_stream(configs):
+///     for r in batch:
+///         ...
+/// ```
 ///
 /// Two reasons for batching at this boundary:
 ///   1. Throughput. Each `__anext__` is a full Python↔Rust round-trip
@@ -451,7 +741,11 @@ impl BlastHTTP {
                 .send(&config)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.message))?;
-            Ok(PyResponse { inner: response })
+            Ok(PyResponse {
+                inner: response,
+                headers_cache: OnceLock::new(),
+                request_cache: OnceLock::new(),
+            })
         })
     }
 
@@ -469,10 +763,12 @@ impl BlastHTTP {
     ///
     /// Example:
     ///
-    ///     results = await client.request_batch(configs, concurrency=100)
-    ///     for r in results:
-    ///         if r.success:
-    ///             ...
+    /// ```text
+    /// results = await client.request_batch(configs, concurrency=100)
+    /// for r in results:
+    ///     if r.success:
+    ///         ...
+    /// ```
     ///
     /// Args:
     ///   configs: List of `BatchConfig` objects describing each request.
@@ -532,10 +828,12 @@ impl BlastHTTP {
     ///
     /// Example:
     ///
-    ///     async for batch in client.request_batch_stream(configs, concurrency=100):
-    ///         for r in batch:
-    ///             if r.success:
-    ///                 ...
+    /// ```text
+    /// async for batch in client.request_batch_stream(configs, concurrency=100):
+    ///     for r in batch:
+    ///         if r.success:
+    ///             ...
+    /// ```
     ///
     /// Args:
     ///   configs: List of `BatchConfig` objects describing each request.
@@ -792,6 +1090,13 @@ impl PyRawConnection {
     #[getter]
     fn negotiated_alpn(&self) -> Option<String> {
         self.inner.negotiated_alpn()
+    }
+
+    /// IP actually used for this connection's TCP socket. None if the
+    /// connection went through a proxy.
+    #[getter]
+    fn peer_ip(&self) -> Option<String> {
+        self.inner.peer_ip()
     }
 }
 
@@ -1407,7 +1712,25 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCertInfo>()?;
     m.add_class::<PyResponseHash>()?;
     m.add_class::<PyRedirectHop>()?;
+    m.add_class::<PyHeaders>()?;
+    m.add_class::<PyRequest>()?;
     m.add_class::<PyRawConnection>()?;
+    m.add("HTTPStatusError", m.py().get_type::<HTTPStatusError>())?;
     register_h2_submodule(m)?;
+    register_headers_as_mapping(m)?;
+    Ok(())
+}
+
+/// Register `Headers` with `collections.abc.MutableMapping` so
+/// `isinstance(h, MutableMapping)` is True. Without this, third-party
+/// libraries that special-case mappings (DeepDiff, dataclasses, etc.)
+/// don't recognize Headers as dict-like even though it implements the
+/// full protocol. Called once at module import.
+fn register_headers_as_mapping(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
+    let abc = py.import("collections.abc")?;
+    let mutable_mapping = abc.getattr("MutableMapping")?;
+    let headers_cls = m.getattr("Headers")?;
+    mutable_mapping.call_method1("register", (headers_cls,))?;
     Ok(())
 }
