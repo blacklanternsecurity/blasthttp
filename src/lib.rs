@@ -6,4 +6,6 @@ pub mod h2;
 pub mod response;
 
 #[cfg(feature = "python")]
+mod mock;
+#[cfg(feature = "python")]
 mod python;

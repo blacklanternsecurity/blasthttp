@@ -121,6 +121,20 @@ struct PyRedirectHop {
 
 #[pymethods]
 impl PyRedirectHop {
+    /// Build a RedirectHop from canned data — primarily for tests and
+    /// fixture mocks that need to synthesize a redirect chain.
+    #[new]
+    #[pyo3(signature = (url, status, peer_ip=None))]
+    fn new(url: String, status: u16, peer_ip: Option<String>) -> Self {
+        PyRedirectHop {
+            inner: RedirectHop {
+                url,
+                status,
+                peer_ip,
+            },
+        }
+    }
+
     #[getter]
     fn url(&self) -> String {
         self.inner.url.clone()
@@ -300,8 +314,8 @@ pyo3::create_exception!(
 // ── Response wrapper ──────────────────────────────────────────────
 
 #[pyclass(name = "Response")]
-struct PyResponse {
-    inner: Response,
+pub struct PyResponse {
+    pub(crate) inner: Response,
     /// Cached headers wrapper. Built on first access and reused so
     /// mutations (`r.headers["x"] = "y"`) persist across reads.
     headers_cache: OnceLock<Py<PyHeaders>>,
@@ -309,8 +323,103 @@ struct PyResponse {
     request_cache: OnceLock<Py<PyRequest>>,
 }
 
+impl PyResponse {
+    /// Build a PyResponse from a Rust `Response`. Used by both the
+    /// hyper client wrapping paths and the mock submodule.
+    pub fn wrap(inner: Response) -> Self {
+        PyResponse {
+            inner,
+            headers_cache: OnceLock::new(),
+            request_cache: OnceLock::new(),
+        }
+    }
+}
+
 #[pymethods]
 impl PyResponse {
+    /// Build a Response from canned data — primarily for tests and
+    /// fixture mocks. Only `url` and `status` are required; everything
+    /// else defaults to a plausibly-empty value.
+    ///
+    /// `body` accepts `bytes`, `str`, or `None` (treated as empty
+    /// bytes). `headers` is a list of `(name, value)` tuples preserving
+    /// order and duplicates. `redirect_chain` is a list of
+    /// `RedirectHop` instances. `cert_info` is a `CertInfo` instance
+    /// or None.
+    ///
+    /// `request_url` defaults to `url` (i.e. the response is for the
+    /// final URL — set explicitly if simulating redirects).
+    #[new]
+    #[pyo3(signature = (
+        url,
+        status,
+        headers=None,
+        body=None,
+        request_url=None,
+        request_method=None,
+        elapsed_ms=0,
+        peer_ip=None,
+        redirect_chain=None,
+        cert_info=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        url: String,
+        status: u16,
+        headers: Option<Vec<(String, String)>>,
+        body: Option<Bound<'_, PyAny>>,
+        request_url: Option<String>,
+        request_method: Option<String>,
+        elapsed_ms: u64,
+        peer_ip: Option<String>,
+        redirect_chain: Option<Vec<PyRef<'_, PyRedirectHop>>>,
+        cert_info: Option<PyRef<'_, PyCertInfo>>,
+    ) -> PyResult<Self> {
+        // Coerce body into Vec<u8> (accept bytes, str, or None).
+        let body_bytes = match body {
+            None => Vec::new(),
+            Some(b) => {
+                if let Ok(s) = b.extract::<String>() {
+                    s.into_bytes()
+                } else if let Ok(bs) = b.extract::<Vec<u8>>() {
+                    bs
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "body must be bytes, str, or None",
+                    ));
+                }
+            }
+        };
+        let _ = py; // currently unused but kept for future ergonomic helpers
+        let request_url = request_url.unwrap_or_else(|| url.clone());
+        let request_method = request_method.unwrap_or_else(|| "GET".to_string());
+        let inner = Response {
+            url,
+            status,
+            headers: headers.unwrap_or_default(),
+            body_bytes,
+            elapsed_ms,
+            redirect_chain: redirect_chain
+                .map(|hops| hops.into_iter().map(|h| h.inner.clone()).collect())
+                .unwrap_or_default(),
+            cert_info: cert_info.map(|c| c.inner.clone()),
+            peer_ip,
+            request_url,
+            request_method,
+            debug_log: Vec::new(),
+            body_cache: OnceLock::new(),
+            raw_headers_cache: OnceLock::new(),
+            cookies_cache: OnceLock::new(),
+            hash_cache: OnceLock::new(),
+        };
+        Ok(PyResponse {
+            inner,
+            headers_cache: OnceLock::new(),
+            request_cache: OnceLock::new(),
+        })
+    }
+
     #[getter]
     fn url(&self) -> String {
         self.inner.url.clone()
@@ -514,6 +623,21 @@ struct PyBatchResult {
 
 #[pymethods]
 impl PyBatchResult {
+    /// Build a BatchResult from canned data — primarily for tests and
+    /// fixture mocks. Provide either `response` (a Response instance)
+    /// for success, or `error` (a string) for failure. Both default to
+    /// None; passing neither yields a degenerate "no response, no error"
+    /// result that `success` reports as False.
+    #[new]
+    #[pyo3(signature = (url, response=None, error=None))]
+    fn new(url: String, response: Option<PyRef<'_, PyResponse>>, error: Option<String>) -> Self {
+        PyBatchResult {
+            url,
+            response: response.map(|r| r.inner.clone()),
+            error,
+        }
+    }
+
     #[getter]
     fn url(&self) -> String {
         self.url.clone()
@@ -1717,6 +1841,7 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRawConnection>()?;
     m.add("HTTPStatusError", m.py().get_type::<HTTPStatusError>())?;
     register_h2_submodule(m)?;
+    crate::mock::register_mock_submodule(m)?;
     register_headers_as_mapping(m)?;
     Ok(())
 }
