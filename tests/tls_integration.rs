@@ -207,7 +207,7 @@ async fn test_server_response_body_received() {
     assert!(result.is_ok());
     let resp = result.unwrap();
     assert_eq!(resp.status, 200);
-    assert_eq!(resp.body, "hello from test server");
+    assert_eq!(resp.body(), "hello from test server");
 
     server.shutdown().await;
 }

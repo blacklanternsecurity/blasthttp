@@ -56,15 +56,23 @@ blasthttp https://legacy-server.com --min-tls 1.0 --ciphers "RC4-SHA"
 blasthttp https://example.com -v
 ```
 
-Output is JSON (one object per response), including status, headers, redirect chain, TLS cert info, and content hashes:
+Output is JSON (one object per response), including status, headers, redirect chain with per-hop peer IP, TLS cert info, content hashes, parsed cookies, and the actual TCP peer IP for the final hop:
 
 ```json
 {
-  "url": "https://example.com",
+  "url": "https://example.com/",
   "status": 200,
+  "request_url": "https://example.com",
+  "request_method": "GET",
   "headers": [["content-type", "text/html"], ...],
+  "raw_headers": "content-type: text/html\r\n...",
+  "body": "<!doctype html>...",
+  "cookies": {"session": "abc123"},
   "elapsed_ms": 120,
-  "redirect_chain": [],
+  "peer_ip": "93.184.215.14",
+  "redirect_chain": [
+    {"url": "http://example.com/", "status": 301, "peer_ip": "93.184.215.14"}
+  ],
   "cert_info": {
     "common_name": "example.com",
     "sans": ["example.com", "www.example.com"],
@@ -114,9 +122,16 @@ import blasthttp
 async def main():
     client = blasthttp.BlastHTTP()
 
-    # Single request
-    response = await client.request("https://example.com")
-    print(response.status, len(response.body))
+    # Single request — Response is httpx-style
+    r = await client.request("https://example.com")
+    print(r.status_code, r.is_success)            # 200, True
+    print(r.headers["Content-Type"])              # case-insensitive
+    print(r.peer_ip)                              # actual TCP peer IP
+    print(r.text[:80])                            # UTF-8 body (lazy)
+    print(r.hash.body_md5)                        # md5/sha256/mmh3 (lazy)
+    print(r.cookies)                              # Set-Cookie parsed (lazy)
+    print(r.request.url, r.request.method)        # original (pre-redirect)
+    r.raise_for_status()                          # raises HTTPStatusError on 4xx/5xx
 
     # Batch requests — full result list at the end
     configs = [
@@ -126,13 +141,13 @@ async def main():
     results = await client.request_batch(configs, concurrency=50)
     for r in results:
         if r.success:
-            print(r.url, r.response.status)
+            print(r.url, r.response.status_code, r.response.peer_ip)
 
     # Streaming batch — process results as they complete
     async for batch in client.request_batch_stream(configs, concurrency=50):
         for r in batch:
             if r.success:
-                print(r.url, r.response.status)
+                print(r.url, r.response.status_code)
 
     # Download to file
     await client.download("https://example.com/file.zip", "/tmp/file.zip")
@@ -140,9 +155,49 @@ async def main():
 asyncio.run(main())
 ```
 
+### Response API
+
+`Response` follows the httpx convention so it works as a drop-in for httpx-flavored consumers:
+
+| Attribute | Type | Notes |
+|---|---|---|
+| `status` / `status_code` | `int` | HTTP status code |
+| `is_success` | `bool` | `True` for 2xx-3xx |
+| `url` | `str` | final URL (after redirects) |
+| `text` / `body` | `str` | UTF-8 decoded body (lazy) |
+| `content` / `body_bytes` | `bytes` | raw body |
+| `headers` | `Headers` | case-insensitive, mutable; `headers["Content-Type"]` works either case |
+| `cookies` | `dict[str, str]` | parsed `Set-Cookie` (lazy) |
+| `raw_headers` | `str` | canonical `Name: Value\r\n…` form (lazy) |
+| `hash` | `ResponseHash` | md5 / sha256 / mmh3 of body and headers (lazy) |
+| `cert_info` | `CertInfo \| None` | TLS cert details from the handshake |
+| `peer_ip` | `str \| None` | actual IP of the final hop's TCP connection; `None` when proxied |
+| `redirect_chain` | `list[RedirectHop]` | each hop carries its own `peer_ip` |
+| `elapsed_ms` / `elapsed` | `int` / `timedelta` | total request time |
+| `request` | `Request` | original `request.url` and `request.method` |
+| `json()` | callable | `json.loads(self.text)` |
+| `raise_for_status()` | callable | raises `HTTPStatusError` on 4xx/5xx |
+
+`body`, `raw_headers`, `cookies`, and `hash` are lazy — first access computes, subsequent accesses are free. Hashing a 10 MB body is real work; batch jobs that filter on `status` and never look at the body don't pay for it.
+
+`headers` is a `Headers` instance (case-insensitive view), not a list of tuples. Iterate with `.items()` to get `(name, value)` pairs preserving original case and duplicate names (e.g. multiple `Set-Cookie`). `Headers` is registered with `collections.abc.MutableMapping`, so libraries that special-case mappings (`DeepDiff`, `dataclasses`, etc.) recognize it.
+
+`raise_for_status()` raises `blasthttp.HTTPStatusError` on 4xx/5xx — import it directly:
+
+```python
+from blasthttp import HTTPStatusError
+try:
+    r = await client.request("https://example.com/404")
+    r.raise_for_status()
+except HTTPStatusError as e:
+    print(e.response.status_code)   # the failing Response is attached
+```
+
+`Response`, `BatchResult`, `RedirectHop`, and `Headers` all have Python constructors so test code can synthesize them from canned data — `blasthttp.Response(url=..., status=200, headers=[...], body=b"...", ...)`. Useful when building fixtures by hand; the `blasthttp.mock` submodule below uses them under the hood.
+
 ### Batch vs. streaming batch
 
-Two shapes for issuing the same workload — pick whichever matches how you want to consume the results:
+Two ways to issue the same workload — pick whichever matches how you want to consume the results:
 
 | | Returns | Consume with | When to use |
 |---|---|---|---|
@@ -237,6 +292,8 @@ asyncio.run(main())
 
 `raw_connect()` takes all the same TLS knobs as `request()` — `verify_certs`, `cipher_string`, `min_tls_version`, `max_tls_version`, `resolve_ip`, `proxy`. `alpn_protocols` is a list of byte-strings (commonly `["h2", "http/1.1"]`) used in the TLS ALPN extension. After the handshake, `conn.negotiated_alpn` reports which one the server picked (or `None` if no ALPN was negotiated, including all plain-HTTP connections).
 
+`conn.peer_ip` returns the actual IP address the OS connected to, same as `Response.peer_ip`. `None` when the connection went through a proxy.
+
 ### HTTP/2 primitives — `blasthttp.h2`
 
 `blasthttp.h2` is a minimal, **permissive** HTTP/2 toolkit for callers who need to emit custom H2 frames over a `RawConnection`. The encoder deliberately lets you produce bytes a strict implementation refuses (CRLF in header values, invalid header names, forced Huffman on/off, custom indexing choices) — the exact knobs protocol fuzzers and H2 smuggling detectors depend on.
@@ -292,6 +349,67 @@ response_headers = dec.decode(block)  # -> [(name: bytes, value: bytes), ...]
 - Frame-type + flag constants: `FRAME_HEADERS`, `FRAME_DATA`, `FRAME_SETTINGS`, `FRAME_CONTINUATION`, `FRAME_RST_STREAM`, `FRAME_GOAWAY`, `FRAME_PING`, `FRAME_PRIORITY`, `FRAME_WINDOW_UPDATE`, `FLAG_END_HEADERS`, `FLAG_END_STREAM`, `FLAG_ACK`, `FLAG_PADDED`, `FLAG_PRIORITY`
 
 This isn't a full H2 client — no stream state machine, no flow control, no HTTP-level response parsing. It's the bytes in, bytes out. Pair with `RawConnection` for end-to-end control.
+
+### Test fixture mock — `blasthttp.mock`
+
+`blasthttp.mock.BlasthttpMock` is a drop-in replacement for `BlastHTTP` that returns canned responses or invokes registered callbacks instead of hitting the network. Useful for unit tests that exercise code which calls into a `BlastHTTP` client.
+
+```python
+import asyncio
+import re
+import blasthttp
+from blasthttp.mock import BlasthttpMock, MockResponse
+
+async def main():
+    mock = BlasthttpMock()
+
+    # Static responses — declarative
+    mock.add_response(url="https://api.example.com/users", json={"users": []})
+    mock.add_response(url=re.compile(r"/v\d+/health"), text="ok")
+
+    # Programmatic — callback receives a MockRequest, returns a MockResponse
+    def echo(req):
+        return MockResponse(status_code=201, json={"echoed": req.method})
+    mock.add_callback(echo, url="https://api.example.com/echo")
+
+    # Use it like a real client
+    r = await mock.request("https://api.example.com/users")
+    print(r.json())                    # {"users": []}
+    print(isinstance(r, blasthttp.Response))   # True
+
+    # Batch streaming works the same as the real client
+    configs = [blasthttp.BatchConfig(f"https://api.example.com/users/{i}") for i in range(5)]
+    mock.add_response(url=re.compile(r"/users/\d+"), json={"id": 0})
+    async for r in mock.request_batch_stream(configs):
+        ...
+
+asyncio.run(main())
+```
+
+Key behaviors:
+
+- **Matchers**: `url` accepts `str` (exact) or `re.Pattern` (`.search()` semantics) or `None` (any). `method` is case-insensitive. `match_headers={...}` and `match_json={...}` add subset predicates against the request headers / decoded JSON body.
+- **FIFO + recycle**: handlers are matched in registration order. Once consumed, a handler is moved to a recycle queue so subsequent requests can re-match it — no need to re-register for repeated calls.
+- **Callbacks**: sync and async (`async def`) both supported. Callbacks may raise `TimeoutException` or any other exception to simulate failures. Returning `MockResponse` is most ergonomic; returning a `blasthttp.Response` directly also works.
+- **Pass-through**: pass a `real_client` and a `should_mock_fn(host) -> bool` predicate to forward selected requests to a real `BlastHTTP` instance. Common use case: mock everything except `127.0.0.1` so a fixture HTTP server stays exercised.
+
+```python
+real = blasthttp.BlastHTTP()
+mock = BlasthttpMock(real_client=real, should_mock_fn=lambda h: h != "127.0.0.1")
+mock.add_response(url="https://example.com/", text="mocked")
+# https://example.com/ → mocked, http://127.0.0.1/* → real_client
+```
+
+Pytest integration is intentionally left to the consumer — wrap the mock in a fixture in your `conftest.py`:
+
+```python
+import pytest
+from blasthttp.mock import BlasthttpMock
+
+@pytest.fixture
+def http_mock():
+    return BlasthttpMock()
+```
 
 ## Building
 

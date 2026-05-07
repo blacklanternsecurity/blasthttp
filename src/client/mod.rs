@@ -123,7 +123,7 @@ mod tests {
         let config = RequestConfig::new("https://example.com".to_string());
         let response = client.send(&config).await.unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, "OK");
+        assert_eq!(response.body(), "OK");
     }
 
     #[tokio::test]
@@ -132,7 +132,7 @@ mod tests {
         let config = RequestConfig::new("https://example.com".to_string());
         let response = client.send(&config).await.unwrap();
         assert_eq!(response.status, 404);
-        assert_eq!(response.body, "Not Found");
+        assert_eq!(response.body(), "Not Found");
     }
 
     #[tokio::test]
@@ -141,7 +141,7 @@ mod tests {
         let config = RequestConfig::new("https://example.com".to_string());
         let response = client.send(&config).await.unwrap();
         assert_eq!(response.status, 204);
-        assert!(response.body.is_empty());
+        assert!(response.body().is_empty());
     }
 
     #[tokio::test]
@@ -167,7 +167,7 @@ mod tests {
         let mut config = RequestConfig::new("https://example.com".to_string());
         config.method = Some("POST".to_string());
         let response = client.send(&config).await.unwrap();
-        assert!(response.body.contains("method=POST"));
+        assert!(response.body().contains("method=POST"));
     }
 
     #[tokio::test]
@@ -177,7 +177,7 @@ mod tests {
         config.method = Some("POST".to_string());
         config.body = Some("test data".to_string());
         let response = client.send(&config).await.unwrap();
-        assert!(response.body.contains("body=test data"));
+        assert!(response.body().contains("body=test data"));
     }
 
     #[tokio::test]
@@ -189,7 +189,7 @@ mod tests {
             ("Authorization".to_string(), "Bearer tok".to_string()),
         ]);
         let response = client.send(&config).await.unwrap();
-        assert!(response.body.contains("headers=2"));
+        assert!(response.body().contains("headers=2"));
     }
 
     #[tokio::test]

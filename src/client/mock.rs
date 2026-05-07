@@ -120,21 +120,23 @@ impl HttpClient for SequenceMockClient {
             });
         }
 
-        let body = "ok".to_string();
-        let body_bytes = body.as_bytes().to_vec();
-        let headers = Vec::new();
-        let hash = crate::response::ResponseHash::compute(&body_bytes, &headers);
+        let body_bytes = b"ok".to_vec();
         Ok(Response {
             url: config.url.clone(),
             status: self.success_status,
-            headers,
+            headers: Vec::new(),
             body_bytes,
-            body,
             elapsed_ms: 0,
             redirect_chain: Vec::new(),
             cert_info: None,
-            hash,
+            peer_ip: None,
+            request_url: config.url.clone(),
+            request_method: config.method().to_string(),
             debug_log: Vec::new(),
+            body_cache: std::sync::OnceLock::new(),
+            raw_headers_cache: std::sync::OnceLock::new(),
+            cookies_cache: std::sync::OnceLock::new(),
+            hash_cache: std::sync::OnceLock::new(),
         })
     }
 }
@@ -165,19 +167,23 @@ impl HttpClient for MockClient {
             self.body.clone()
         };
 
-        let body_bytes = body.as_bytes().to_vec();
-        let hash = crate::response::ResponseHash::compute(&body_bytes, &self.headers);
+        let body_bytes = body.into_bytes();
         Ok(Response {
             url: config.url.clone(),
             status: self.status,
             headers: self.headers.clone(),
             body_bytes,
-            body,
             elapsed_ms: 0,
             redirect_chain: Vec::new(),
             cert_info: None,
-            hash,
+            peer_ip: None,
+            request_url: config.url.clone(),
+            request_method: config.method().to_string(),
             debug_log: Vec::new(),
+            body_cache: std::sync::OnceLock::new(),
+            raw_headers_cache: std::sync::OnceLock::new(),
+            cookies_cache: std::sync::OnceLock::new(),
+            hash_cache: std::sync::OnceLock::new(),
         })
     }
 }
