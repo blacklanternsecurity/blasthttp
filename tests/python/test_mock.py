@@ -53,6 +53,20 @@ async def test_add_response_content_bytes():
 
 
 @pytest.mark.asyncio
+async def test_add_response_content_binary_roundtrip():
+    # Bytes with the high bit set must round-trip without UTF-8 corruption.
+    # All 256 byte values, plus a representative ZIP local-file-header
+    # (PK\x03\x04...) — the kind of payload that breaks if the body is
+    # passed through a lossy UTF-8 decode.
+    mock = BlasthttpMock()
+    raw = bytes(range(256)) + b"PK\x03\x04\x14\x00\x00\x00\x08\x00"
+    mock.add_response(url="http://x/", content=raw)
+    r = await mock.request("http://x/")
+    assert bytes(r.content) == raw
+    assert len(r.content) == len(raw)
+
+
+@pytest.mark.asyncio
 async def test_add_response_custom_status_and_headers():
     mock = BlasthttpMock()
     mock.add_response(
