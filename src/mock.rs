@@ -134,7 +134,7 @@ impl PyMockResponse {
 enum HandlerKind {
     Response {
         status_code: u16,
-        body: String,
+        body: Vec<u8>,
         headers: Vec<(String, String)>,
         match_headers: Option<Py<PyDict>>,
         match_json: Option<Py<PyDict>>,
@@ -259,14 +259,14 @@ fn make_response(
     url: String,
     method: String,
     status_code: u16,
-    body: String,
+    body: Vec<u8>,
     headers: Vec<(String, String)>,
 ) -> Response {
     Response {
         url: url.clone(),
         status: status_code,
         headers,
-        body_bytes: body.into_bytes(),
+        body_bytes: body,
         elapsed_ms: 0,
         redirect_chain: Vec::new(),
         cert_info: None,
@@ -473,7 +473,7 @@ fn callback_result_to_response(
             url.to_string(),
             method.to_string(),
             mr.status_code,
-            mr.text.clone(),
+            mr.text.clone().into_bytes(),
             header_list,
         ))
     } else if let Ok(pr_ref) = result.cast::<PyResponse>() {
@@ -586,24 +586,25 @@ impl PyBlasthttpMock {
     ) -> PyResult<()> {
         let mut header_list = normalize_headers(headers.as_ref())?;
 
-        let body = if let Some(t) = text {
+        let body: Vec<u8> = if let Some(t) = text {
             ensure_content_type(&mut header_list, "text/plain; charset=utf-8");
-            t
+            t.into_bytes()
         } else if let Some(j) = json {
             let s: String = py.import("json")?.call_method1("dumps", (j,))?.extract()?;
             ensure_content_type(&mut header_list, "application/json");
-            s
+            s.into_bytes()
         } else if let Some(c) = content {
             ensure_content_type(&mut header_list, "application/octet-stream");
+            // Try bytes first so binary content round-trips without UTF-8 decode.
             if let Ok(bs) = c.extract::<Vec<u8>>() {
-                body_to_string(&bs)
+                bs
             } else if let Ok(s) = c.extract::<String>() {
-                s
+                s.into_bytes()
             } else {
                 return Err(PyTypeError::new_err("content must be bytes or str"));
             }
         } else {
-            String::new()
+            Vec::new()
         };
 
         let handler = Handler {
