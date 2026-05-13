@@ -5,7 +5,7 @@ pub struct RequestConfig {
     pub url: String,
     pub method: Option<String>,
     pub headers: Option<Vec<(String, String)>>,
-    pub body: Option<String>,
+    pub body: Option<Vec<u8>>,
     pub timeout_seconds: Option<u64>,
     pub max_body_size: Option<usize>,
     pub follow_redirects: Option<bool>,

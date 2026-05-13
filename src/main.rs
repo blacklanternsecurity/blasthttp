@@ -102,7 +102,7 @@ fn build_config(cli: &Cli, url: String) -> RequestConfig {
         config.headers = Some(cli.headers.iter().filter_map(|h| parse_header(h)).collect());
     }
 
-    config.body = cli.data.clone();
+    config.body = cli.data.clone().map(String::into_bytes);
     config.verify_certs = Some(cli.verify);
     config.follow_redirects = Some(cli.follow_redirects);
     config.max_redirects = Some(cli.max_redirects);

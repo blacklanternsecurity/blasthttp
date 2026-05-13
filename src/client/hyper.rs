@@ -1044,7 +1044,7 @@ fn build_request(
         }
     }
 
-    let body_bytes = config.body.as_deref().unwrap_or("").as_bytes().to_vec();
+    let body_bytes = config.body.clone().unwrap_or_default();
     builder
         .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
         .map_err(|e| ClientError::other(format!("failed to build request: {}", e)))

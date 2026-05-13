@@ -8,4 +8,6 @@ pub mod response;
 #[cfg(feature = "python")]
 mod mock;
 #[cfg(feature = "python")]
+mod multipart;
+#[cfg(feature = "python")]
 mod python;

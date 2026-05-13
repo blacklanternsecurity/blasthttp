@@ -239,11 +239,20 @@ fn url_matches(py: Python<'_>, pattern: Option<&Py<PyAny>>, url: &str) -> PyResu
     result.is_truthy()
 }
 
-fn body_to_string(body_bytes: &[u8]) -> String {
-    match std::str::from_utf8(body_bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => String::from_utf8_lossy(body_bytes).into_owned(),
+fn body_from_arg(body: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<u8>> {
+    let Some(b) = body else {
+        return Ok(Vec::new());
+    };
+    if b.is_none() {
+        return Ok(Vec::new());
     }
+    if let Ok(s) = b.extract::<String>() {
+        return Ok(s.into_bytes());
+    }
+    if let Ok(bs) = b.extract::<Vec<u8>>() {
+        return Ok(bs);
+    }
+    Err(PyTypeError::new_err("body must be str, bytes, or None"))
 }
 
 fn ensure_content_type(headers: &mut Vec<(String, String)>, default: &str) {
@@ -301,10 +310,14 @@ fn header_subset_match(
     Ok(true)
 }
 
-fn json_subset_match(py: Python<'_>, expected: &Py<PyDict>, body_str: &str) -> PyResult<bool> {
-    if body_str.is_empty() {
+fn json_subset_match(py: Python<'_>, expected: &Py<PyDict>, body: &[u8]) -> PyResult<bool> {
+    if body.is_empty() {
         return Ok(expected.bind(py).is_empty());
     }
+    let body_str = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
     let parsed = match py.import("json")?.call_method1("loads", (body_str,)) {
         Ok(v) => v,
         Err(_) => return Ok(false),
@@ -340,7 +353,7 @@ fn pick_handler(
     url: &str,
     method: &str,
     req_headers_dict: &Bound<'_, PyDict>,
-    body_str: &str,
+    body: &[u8],
 ) -> PyResult<Option<Handler>> {
     let mut guard = state.lock().map_err(poisoned)?;
 
@@ -373,7 +386,7 @@ fn pick_handler(
                     continue;
                 }
                 if let Some(mj) = match_json
-                    && !json_subset_match(py, mj, body_str)?
+                    && !json_subset_match(py, mj, body)?
                 {
                     continue;
                 }
@@ -415,7 +428,7 @@ fn plan_dispatch(
     url: &str,
     method: &str,
     headers: &[(String, String)],
-    body_str: &str,
+    body: &[u8],
 ) -> PyResult<DispatchPlan> {
     // Build a one-shot dict for predicate checks.
     let req_headers_dict = PyDict::new(py);
@@ -423,7 +436,7 @@ fn plan_dispatch(
         req_headers_dict.set_item(k, v)?;
     }
 
-    let Some(handler) = pick_handler(py, state, url, method, &req_headers_dict, body_str)? else {
+    let Some(handler) = pick_handler(py, state, url, method, &req_headers_dict, body)? else {
         return Err(PyRuntimeError::new_err(format!(
             "No mock response registered for {} {}",
             method, url
@@ -433,14 +446,14 @@ fn plan_dispatch(
     match handler.kind {
         HandlerKind::Response {
             status_code,
-            body,
+            body: resp_body,
             headers: resp_headers,
             ..
         } => Ok(DispatchPlan::Response(Box::new(make_response(
             url.to_string(),
             method.to_string(),
             status_code,
-            body,
+            resp_body,
             resp_headers,
         )))),
         HandlerKind::Callback { callback } => {
@@ -448,7 +461,7 @@ fn plan_dispatch(
                 url: url.to_string(),
                 method: method.to_string(),
                 headers: req_headers_dict.unbind(),
-                content: PyBytes::new(py, body_str.as_bytes()).unbind(),
+                content: PyBytes::new(py, body).unbind(),
             };
             Ok(DispatchPlan::Callback {
                 callback,
@@ -492,10 +505,10 @@ async fn dispatch_one(
     url: String,
     method: String,
     headers: Vec<(String, String)>,
-    body_str: String,
+    body: Vec<u8>,
 ) -> PyResult<Response> {
     // Plan synchronously.
-    let plan = Python::attach(|py| plan_dispatch(py, &state, &url, &method, &headers, &body_str))?;
+    let plan = Python::attach(|py| plan_dispatch(py, &state, &url, &method, &headers, &body))?;
 
     match plan {
         DispatchPlan::Response(resp) => Ok(*resp),
@@ -662,6 +675,7 @@ impl PyBlasthttpMock {
         method=None,
         headers=None,
         body=None,
+        files=None,
         follow_redirects=None,
         max_redirects=None,
         **_kwargs,
@@ -674,6 +688,7 @@ impl PyBlasthttpMock {
         method: Option<String>,
         headers: Option<Bound<'py, PyAny>>,
         body: Option<Bound<'py, PyAny>>,
+        files: Option<Bound<'py, PyAny>>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
         _kwargs: Option<Bound<'py, PyDict>>,
@@ -685,24 +700,25 @@ impl PyBlasthttpMock {
                 method,
                 headers,
                 body,
+                files,
                 follow_redirects,
                 max_redirects,
             );
         }
 
         let method_str = method.unwrap_or_else(|| "GET".to_string());
-        let header_list = normalize_headers(headers.as_ref())?;
-        let body_str = match body {
-            None => String::new(),
-            Some(b) => {
-                if let Ok(s) = b.extract::<String>() {
-                    s
-                } else if let Ok(bs) = b.extract::<Vec<u8>>() {
-                    body_to_string(&bs)
-                } else {
-                    return Err(PyTypeError::new_err("body must be str, bytes, or None"));
-                }
-            }
+        let mut header_list = normalize_headers(headers.as_ref())?;
+        let body_bytes = if let Some(ref f) = files
+            && !f.is_none()
+        {
+            let (boundary, mp_body) = crate::multipart::build_multipart(f)?;
+            ensure_content_type(
+                &mut header_list,
+                &format!("multipart/form-data; boundary={}", boundary),
+            );
+            mp_body
+        } else {
+            body_from_arg(body.as_ref())?
         };
 
         let state_arc = Arc::clone(&self.state);
@@ -718,7 +734,7 @@ impl PyBlasthttpMock {
                     current_url.clone(),
                     method_str.clone(),
                     header_list.clone(),
-                    body_str.clone(),
+                    body_bytes.clone(),
                 )
                 .await?;
 
@@ -816,9 +832,10 @@ impl PyBlasthttpMock {
                     .getattr("headers")?
                     .extract::<Option<Vec<(String, String)>>>()?
                     .unwrap_or_default();
-                let body: String = bound
+                let body: Vec<u8> = bound
                     .getattr("body")?
                     .extract::<Option<String>>()?
+                    .map(String::into_bytes)
                     .unwrap_or_default();
                 mock_entries.push(MockBatchEntry {
                     url,
@@ -925,6 +942,7 @@ impl PyBlasthttpMock {
         method: Option<String>,
         headers: Option<Bound<'py, PyAny>>,
         body: Option<Bound<'py, PyAny>>,
+        files: Option<Bound<'py, PyAny>>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -943,6 +961,9 @@ impl PyBlasthttpMock {
         if let Some(b) = body {
             kwargs.set_item("body", b)?;
         }
+        if let Some(f) = files {
+            kwargs.set_item("files", f)?;
+        }
         if let Some(f) = follow_redirects {
             kwargs.set_item("follow_redirects", f)?;
         }
@@ -960,7 +981,7 @@ struct MockBatchEntry {
     url: String,
     method: String,
     headers: Vec<(String, String)>,
-    body: String,
+    body: Vec<u8>,
 }
 
 // ── Streaming batch iterator ──────────────────────────────────────
