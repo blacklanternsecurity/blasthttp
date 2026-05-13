@@ -65,8 +65,7 @@ def local_server(addr):
     """Start the bundled Go server on `addr` (host:port); stop it on exit."""
     if not BENCH_SERVER.exists():
         raise RuntimeError(
-            f"Server binary not found at {BENCH_SERVER}. "
-            f"Run: make -C {BENCH_DIR.relative_to(REPO_ROOT).parent}/bench"
+            f"Server binary not found at {BENCH_SERVER}. Run: make -C {BENCH_DIR.relative_to(REPO_ROOT).parent}/bench"
         )
     host, port = addr.split(":")
     port = int(port)
@@ -116,9 +115,7 @@ def _count_json_results(stdout):
 
 def _run_subprocess_benchmark(binary, urls, workers):
     """Write URLs to a temp file, run `binary <urls-file> <workers>`, parse JSON."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, dir=REPO_ROOT
-    ) as urls_file:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, dir=REPO_ROOT) as urls_file:
         urls_file.write("\n".join(urls))
         urls_file.write("\n")
         urls_path = urls_file.name
@@ -133,9 +130,7 @@ def _run_subprocess_benchmark(binary, urls, workers):
         total_time = time.perf_counter() - start
 
         if result.returncode != 0:
-            raise RuntimeError(
-                f"{binary} exited {result.returncode}: {result.stderr[-500:]}"
-            )
+            raise RuntimeError(f"{binary} exited {result.returncode}: {result.stderr[-500:]}")
         success, errors = _count_json_results(result.stdout)
         qps = len(urls) / total_time if total_time > 0 else 0
         return total_time, qps, success, errors
@@ -152,9 +147,7 @@ def benchmark_blasthttp_cli(urls, workers, rate_limit=None):
     if not BLASTHTTP_CLI.exists():
         raise RuntimeError(f"{BLASTHTTP_CLI} missing (cargo build --release)")
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, dir=REPO_ROOT
-    ) as urls_file:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, dir=REPO_ROOT) as urls_file:
         urls_file.write("\n".join(urls))
         urls_file.write("\n")
         urls_path = urls_file.name
@@ -200,9 +193,7 @@ async def benchmark_blasthttp_python(urls, workers, rate_limit=None):
     configs = [BatchConfig(url) for url in urls]
 
     start = time.perf_counter()
-    results = await client.request_batch(
-        configs, concurrency=workers, rate_limit=rate_limit
-    )
+    results = await client.request_batch(configs, concurrency=workers, rate_limit=rate_limit)
     total_time = time.perf_counter() - start
 
     success = sum(1 for r in results if r.success)
@@ -218,9 +209,7 @@ async def benchmark_blasthttp_python_stream(urls, workers, rate_limit=None):
     success = 0
     errors = 0
     start = time.perf_counter()
-    async for batch in client.request_batch_stream(
-        configs, concurrency=workers, rate_limit=rate_limit
-    ):
+    async for batch in client.request_batch_stream(configs, concurrency=workers, rate_limit=rate_limit):
         for r in batch:
             if r.success:
                 success += 1
@@ -266,10 +255,7 @@ async def benchmark_httpx(urls, workers):
         counts = [0, 0]  # [success, errors]
 
         start = time.perf_counter()
-        worker_tasks = [
-            asyncio.create_task(_httpx_worker(client, queue, counts))
-            for _ in range(workers)
-        ]
+        worker_tasks = [asyncio.create_task(_httpx_worker(client, queue, counts)) for _ in range(workers)]
 
         for url in urls:
             await queue.put(url)
@@ -310,9 +296,7 @@ def print_table(results, baseline):
     baseline_qps = results.get(baseline, (0, 1, 0, 0))[1] if baseline in results else 0
 
     rows = []
-    for name, (total_time, qps, success, errors) in sorted(
-        results.items(), key=lambda x: -x[1][1]
-    ):
+    for name, (total_time, qps, success, errors) in sorted(results.items(), key=lambda x: -x[1][1]):
         multiplier = (qps / baseline_qps) if baseline_qps > 0 else 0
         rows.append(
             [
@@ -417,9 +401,7 @@ async def main():
 
         if run("blasthttp-python"):
             print("Running blasthttp-python...", file=sys.stderr, flush=True)
-            results["blasthttp-python"] = await benchmark_blasthttp_python(
-                urls, args.num_workers
-            )
+            results["blasthttp-python"] = await benchmark_blasthttp_python(urls, args.num_workers)
 
         if run("blasthttp-python-200k"):
             print("Running blasthttp-python-200k...", file=sys.stderr, flush=True)
@@ -429,9 +411,7 @@ async def main():
 
         if run("blasthttp-python-stream"):
             print("Running blasthttp-python-stream...", file=sys.stderr, flush=True)
-            results["blasthttp-python-stream"] = await benchmark_blasthttp_python_stream(
-                urls, args.num_workers
-            )
+            results["blasthttp-python-stream"] = await benchmark_blasthttp_python_stream(urls, args.num_workers)
 
         if run("blasthttp-python-stream-200k"):
             print("Running blasthttp-python-stream-200k...", file=sys.stderr, flush=True)
