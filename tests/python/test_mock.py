@@ -161,9 +161,7 @@ async def test_method_filter_mismatch_falls_through():
 async def test_match_headers_subset():
     mock = BlasthttpMock()
     mock.add_response(text="auth-ok", match_headers={"Authorization": "Bearer x"})
-    r = await mock.request(
-        "http://x/", headers={"Authorization": "Bearer x", "X-Other": "y"}
-    )
+    r = await mock.request("http://x/", headers={"Authorization": "Bearer x", "X-Other": "y"})
     assert r.text == "auth-ok"
 
 
@@ -180,9 +178,8 @@ async def test_match_json_subset():
     mock = BlasthttpMock()
     mock.add_response(text="json-ok", match_json={"action": "create"})
     import json as _json
-    r = await mock.request(
-        "http://x/", method="POST", body=_json.dumps({"action": "create", "extra": 1})
-    )
+
+    r = await mock.request("http://x/", method="POST", body=_json.dumps({"action": "create", "extra": 1}))
     assert r.text == "json-ok"
 
 
@@ -191,10 +188,9 @@ async def test_match_json_mismatch_falls_through():
     mock = BlasthttpMock()
     mock.add_response(text="json-ok", match_json={"action": "create"})
     import json as _json
+
     with pytest.raises(Exception):
-        await mock.request(
-            "http://x/", method="POST", body=_json.dumps({"action": "delete"})
-        )
+        await mock.request("http://x/", method="POST", body=_json.dumps({"action": "delete"}))
 
 
 # ── Callbacks ────────────────────────────────────────────────────
@@ -235,9 +231,7 @@ async def test_callback_can_return_blasthttp_response():
     mock = BlasthttpMock()
 
     def cb(req):
-        return blasthttp.Response(
-            url=req.url, status=204, body=b"", request_method=req.method
-        )
+        return blasthttp.Response(url=req.url, status=204, body=b"", request_method=req.method)
 
     mock.add_callback(cb)
     r = await mock.request("http://x/")
@@ -322,9 +316,7 @@ async def test_batch_request_drains_to_list():
     mock = BlasthttpMock()
     mock.add_response(url="http://a/", text="A")
     mock.add_response(url="http://b/", text="B")
-    results = await mock.request_batch(
-        [blasthttp.BatchConfig("http://a/"), blasthttp.BatchConfig("http://b/")]
-    )
+    results = await mock.request_batch([blasthttp.BatchConfig("http://a/"), blasthttp.BatchConfig("http://b/")])
     assert [(r.url, r.response.text) for r in results] == [
         ("http://a/", "A"),
         ("http://b/", "B"),
@@ -369,6 +361,7 @@ async def test_passthrough_raises_without_real_client():
 async def test_passthrough_to_real_client():
     """When should_mock returns False and a real_client is provided,
     requests are forwarded. We use a small local HTTP server fixture."""
+
     # Local HTTP server returning a fixed body.
     async def handler(reader, writer):
         await reader.readuntil(b"\r\n\r\n")
@@ -381,9 +374,7 @@ async def test_passthrough_to_real_client():
     base = f"http://{addr[0]}:{addr[1]}/"
     try:
         real = blasthttp.BlastHTTP()
-        mock = BlasthttpMock(
-            real_client=real, should_mock_fn=lambda host: host != "127.0.0.1"
-        )
+        mock = BlasthttpMock(real_client=real, should_mock_fn=lambda host: host != "127.0.0.1")
         # Mock handler for non-localhost (would be intercepted)
         mock.add_response(url="http://example.com/", text="mocked")
 

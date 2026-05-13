@@ -3,6 +3,7 @@
 Exercises the Rust-backed byte-pipeline primitive through the PyO3 bindings
 using a local asyncio TCP echo server as the peer.
 """
+
 import asyncio
 import time
 
@@ -17,6 +18,7 @@ async def echo_server():
 
     Yields (server, port). Server is torn down on fixture cleanup.
     """
+
     async def handle(reader, writer):
         try:
             while True:
@@ -157,6 +159,4 @@ async def test_rate_limit_tokens_consumed_on_send_and_read(echo_server):
     elapsed = time.monotonic() - t0
     await conn.close()
 
-    assert elapsed >= 0.18, (
-        f"rate limit did not gate send/read: elapsed {elapsed:.3f}s"
-    )
+    assert elapsed >= 0.18, f"rate limit did not gate send/read: elapsed {elapsed:.3f}s"

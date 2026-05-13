@@ -20,8 +20,14 @@ managed = false
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    "ruff==0.15.10",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests/python"]
+
+[tool.ruff]
+line-length = 119
+lint.select = ["E", "F"]
+lint.ignore = ["E402", "E711", "E713", "E721", "E741", "F403", "F405", "E501"]

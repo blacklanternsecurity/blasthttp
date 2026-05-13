@@ -32,11 +32,7 @@ async def test_files_plain_field_with_none_filename():
     assert ct.startswith("multipart/form-data; boundary=")
 
     expected = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="action"\r\n'
-        "\r\n"
-        "delete\r\n"
-        f"--{boundary}--\r\n"
+        f'--{boundary}\r\nContent-Disposition: form-data; name="action"\r\n\r\ndelete\r\n--{boundary}--\r\n'
     ).encode()
     assert body == expected
 
@@ -65,11 +61,15 @@ async def test_files_file_part_with_filename_and_content_type():
     body = captured["content"]
     boundary = captured["headers"]["Content-Type"].split("boundary=", 1)[1]
     expected = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="upload"; filename="blob"\r\n'
-        "Content-Type: application/octet-stream\r\n"
-        "\r\n"
-    ).encode() + b"\x00\x01\x02hello" + f"\r\n--{boundary}--\r\n".encode()
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="upload"; filename="blob"\r\n'
+            "Content-Type: application/octet-stream\r\n"
+            "\r\n"
+        ).encode()
+        + b"\x00\x01\x02hello"
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
     assert body == expected
 
 
