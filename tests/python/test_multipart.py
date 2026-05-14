@@ -253,6 +253,130 @@ async def test_body_accepts_bytes():
 
 
 @pytest.mark.asyncio
+async def test_batch_config_accepts_bytes_body():
+    """BatchConfig(body=bytes) — closes parity with BlastHTTP.request(body=bytes)."""
+    captured = {}
+
+    async def cb(req):
+        captured["content"] = bytes(req.content)
+        return MockResponse(status_code=200, text="ok")
+
+    mock = BlasthttpMock()
+    mock.add_callback(cb, url="http://x/")
+
+    import blasthttp
+
+    cfg = blasthttp.BatchConfig("http://x/", method="POST", body=b"\x00\x01\x02")
+    await mock.request_batch([cfg])
+
+    assert captured["content"] == b"\x00\x01\x02"
+
+
+@pytest.mark.asyncio
+async def test_batch_config_accepts_str_body():
+    """BatchConfig(body=str) still works after the bytes widening."""
+    captured = {}
+
+    async def cb(req):
+        captured["content"] = bytes(req.content)
+        return MockResponse(status_code=200, text="ok")
+
+    mock = BlasthttpMock()
+    mock.add_callback(cb, url="http://x/")
+
+    import blasthttp
+
+    cfg = blasthttp.BatchConfig("http://x/", method="POST", body="hello")
+    await mock.request_batch([cfg])
+
+    assert captured["content"] == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_batch_config_files_multipart():
+    """BatchConfig(files=...) sends multipart through the batch path."""
+    captured = {}
+
+    async def cb(req):
+        captured["content"] = bytes(req.content)
+        captured["headers"] = dict(req.headers)
+        return MockResponse(status_code=200, text="ok")
+
+    mock = BlasthttpMock()
+    mock.add_callback(cb, url="http://x/")
+
+    import blasthttp
+
+    cfg = blasthttp.BatchConfig(
+        "http://x/",
+        method="POST",
+        files={"field": (None, "value"), "f": ("blob", b"\x00\x01", "application/octet-stream")},
+    )
+    await mock.request_batch([cfg])
+
+    ct = captured["headers"]["Content-Type"]
+    assert ct.startswith("multipart/form-data; boundary=")
+    assert b'name="field"' in captured["content"]
+    assert b'filename="blob"' in captured["content"]
+    assert b"\x00\x01" in captured["content"]
+
+
+@pytest.mark.asyncio
+async def test_batch_config_files_multipart_via_stream():
+    """BatchConfig(files=...) also works through request_batch_stream."""
+    captured = {}
+
+    async def cb(req):
+        captured["content"] = bytes(req.content)
+        captured["headers"] = dict(req.headers)
+        return MockResponse(status_code=200, text="ok")
+
+    mock = BlasthttpMock()
+    mock.add_callback(cb, url="http://x/")
+
+    import blasthttp
+
+    cfg = blasthttp.BatchConfig(
+        "http://x/",
+        method="POST",
+        body=b"\xaa\xbb",
+        files={"field": (None, "value")},
+    )
+    async for _result in mock.request_batch_stream([cfg]):
+        pass
+
+    ct = captured["headers"]["Content-Type"]
+    assert ct.startswith("multipart/form-data; boundary=")
+    assert b'name="field"' in captured["content"]
+    assert b"\xaa\xbb" not in captured["content"], "files= must override body="
+
+
+@pytest.mark.asyncio
+async def test_batch_config_caller_content_type_wins():
+    """Caller-supplied Content-Type in BatchConfig.headers wins over auto-injected boundary."""
+    captured = {}
+
+    async def cb(req):
+        captured["headers"] = dict(req.headers)
+        return MockResponse(status_code=200, text="ok")
+
+    mock = BlasthttpMock()
+    mock.add_callback(cb, url="http://x/")
+
+    import blasthttp
+
+    cfg = blasthttp.BatchConfig(
+        "http://x/",
+        method="POST",
+        headers=[("Content-Type", "multipart/form-data; boundary=fixed")],
+        files={"k": (None, "v")},
+    )
+    await mock.request_batch([cfg])
+
+    assert captured["headers"]["Content-Type"] == "multipart/form-data; boundary=fixed"
+
+
+@pytest.mark.asyncio
 async def test_boundary_is_unique_per_request():
     """Each request generates a fresh boundary so concurrent uploads don't collide."""
     boundaries = []

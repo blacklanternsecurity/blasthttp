@@ -971,8 +971,8 @@ impl BlastHTTP {
     ) -> PyResult<Bound<'py, PyAny>> {
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
-            .map(|c| c.into_request_config())
-            .collect();
+            .map(|c| c.into_request_config(py))
+            .collect::<PyResult<_>>()?;
 
         let shared_limiter = self.rate_limiter.clone();
         let client = self.client.clone();
@@ -1029,14 +1029,15 @@ impl BlastHTTP {
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch_stream(
         &self,
+        py: Python<'_>,
         configs: Vec<PyBatchConfig>,
         concurrency: usize,
         rate_limit: Option<f64>,
     ) -> PyResult<PyBatchResultIterator> {
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
-            .map(|c| c.into_request_config())
-            .collect();
+            .map(|c| c.into_request_config(py))
+            .collect::<PyResult<_>>()?;
 
         let stream = batch::send_batch_stream(
             self.client.clone(),
@@ -1290,7 +1291,6 @@ impl PyRawConnection {
 /// Per-request config for batch operations.
 /// Mirrors send() parameters but as a class for batch input.
 #[pyclass(name = "BatchConfig")]
-#[derive(Clone)]
 struct PyBatchConfig {
     #[pyo3(get, set)]
     url: String,
@@ -1299,7 +1299,9 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     headers: Option<Vec<(String, String)>>,
     #[pyo3(get, set)]
-    body: Option<String>,
+    body: Option<Py<PyAny>>,
+    #[pyo3(get, set)]
+    files: Option<Py<PyAny>>,
     #[pyo3(get, set)]
     timeout: Option<u64>,
     #[pyo3(get, set)]
@@ -1338,6 +1340,7 @@ impl PyBatchConfig {
         method=None,
         headers=None,
         body=None,
+        files=None,
         timeout=None,
         follow_redirects=None,
         max_redirects=None,
@@ -1358,7 +1361,8 @@ impl PyBatchConfig {
         url: String,
         method: Option<String>,
         headers: Option<Vec<(String, String)>>,
-        body: Option<String>,
+        body: Option<Bound<'_, PyAny>>,
+        files: Option<Bound<'_, PyAny>>,
         timeout: Option<u64>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
@@ -1378,7 +1382,8 @@ impl PyBatchConfig {
             url,
             method,
             headers,
-            body,
+            body: body.map(|b| b.unbind()),
+            files: files.map(|f| f.unbind()),
             timeout,
             follow_redirects,
             max_redirects,
@@ -1397,13 +1402,42 @@ impl PyBatchConfig {
     }
 }
 
+impl Clone for PyBatchConfig {
+    fn clone(&self) -> Self {
+        Python::attach(|py| PyBatchConfig {
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers.clone(),
+            body: self.body.as_ref().map(|b| b.clone_ref(py)),
+            files: self.files.as_ref().map(|f| f.clone_ref(py)),
+            timeout: self.timeout,
+            follow_redirects: self.follow_redirects,
+            max_redirects: self.max_redirects,
+            verify_certs: self.verify_certs,
+            proxy: self.proxy.clone(),
+            cipher_string: self.cipher_string.clone(),
+            min_tls_version: self.min_tls_version.clone(),
+            max_tls_version: self.max_tls_version.clone(),
+            retries: self.retries,
+            retry_wait_min_ms: self.retry_wait_min_ms,
+            retry_wait_max_ms: self.retry_wait_max_ms,
+            raw_path: self.raw_path,
+            request_target: self.request_target.clone(),
+            resolve_ip: self.resolve_ip.clone(),
+        })
+    }
+}
+
 impl PyBatchConfig {
-    fn into_request_config(self) -> RequestConfig {
-        RequestConfig {
+    fn into_request_config(self, py: Python<'_>) -> PyResult<RequestConfig> {
+        let body = self.body.as_ref().map(|b| b.bind(py).clone());
+        let files = self.files.as_ref().map(|f| f.bind(py).clone());
+        let (body_bytes, headers) = apply_body_and_files(body, files, self.headers)?;
+        Ok(RequestConfig {
             url: self.url,
             method: self.method,
-            headers: self.headers,
-            body: self.body.map(String::into_bytes),
+            headers,
+            body: body_bytes,
             timeout_seconds: self.timeout,
             max_body_size: None,
             follow_redirects: self.follow_redirects,
@@ -1421,7 +1455,7 @@ impl PyBatchConfig {
             resolve_ip: self.resolve_ip,
             alpn_protocols: None,
             verbosity: 0,
-        }
+        })
     }
 }
 

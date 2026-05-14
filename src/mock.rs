@@ -828,20 +828,22 @@ impl PyBlasthttpMock {
                     .getattr("method")?
                     .extract::<Option<String>>()?
                     .unwrap_or_else(|| "GET".to_string());
-                let headers: Vec<(String, String)> = bound
-                    .getattr("headers")?
-                    .extract::<Option<Vec<(String, String)>>>()?
-                    .unwrap_or_default();
-                let body: Vec<u8> = bound
-                    .getattr("body")?
-                    .extract::<Option<String>>()?
-                    .map(String::into_bytes)
-                    .unwrap_or_default();
+                let headers: Option<Vec<(String, String)>> = bound.getattr("headers")?.extract()?;
+                let body_obj = bound.getattr("body")?;
+                let body = if body_obj.is_none() {
+                    None
+                } else {
+                    Some(body_obj)
+                };
+                let files_obj = bound.getattr("files").ok();
+                let files = files_obj.and_then(|f| if f.is_none() { None } else { Some(f) });
+                let (body_bytes, final_headers) =
+                    crate::python::apply_body_and_files(body, files, headers)?;
                 mock_entries.push(MockBatchEntry {
                     url,
                     method,
-                    headers,
-                    body,
+                    headers: final_headers.unwrap_or_default(),
+                    body: body_bytes.unwrap_or_default(),
                 });
             } else {
                 passthrough_configs.push(cfg);
