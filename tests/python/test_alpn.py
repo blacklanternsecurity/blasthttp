@@ -4,6 +4,7 @@ Exercises the `alpn_protocols` parameter and the `negotiated_alpn`
 attribute on the returned RawConnection against a local TLS server
 that offers a specific ALPN list.
 """
+
 import asyncio
 import pathlib
 import ssl
@@ -26,13 +27,23 @@ def selfsigned_cert():
     key = pathlib.Path(tmpdir) / "key.pem"
     subprocess.run(
         [
-            "openssl", "req", "-x509", "-nodes",
-            "-newkey", "rsa:2048",
-            "-subj", "/CN=localhost",
-            "-keyout", str(key), "-out", str(cert),
-            "-days", "1",
+            "openssl",
+            "req",
+            "-x509",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
         ],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     return str(cert), str(key)
 
@@ -69,7 +80,10 @@ async def tls_server_factory(selfsigned_cert):
     async def make_server(server_alpn_list):
         ctx = _server_ctx(cert, key, server_alpn_list)
         srv = await asyncio.start_server(
-            handle, "127.0.0.1", 0, ssl=ctx,
+            handle,
+            "127.0.0.1",
+            0,
+            ssl=ctx,
         )
         servers.append(srv)
         return srv.sockets[0].getsockname()[1]
@@ -90,32 +104,37 @@ def client():
 
 
 async def test_alpn_negotiates_h2_when_only_h2_offered_and_supported(
-    client, tls_server_factory,
+    client,
+    tls_server_factory,
 ):
     """Server advertises h2; client offers h2 only → negotiated=h2."""
     port = await tls_server_factory(["h2"])
     conn = await client.raw_connect(
-        f"https://127.0.0.1:{port}", alpn_protocols=["h2"],
+        f"https://127.0.0.1:{port}",
+        alpn_protocols=["h2"],
     )
     assert conn.negotiated_alpn == "h2"
     await conn.close()
 
 
 async def test_alpn_negotiates_http1_when_only_http1_offered(
-    client, tls_server_factory,
+    client,
+    tls_server_factory,
 ):
     """Server advertises http/1.1; client offers http/1.1 only →
     negotiated=http/1.1."""
     port = await tls_server_factory(["http/1.1"])
     conn = await client.raw_connect(
-        f"https://127.0.0.1:{port}", alpn_protocols=["http/1.1"],
+        f"https://127.0.0.1:{port}",
+        alpn_protocols=["http/1.1"],
     )
     assert conn.negotiated_alpn == "http/1.1"
     await conn.close()
 
 
 async def test_alpn_uses_server_preference_order(
-    client, tls_server_factory,
+    client,
+    tls_server_factory,
 ):
     """Server lists `[http/1.1, h2]` (h1 preferred); client offers
     both `[h2, http/1.1]`. OpenSSL picks server's preferred → h1.
@@ -130,7 +149,8 @@ async def test_alpn_uses_server_preference_order(
 
 
 async def test_alpn_defaults_to_http1_when_not_specified(
-    client, tls_server_factory,
+    client,
+    tls_server_factory,
 ):
     """Client doesn't pass `alpn_protocols`: blasthttp offers an
     http/1.1 default, so `negotiated_alpn` is "http/1.1" against a
@@ -142,13 +162,15 @@ async def test_alpn_defaults_to_http1_when_not_specified(
 
 
 async def test_alpn_negotiated_is_none_when_server_has_no_alpn(
-    client, tls_server_factory,
+    client,
+    tls_server_factory,
 ):
     """Client offers ALPN, server doesn't advertise any → connection
     still succeeds but `negotiated_alpn` is None."""
     port = await tls_server_factory([])  # server with no ALPN list
     conn = await client.raw_connect(
-        f"https://127.0.0.1:{port}", alpn_protocols=["h2"],
+        f"https://127.0.0.1:{port}",
+        alpn_protocols=["h2"],
     )
     assert conn.negotiated_alpn is None
     await conn.close()
@@ -157,6 +179,7 @@ async def test_alpn_negotiated_is_none_when_server_has_no_alpn(
 async def test_alpn_negotiated_is_none_for_plain_http():
     """Plain HTTP → no TLS → no ALPN. Using the existing local TCP
     echo fixture path rather than the TLS factory."""
+
     async def handle(reader, writer):
         writer.close()
         try:
@@ -169,7 +192,8 @@ async def test_alpn_negotiated_is_none_for_plain_http():
     try:
         client = blasthttp.BlastHTTP()
         conn = await client.raw_connect(
-            f"http://127.0.0.1:{port}", alpn_protocols=["h2"],
+            f"http://127.0.0.1:{port}",
+            alpn_protocols=["h2"],
         )
         assert conn.negotiated_alpn is None
         await conn.close()

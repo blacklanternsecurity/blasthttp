@@ -15,12 +15,12 @@ import blasthttp
 
 async def _http_handler(reader, writer):
     """Handler that responds based on the path:
-       /              -> 200 OK with "hello"
-       /json          -> 200 OK with a JSON body
-       /404           -> 404 Not Found
-       /500           -> 500 Internal Server Error
-       /cookies       -> two Set-Cookie headers
-       /multi-headers -> duplicate header names
+    /              -> 200 OK with "hello"
+    /json          -> 200 OK with a JSON body
+    /404           -> 404 Not Found
+    /500           -> 500 Internal Server Error
+    /cookies       -> two Set-Cookie headers
+    /multi-headers -> duplicate header names
     """
     try:
         request_line = await reader.readuntil(b"\r\n")
@@ -56,20 +56,9 @@ async def _http_handler(reader, writer):
                 b"\r\nok"
             )
         elif path == "/multi-headers":
-            writer.write(
-                b"HTTP/1.1 200 OK\r\n"
-                b"X-Custom: first\r\n"
-                b"X-Custom: second\r\n"
-                b"Content-Length: 2\r\n"
-                b"\r\nok"
-            )
+            writer.write(b"HTTP/1.1 200 OK\r\nX-Custom: first\r\nX-Custom: second\r\nContent-Length: 2\r\n\r\nok")
         else:
-            writer.write(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/plain\r\n"
-                b"Content-Length: 5\r\n"
-                b"\r\nhello"
-            )
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello")
         await writer.drain()
     finally:
         writer.close()

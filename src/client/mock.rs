@@ -156,18 +156,22 @@ impl HttpClient for MockClient {
 
         self.concurrent_count.fetch_sub(1, Ordering::SeqCst);
 
-        let body = if self.echo_config {
+        let body_bytes = if self.echo_config {
+            let body_str = config
+                .body
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default();
             format!(
                 "method={} body={} headers={}",
                 config.method(),
-                config.body.as_deref().unwrap_or(""),
+                body_str,
                 config.headers.as_ref().map(|h| h.len()).unwrap_or(0),
             )
+            .into_bytes()
         } else {
-            self.body.clone()
+            self.body.clone().into_bytes()
         };
-
-        let body_bytes = body.into_bytes();
         Ok(Response {
             url: config.url.clone(),
             status: self.status,

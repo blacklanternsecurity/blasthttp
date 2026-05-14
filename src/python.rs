@@ -20,9 +20,61 @@ use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
 use crate::client::raw;
 use crate::config::RequestConfig;
+use crate::multipart;
 use crate::response::{CertInfo, RedirectHop, Response, ResponseHash};
 
 use std::io::Write;
+
+// ── Shared body/files coercion ────────────────────────────────────
+
+/// Coerce a `body=` Python value (bytes, str, or None) to `Option<Vec<u8>>`.
+pub(crate) fn coerce_body(body: Option<Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
+    let Some(b) = body else {
+        return Ok(None);
+    };
+    if b.is_none() {
+        return Ok(None);
+    }
+    if let Ok(s) = b.extract::<String>() {
+        return Ok(Some(s.into_bytes()));
+    }
+    if let Ok(bs) = b.extract::<Vec<u8>>() {
+        return Ok(Some(bs));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "body must be bytes, str, or None",
+    ))
+}
+
+pub(crate) type BodyAndHeaders = (Option<Vec<u8>>, Option<Vec<(String, String)>>);
+
+/// Resolve `body=` / `files=` into the final body bytes + header list.
+/// When `files` is set it wins over `body`, the multipart body is built,
+/// and a `Content-Type: multipart/form-data; boundary=...` header is
+/// appended unless the caller already supplied one.
+pub(crate) fn apply_body_and_files(
+    body: Option<Bound<'_, PyAny>>,
+    files: Option<Bound<'_, PyAny>>,
+    headers: Option<Vec<(String, String)>>,
+) -> PyResult<BodyAndHeaders> {
+    if let Some(files) = files
+        && !files.is_none()
+    {
+        let (boundary, body_bytes) = multipart::build_multipart(&files)?;
+        let mut header_list = headers.unwrap_or_default();
+        if !header_list
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
+            header_list.push((
+                "Content-Type".to_string(),
+                format!("multipart/form-data; boundary={}", boundary),
+            ));
+        }
+        return Ok((Some(body_bytes), Some(header_list)));
+    }
+    Ok((coerce_body(body)?, headers))
+}
 
 // ── Response wrapper types ────────────────────────────────────────
 
@@ -785,11 +837,18 @@ impl BlastHTTP {
     }
 
     /// Send a single HTTP request. Returns a Response object.
+    ///
+    /// `body` accepts `bytes`, `str`, or `None`. `files` is an
+    /// httpx-style dict mapping field name to content — when set, the
+    /// body is built as a `multipart/form-data` payload and the
+    /// `Content-Type` header is set automatically (unless the caller
+    /// supplied one). `files` takes precedence over `body`.
     #[pyo3(signature = (
         url,
         method=None,
         headers=None,
         body=None,
+        files=None,
         timeout=None,
         follow_redirects=None,
         max_redirects=None,
@@ -813,7 +872,8 @@ impl BlastHTTP {
         url: String,
         method: Option<String>,
         headers: Option<Vec<(String, String)>>,
-        body: Option<String>,
+        body: Option<Bound<'py, PyAny>>,
+        files: Option<Bound<'py, PyAny>>,
         timeout: Option<u64>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
@@ -830,11 +890,12 @@ impl BlastHTTP {
         request_target: Option<String>,
         resolve_ip: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let (body_bytes, headers) = apply_body_and_files(body, files, headers)?;
         let config = RequestConfig {
             url,
             method,
             headers,
-            body,
+            body: body_bytes,
             timeout_seconds: timeout,
             max_body_size,
             follow_redirects,
@@ -910,8 +971,8 @@ impl BlastHTTP {
     ) -> PyResult<Bound<'py, PyAny>> {
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
-            .map(|c| c.into_request_config())
-            .collect();
+            .map(|c| c.into_request_config(py))
+            .collect::<PyResult<_>>()?;
 
         let shared_limiter = self.rate_limiter.clone();
         let client = self.client.clone();
@@ -968,14 +1029,15 @@ impl BlastHTTP {
     #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
     fn request_batch_stream(
         &self,
+        py: Python<'_>,
         configs: Vec<PyBatchConfig>,
         concurrency: usize,
         rate_limit: Option<f64>,
     ) -> PyResult<PyBatchResultIterator> {
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
-            .map(|c| c.into_request_config())
-            .collect();
+            .map(|c| c.into_request_config(py))
+            .collect::<PyResult<_>>()?;
 
         let stream = batch::send_batch_stream(
             self.client.clone(),
@@ -1229,7 +1291,6 @@ impl PyRawConnection {
 /// Per-request config for batch operations.
 /// Mirrors send() parameters but as a class for batch input.
 #[pyclass(name = "BatchConfig")]
-#[derive(Clone)]
 struct PyBatchConfig {
     #[pyo3(get, set)]
     url: String,
@@ -1238,7 +1299,9 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     headers: Option<Vec<(String, String)>>,
     #[pyo3(get, set)]
-    body: Option<String>,
+    body: Option<Py<PyAny>>,
+    #[pyo3(get, set)]
+    files: Option<Py<PyAny>>,
     #[pyo3(get, set)]
     timeout: Option<u64>,
     #[pyo3(get, set)]
@@ -1277,6 +1340,7 @@ impl PyBatchConfig {
         method=None,
         headers=None,
         body=None,
+        files=None,
         timeout=None,
         follow_redirects=None,
         max_redirects=None,
@@ -1297,7 +1361,8 @@ impl PyBatchConfig {
         url: String,
         method: Option<String>,
         headers: Option<Vec<(String, String)>>,
-        body: Option<String>,
+        body: Option<Bound<'_, PyAny>>,
+        files: Option<Bound<'_, PyAny>>,
         timeout: Option<u64>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
@@ -1317,7 +1382,8 @@ impl PyBatchConfig {
             url,
             method,
             headers,
-            body,
+            body: body.map(|b| b.unbind()),
+            files: files.map(|f| f.unbind()),
             timeout,
             follow_redirects,
             max_redirects,
@@ -1336,13 +1402,42 @@ impl PyBatchConfig {
     }
 }
 
+impl Clone for PyBatchConfig {
+    fn clone(&self) -> Self {
+        Python::attach(|py| PyBatchConfig {
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers.clone(),
+            body: self.body.as_ref().map(|b| b.clone_ref(py)),
+            files: self.files.as_ref().map(|f| f.clone_ref(py)),
+            timeout: self.timeout,
+            follow_redirects: self.follow_redirects,
+            max_redirects: self.max_redirects,
+            verify_certs: self.verify_certs,
+            proxy: self.proxy.clone(),
+            cipher_string: self.cipher_string.clone(),
+            min_tls_version: self.min_tls_version.clone(),
+            max_tls_version: self.max_tls_version.clone(),
+            retries: self.retries,
+            retry_wait_min_ms: self.retry_wait_min_ms,
+            retry_wait_max_ms: self.retry_wait_max_ms,
+            raw_path: self.raw_path,
+            request_target: self.request_target.clone(),
+            resolve_ip: self.resolve_ip.clone(),
+        })
+    }
+}
+
 impl PyBatchConfig {
-    fn into_request_config(self) -> RequestConfig {
-        RequestConfig {
+    fn into_request_config(self, py: Python<'_>) -> PyResult<RequestConfig> {
+        let body = self.body.as_ref().map(|b| b.bind(py).clone());
+        let files = self.files.as_ref().map(|f| f.bind(py).clone());
+        let (body_bytes, headers) = apply_body_and_files(body, files, self.headers)?;
+        Ok(RequestConfig {
             url: self.url,
             method: self.method,
-            headers: self.headers,
-            body: self.body,
+            headers,
+            body: body_bytes,
             timeout_seconds: self.timeout,
             max_body_size: None,
             follow_redirects: self.follow_redirects,
@@ -1360,7 +1455,7 @@ impl PyBatchConfig {
             resolve_ip: self.resolve_ip,
             alpn_protocols: None,
             verbosity: 0,
-        }
+        })
     }
 }
 

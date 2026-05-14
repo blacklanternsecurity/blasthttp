@@ -5,6 +5,7 @@ against a local asyncio HTTP server that delays responses based on the URL
 path so we can drive completion timing and verify the 200ms timeout flushes
 partial batches.
 """
+
 import asyncio
 import re
 
@@ -22,6 +23,7 @@ async def delay_server():
 
     Yields the port; tears down on cleanup.
     """
+
     async def handle(reader, writer):
         try:
             data = b""
@@ -124,9 +126,7 @@ async def test_stream_timeout_flushes_partial_batches(delay_server):
         batch_sizes.append(len(batch))
 
     assert sum(batch_sizes) == 60, f"expected 60 results, got {batch_sizes}"
-    assert batch_sizes == [21, 20, 19], (
-        f"expected timeout to flush as [21, 20, 19], got {batch_sizes}"
-    )
+    assert batch_sizes == [21, 20, 19], f"expected timeout to flush as [21, 20, 19], got {batch_sizes}"
 
 
 async def test_stream_no_timeout_under_load(delay_server):

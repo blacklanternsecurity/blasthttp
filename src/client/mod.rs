@@ -175,7 +175,7 @@ mod tests {
         let client = MockClient::new(200, String::new()).with_echo();
         let mut config = RequestConfig::new("https://example.com".to_string());
         config.method = Some("POST".to_string());
-        config.body = Some("test data".to_string());
+        config.body = Some(b"test data".to_vec());
         let response = client.send(&config).await.unwrap();
         assert!(response.body().contains("body=test data"));
     }

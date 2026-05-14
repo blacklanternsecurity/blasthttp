@@ -4,7 +4,7 @@ Exercises HPACK encoder/decoder, frame builders, and the `build_probe`
 high-level helper. All tests are pure-CPU — no network — so they
 run in milliseconds and catch PyO3-binding drift early.
 """
-import blasthttp
+
 from blasthttp import h2
 
 
@@ -15,12 +15,22 @@ def test_module_exports_key_symbols():
     """Contract guard — any refactor that renames or drops these
     symbols silently breaks downstream code (e.g. badhttp)."""
     for name in (
-        "Header", "Decoder", "PREFACE",
-        "FRAME_HEADERS", "FRAME_DATA", "FRAME_SETTINGS",
-        "FRAME_CONTINUATION", "FRAME_RST_STREAM", "FRAME_GOAWAY",
-        "FLAG_END_HEADERS", "FLAG_END_STREAM", "FLAG_ACK",
+        "Header",
+        "Decoder",
+        "PREFACE",
+        "FRAME_HEADERS",
+        "FRAME_DATA",
+        "FRAME_SETTINGS",
+        "FRAME_CONTINUATION",
+        "FRAME_RST_STREAM",
+        "FRAME_GOAWAY",
+        "FLAG_END_HEADERS",
+        "FLAG_END_STREAM",
+        "FLAG_ACK",
         "encode_headers",
-        "build_headers_frame", "build_data_frame", "build_settings_frame",
+        "build_headers_frame",
+        "build_data_frame",
+        "build_settings_frame",
         "build_probe",
     ):
         assert hasattr(h2, name), f"blasthttp.h2.{name} missing"
@@ -78,16 +88,20 @@ def test_permissive_crlf_in_value_round_trips():
     material for H2-to-H1 CRLF injection. Encoder must accept, decoder
     must return exact bytes back."""
     evil = "bogus\r\nX-Smuggled: yes"
-    block = h2.encode_headers([
-        h2.Header(":method", "GET"),
-        h2.Header(":path", "/"),
-        h2.Header(":authority", "example.com"),
-        h2.Header(":scheme", "https"),
-        h2.Header(
-            "x-injected", evil,
-            allow_invalid_value=True, huffman_value=False,
-        ),
-    ])
+    block = h2.encode_headers(
+        [
+            h2.Header(":method", "GET"),
+            h2.Header(":path", "/"),
+            h2.Header(":authority", "example.com"),
+            h2.Header(":scheme", "https"),
+            h2.Header(
+                "x-injected",
+                evil,
+                allow_invalid_value=True,
+                huffman_value=False,
+            ),
+        ]
+    )
     decoded = h2.Decoder().decode(block)
     # Find the injected header — its value must be preserved verbatim,
     # CRLF and all.
@@ -164,14 +178,16 @@ def test_build_probe_emits_preface_then_settings_then_headers():
     """build_probe is the one-shot builder for a full H2 request probe.
     Order matters: preface first, then a SETTINGS frame (our side's),
     then the HEADERS for stream 1."""
-    probe = h2.build_probe([
-        h2.Header(":method", "GET"),
-        h2.Header(":path", "/"),
-        h2.Header(":authority", "example.com"),
-        h2.Header(":scheme", "https"),
-    ])
+    probe = h2.build_probe(
+        [
+            h2.Header(":method", "GET"),
+            h2.Header(":path", "/"),
+            h2.Header(":authority", "example.com"),
+            h2.Header(":scheme", "https"),
+        ]
+    )
     assert probe.startswith(h2.PREFACE)
-    after_preface = probe[len(h2.PREFACE):]
+    after_preface = probe[len(h2.PREFACE) :]
     # First frame past the preface is SETTINGS.
     _, ftype1, _, sid1 = _parse_frame_header(after_preface)
     assert ftype1 == h2.FRAME_SETTINGS
@@ -207,7 +223,7 @@ def test_build_probe_appends_data_frame_when_body_given():
         frame_types.append(ftype)
         pos += 9 + length
     assert frame_types == [
-        h2.FRAME_SETTINGS, h2.FRAME_HEADERS, h2.FRAME_DATA,
+        h2.FRAME_SETTINGS,
+        h2.FRAME_HEADERS,
+        h2.FRAME_DATA,
     ]
-
-

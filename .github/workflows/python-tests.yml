@@ -15,7 +15,22 @@ permissions:
   contents: read
 
 jobs:
+  python-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install ruff
+        run: pip install ruff==0.15.10
+      - name: ruff check
+        run: ruff check
+      - name: ruff format --check
+        run: ruff format --check
+
   python-tests:
+    needs: python-lint
     runs-on: ubuntu-24.04
     strategy:
       matrix:
