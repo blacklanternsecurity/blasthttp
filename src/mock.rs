@@ -706,6 +706,8 @@ impl PyBlasthttpMock {
             );
         }
 
+        crate::python::reject_body_with_files(&body, &files)?;
+
         let method_str = method.unwrap_or_else(|| "GET".to_string());
         let mut header_list = normalize_headers(headers.as_ref())?;
         let body_bytes = if let Some(ref f) = files
