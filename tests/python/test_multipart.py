@@ -139,27 +139,22 @@ async def test_files_mixed_fields_and_file_telerik_shape():
 
 
 @pytest.mark.asyncio
-async def test_files_overrides_body():
-    """`files=` takes precedence over `body=` and overrides Content-Type."""
-    captured = {}
+async def test_files_and_body_rejected():
+    """Passing both `body=` and `files=` raises ValueError instead of silently picking one."""
+    mock = BlasthttpMock()
 
     async def cb(req: MockRequest):
-        captured["content"] = bytes(req.content)
-        captured["headers"] = dict(req.headers)
         return MockResponse(status_code=200, text="ok")
 
-    mock = BlasthttpMock()
     mock.add_callback(cb, url="http://x/")
 
-    await mock.request(
-        "http://x/",
-        method="POST",
-        body="ignored",
-        files={"k": (None, "v")},
-    )
-
-    assert b"ignored" not in captured["content"]
-    assert captured["headers"]["Content-Type"].startswith("multipart/form-data; boundary=")
+    with pytest.raises(ValueError, match="both body= and files="):
+        await mock.request(
+            "http://x/",
+            method="POST",
+            body="ignored",
+            files={"k": (None, "v")},
+        )
 
 
 @pytest.mark.asyncio
@@ -323,7 +318,7 @@ async def test_batch_config_files_multipart():
 
 @pytest.mark.asyncio
 async def test_batch_config_files_multipart_via_stream():
-    """BatchConfig(files=...) also works through request_batch_stream."""
+    """BatchConfig(files=...) works through request_batch_stream."""
     captured = {}
 
     async def cb(req):
@@ -339,7 +334,6 @@ async def test_batch_config_files_multipart_via_stream():
     cfg = blasthttp.BatchConfig(
         "http://x/",
         method="POST",
-        body=b"\xaa\xbb",
         files={"field": (None, "value")},
     )
     async for _result in mock.request_batch_stream([cfg]):
@@ -348,7 +342,29 @@ async def test_batch_config_files_multipart_via_stream():
     ct = captured["headers"]["Content-Type"]
     assert ct.startswith("multipart/form-data; boundary=")
     assert b'name="field"' in captured["content"]
-    assert b"\xaa\xbb" not in captured["content"], "files= must override body="
+
+
+@pytest.mark.asyncio
+async def test_batch_config_body_and_files_rejected():
+    """BatchConfig with both body= and files= raises ValueError through the batch path."""
+    mock = BlasthttpMock()
+
+    async def cb(req):
+        return MockResponse(status_code=200, text="ok")
+
+    mock.add_callback(cb, url="http://x/")
+
+    import blasthttp
+
+    cfg = blasthttp.BatchConfig(
+        "http://x/",
+        method="POST",
+        body=b"\xaa\xbb",
+        files={"field": (None, "value")},
+    )
+    with pytest.raises(ValueError, match="both body= and files="):
+        async for _ in mock.request_batch_stream([cfg]):
+            pass
 
 
 @pytest.mark.asyncio

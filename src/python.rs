@@ -48,15 +48,32 @@ pub(crate) fn coerce_body(body: Option<Bound<'_, PyAny>>) -> PyResult<Option<Vec
 
 pub(crate) type BodyAndHeaders = (Option<Vec<u8>>, Option<Vec<(String, String)>>);
 
+/// Reject the combination of a non-None `body=` and a non-None `files=`.
+/// Used by every entry point that accepts both kwargs.
+pub(crate) fn reject_body_with_files(
+    body: &Option<Bound<'_, PyAny>>,
+    files: &Option<Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    let body_set = body.as_ref().is_some_and(|b| !b.is_none());
+    let files_set = files.as_ref().is_some_and(|f| !f.is_none());
+    if body_set && files_set {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "got both body= and files=; pass only one",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve `body=` / `files=` into the final body bytes + header list.
-/// When `files` is set it wins over `body`, the multipart body is built,
-/// and a `Content-Type: multipart/form-data; boundary=...` header is
-/// appended unless the caller already supplied one.
+/// Passing both is rejected with `ValueError`. When `files` is set, the
+/// multipart body is built and a `Content-Type: multipart/form-data;
+/// boundary=...` header is appended unless the caller already supplied one.
 pub(crate) fn apply_body_and_files(
     body: Option<Bound<'_, PyAny>>,
     files: Option<Bound<'_, PyAny>>,
     headers: Option<Vec<(String, String)>>,
 ) -> PyResult<BodyAndHeaders> {
+    reject_body_with_files(&body, &files)?;
     if let Some(files) = files
         && !files.is_none()
     {
