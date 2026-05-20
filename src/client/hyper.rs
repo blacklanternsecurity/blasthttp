@@ -1033,7 +1033,7 @@ fn build_request(
         .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
 
     // Auto-set Host from URI (HTTP/1.1 requirement) unless the caller supplies
-    // their own.  hyper's low-level handshake API (used by dispatch_raw for
+    // their own.  hyper's low-level handshake API (used by dispatch_direct for
     // resolve_ip / request_target, and by the forward-proxy path) does not
     // auto-set Host, so we must do it. For the pooled high-level client we
     // skip this — hyper populates Host (HTTP/1.1) or :authority (HTTP/2) from
