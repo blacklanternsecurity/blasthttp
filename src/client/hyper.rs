@@ -626,7 +626,10 @@ async fn dispatch_request(
     config: &RequestConfig,
     log: &DebugLog,
 ) -> Result<SingleResponse, ClientError> {
-    let request = build_request(uri, config, false)?;
+    // The pooled high-level client populates Host / :authority from the URI
+    // itself, so we don't add a Host header here. Adding it would cause
+    // duplicate :authority + host in the HTTP/2 HPACK block.
+    let request = build_request(uri, config, false, false)?;
     let v = config.verbosity;
 
     debug_record(log, v, 1, "   Request headers:");
@@ -882,8 +885,11 @@ async fn dispatch_direct(
 
     // Use origin-form unless request_target was explicitly set (caller wants
     // exact control over the request-line, e.g. absolute-form for SSRF testing).
+    // The low-level http1 sender below doesn't auto-populate Host from the URI
+    // the way the pooled high-level client does, so we ask build_request to do
+    // it manually.
     let use_origin_form = config.request_target.is_none();
-    let request = build_request(&request_uri, config, use_origin_form)?;
+    let request = build_request(&request_uri, config, use_origin_form, true)?;
 
     debug_record(log, v, 1, "   Request headers:");
     for (name, value) in request.headers() {
@@ -962,8 +968,9 @@ async fn dispatch_forward_proxy(
         let _ = conn.await;
     });
 
-    // Build request with absolute-form URI (SendRequest does NOT normalize it)
-    let request = build_request(target_uri, config, false)?;
+    // Build request with absolute-form URI (SendRequest does NOT normalize it).
+    // The low-level http1 sender doesn't auto-populate Host, so add it manually.
+    let request = build_request(target_uri, config, false, true)?;
     let v = config.verbosity;
 
     debug_record(log, v, 1, "   Request headers:");
@@ -989,6 +996,7 @@ fn build_request(
     uri: &http::Uri,
     config: &RequestConfig,
     origin_form: bool,
+    manual_host_header: bool,
 ) -> Result<hyper::Request<FullBody>, ClientError> {
     // For direct connections (dispatch_direct), use origin-form (path + query only)
     // in the request-line per RFC 7230 §5.3.1. For pooled/client connections,
@@ -1025,9 +1033,17 @@ fn build_request(
         .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
 
     // Auto-set Host from URI (HTTP/1.1 requirement) unless the caller supplies
-    // their own.  hyper's low-level handshake API (used by dispatch_direct for
-    // resolve_ip / request_target) does not auto-set Host, so we must do it.
-    if !has_custom_host && let Some(authority) = uri.authority() {
+    // their own.  hyper's low-level handshake API (used by dispatch_raw for
+    // resolve_ip / request_target, and by the forward-proxy path) does not
+    // auto-set Host, so we must do it. For the pooled high-level client we
+    // skip this — hyper populates Host (HTTP/1.1) or :authority (HTTP/2) from
+    // the URI itself, and adding our own Host on top would land as a duplicate
+    // header in the HTTP/2 HPACK block alongside :authority, which some
+    // origin servers/WAFs reject as a protocol violation.
+    if manual_host_header
+        && !has_custom_host
+        && let Some(authority) = uri.authority()
+    {
         builder = builder.header("Host", authority.as_str());
     }
 
@@ -1530,8 +1546,20 @@ mod tests {
     fn test_build_request_auto_host_from_uri() {
         let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
         let config = RequestConfig::new("http://example.com:8080/path".to_string());
-        let req = build_request(&uri, &config, true).unwrap();
+        let req = build_request(&uri, &config, true, true).unwrap();
         assert_eq!(req.headers().get("host").unwrap(), "example.com:8080");
+    }
+
+    #[test]
+    fn test_build_request_no_manual_host_for_pooled_path() {
+        // The pooled high-level client populates Host / :authority from the
+        // URI itself, so build_request must not add a Host header on top.
+        // Sending both would land as a duplicate :authority + host in the
+        // HTTP/2 HPACK block, which some origin servers reject.
+        let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
+        let config = RequestConfig::new("http://example.com:8080/path".to_string());
+        let req = build_request(&uri, &config, false, false).unwrap();
+        assert!(req.headers().get("host").is_none());
     }
 
     #[test]
@@ -1539,8 +1567,22 @@ mod tests {
         let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
         let mut config = RequestConfig::new("http://example.com:8080/path".to_string());
         config.headers = Some(vec![("Host".to_string(), "custom.host".to_string())]);
-        let req = build_request(&uri, &config, true).unwrap();
+        let req = build_request(&uri, &config, true, true).unwrap();
         // Should only have the custom Host, not auto-derived
+        let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0], "custom.host");
+    }
+
+    #[test]
+    fn test_build_request_custom_host_passes_through_pooled_path() {
+        // Even on the pooled path (manual_host_header=false), a caller-supplied
+        // Host must be preserved — that's how virtualhost / host-header probes
+        // override the auto-derived value.
+        let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
+        let mut config = RequestConfig::new("http://example.com:8080/path".to_string());
+        config.headers = Some(vec![("Host".to_string(), "custom.host".to_string())]);
+        let req = build_request(&uri, &config, false, false).unwrap();
         let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0], "custom.host");
@@ -1554,7 +1596,7 @@ mod tests {
             ("Host".to_string(), "first.host".to_string()),
             ("Host".to_string(), "second.host".to_string()),
         ]);
-        let req = build_request(&uri, &config, true).unwrap();
+        let req = build_request(&uri, &config, true, true).unwrap();
         let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0], "first.host");
@@ -1565,7 +1607,7 @@ mod tests {
     fn test_build_request_origin_form_strips_authority() {
         let uri: http::Uri = "http://example.com:8080/path?q=1".parse().unwrap();
         let config = RequestConfig::new("http://example.com:8080/path?q=1".to_string());
-        let req = build_request(&uri, &config, true).unwrap();
+        let req = build_request(&uri, &config, true, true).unwrap();
         assert_eq!(req.uri(), "/path?q=1");
     }
 
@@ -1573,7 +1615,7 @@ mod tests {
     fn test_build_request_absolute_form_preserves_uri() {
         let uri: http::Uri = "http://example.com:8080/path?q=1".parse().unwrap();
         let config = RequestConfig::new("http://example.com:8080/path?q=1".to_string());
-        let req = build_request(&uri, &config, false).unwrap();
+        let req = build_request(&uri, &config, false, false).unwrap();
         assert_eq!(req.uri().to_string(), "http://example.com:8080/path?q=1");
     }
 
@@ -1583,7 +1625,7 @@ mod tests {
         // Simulate: origin_form=false (as dispatch_direct does when request_target is Some)
         let uri: http::Uri = "http://evil.com/admin".parse().unwrap();
         let config = RequestConfig::new("http://example.com/".to_string());
-        let req = build_request(&uri, &config, false).unwrap();
+        let req = build_request(&uri, &config, false, true).unwrap();
         assert_eq!(req.uri().to_string(), "http://evil.com/admin");
     }
 }
