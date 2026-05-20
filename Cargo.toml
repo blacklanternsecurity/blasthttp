@@ -1,6 +1,6 @@
 [package]
 name = "blasthttp"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
 license = "GPL-3.0"
@@ -42,7 +42,7 @@ http = "1"
 
 # Decompression
 flate2 = "1"
-brotli = "7"
+brotli = "8"
 
 # Hashing — response fingerprinting (matches BBOT's hash format)
 murmur3 = "0.5"
