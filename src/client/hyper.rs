@@ -532,7 +532,7 @@ impl HyperClient {
 
     /// Determine the connection mode for a given request config + target URI.
     fn conn_mode(config: &RequestConfig, target_uri: &http::Uri) -> Result<ConnMode, ClientError> {
-        match config.proxy.as_deref() {
+        match config.effective_proxy(target_uri.host().unwrap_or("")) {
             None => Ok(ConnMode::Direct),
             Some(proxy_url) => {
                 let proxy_uri: http::Uri =
@@ -694,7 +694,7 @@ pub(crate) async fn connect_stream(
     // tunnel from there. resolve_ip is ignored when a proxy is set — DNS
     // resolution happens at the proxy for SOCKS5, and CONNECT addresses the
     // target by hostname.
-    let proxy_config = match config.proxy.as_ref() {
+    let proxy_config = match config.effective_proxy(&host) {
         Some(p) => Some(proxy::parse_proxy_url(p)?),
         None => None,
     };
@@ -1267,7 +1267,7 @@ impl HyperClient {
         })?;
 
         debug_record(log, v, 1, &format!("-> {} {}", config.method(), uri));
-        if let Some(ref proxy) = config.proxy {
+        if let Some(proxy) = config.effective_proxy(uri.host().unwrap_or("")) {
             debug_record(log, v, 1, &format!("   Proxy: {}", proxy));
         }
         if !config.should_verify_certs() {

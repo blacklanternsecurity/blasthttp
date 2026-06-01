@@ -1,6 +1,6 @@
 [package]
 name = "blasthttp"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
 license = "GPL-3.0"
