@@ -142,7 +142,7 @@ pub(crate) fn host_bypasses_proxy(host: &str, patterns: &[String]) -> bool {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     let host_ip = host.parse::<IpAddr>().ok();
-    let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
 
     for pattern in patterns {
         let pattern = pattern.trim();
@@ -177,18 +177,27 @@ pub(crate) fn host_bypasses_proxy(host: &str, patterns: &[String]) -> bool {
         if host_ip.is_some() {
             continue;
         }
-        let suffix = pattern
-            .trim_start_matches('*')
-            .trim_matches('.')
-            .to_ascii_lowercase();
-        if suffix.is_empty() {
-            continue;
-        }
-        if host_lower == suffix || host_lower.ends_with(&format!(".{}", suffix)) {
+        let suffix = pattern.trim_start_matches('*').trim_matches('.');
+        if !suffix.is_empty() && host_matches_suffix(host, suffix) {
             return true;
         }
     }
     false
+}
+
+/// Case-insensitive check that `host` equals `suffix` or is a subdomain of it
+/// (i.e. `host` ends in `.<suffix>`). Operates on bytes to avoid allocating.
+fn host_matches_suffix(host: &str, suffix: &str) -> bool {
+    let (host, suffix) = (host.as_bytes(), suffix.as_bytes());
+    if host.len() == suffix.len() {
+        return host.eq_ignore_ascii_case(suffix);
+    }
+    match host.len().checked_sub(suffix.len()) {
+        Some(start) if start >= 1 && host[start - 1] == b'.' => {
+            host[start..].eq_ignore_ascii_case(suffix)
+        }
+        _ => false,
+    }
 }
 
 /// True if `ip` falls within the `net`/`prefix_len` CIDR block. Mismatched
