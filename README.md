@@ -49,6 +49,9 @@ blasthttp https://example.com -L
 # Through a proxy
 blasthttp https://example.com -x http://127.0.0.1:8080
 
+# ...but connect directly to certain hosts (host, *.suffix, IP, or CIDR)
+blasthttp https://example.com -x http://127.0.0.1:8080 --no-proxy '*.internal.corp' --no-proxy 10.0.0.0/8
+
 # Force specific TLS versions/ciphers
 blasthttp https://legacy-server.com --min-tls 1.0 --ciphers "RC4-SHA"
 
@@ -106,6 +109,7 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `--max-body-size` | Max response body (bytes) | 10 MB |
 | `--verify` | Enable TLS cert validation | off |
 | `-x, --proxy` | HTTP/SOCKS proxy URL | |
+| `--no-proxy` | Host that bypasses the proxy: `host`, `*.suffix`, IP, CIDR, or `*` (repeatable) | |
 | `--ciphers` | OpenSSL cipher string | all |
 | `--min-tls` | Minimum TLS version (1.0–1.3) | |
 | `--max-tls` | Maximum TLS version (1.0–1.3) | |
@@ -232,6 +236,31 @@ response = await client.request(
 )
 ```
 
+### Proxy exclusions (`no_proxy`)
+
+`proxy` routes a request through an HTTP or SOCKS5 proxy; `no_proxy` is a per-request list of hosts that bypass it and connect directly — the `NO_PROXY` equivalent. It's accepted by `request()`, `download()`, `raw_connect()`, and `BatchConfig`, and as the repeatable `--no-proxy` CLI flag.
+
+```python
+# Proxy everything except internal hosts and the loopback range.
+r = await client.request(
+    "https://example.com/",
+    proxy="http://127.0.0.1:8080",
+    no_proxy=["localhost", "*.internal.corp", "10.0.0.0/8"],
+)
+```
+
+Each entry matches case-insensitively as:
+
+- an exact hostname (`elastic.corp`);
+- a domain suffix — `*.corp`, `.corp`, and `corp` are equivalent and match the domain itself plus any subdomain;
+- a single IP (`127.0.0.1`, `::1`);
+- a CIDR range (`10.0.0.0/8`, `fd00::/8`), matched only against IP hosts;
+- or `*` to bypass the proxy for every host.
+
+The proxy/`no_proxy` decision is re-evaluated on **every redirect hop**, not just the first URL: if a request starts on an excluded (direct) host and is redirected onto a non-excluded host, the later hop goes through the proxy — and vice versa.
+
+`no_proxy` only does anything when a `proxy` is set, so passing it without one is rejected up front (the request errors rather than silently ignoring the exclusions).
+
 ### Global Rate Limiting
 
 Set a client-level rate limit (requests per second) that applies to **all** request methods — `request()`, `request_batch()`, `request_batch_stream()`, and `download()`:
@@ -290,7 +319,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`raw_connect()` takes all the same TLS knobs as `request()` — `verify_certs`, `cipher_string`, `min_tls_version`, `max_tls_version`, `resolve_ip`, `proxy`. `alpn_protocols` is a list of byte-strings (commonly `["h2", "http/1.1"]`) used in the TLS ALPN extension. After the handshake, `conn.negotiated_alpn` reports which one the server picked (or `None` if no ALPN was negotiated, including all plain-HTTP connections).
+`raw_connect()` takes all the same TLS knobs as `request()` — `verify_certs`, `cipher_string`, `min_tls_version`, `max_tls_version`, `resolve_ip`, `proxy`, `no_proxy`. `alpn_protocols` is a list of byte-strings (commonly `["h2", "http/1.1"]`) used in the TLS ALPN extension. After the handshake, `conn.negotiated_alpn` reports which one the server picked (or `None` if no ALPN was negotiated, including all plain-HTTP connections).
 
 `conn.peer_ip` returns the actual IP address the OS connected to, same as `Response.peer_ip`. `None` when the connection went through a proxy.
 

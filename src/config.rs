@@ -107,6 +107,22 @@ impl RequestConfig {
         }
     }
 
+    /// `no_proxy` only has an effect alongside a `proxy` — it lists hosts that
+    /// bypass that proxy. Setting it without a proxy is silently a no-op and
+    /// almost always a mistake, so reject it up front. Returns the error
+    /// message (caller wraps it in its error type).
+    pub fn validate_proxy(&self) -> Result<(), String> {
+        let proxy_set = self.proxy.as_deref().is_some_and(|p| !p.trim().is_empty());
+        if !self.no_proxy.is_empty() && !proxy_set {
+            return Err(
+                "no_proxy is set but no proxy is configured; no_proxy only has an effect \
+                 when a proxy is also set"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn max_retries(&self) -> u32 {
         self.retries.unwrap_or(1)
     }
@@ -334,5 +350,26 @@ mod tests {
         // No proxy configured -> always None regardless of no_proxy.
         cfg.proxy = None;
         assert_eq!(cfg.effective_proxy("example.com"), None);
+    }
+
+    #[test]
+    fn validate_proxy_rejects_no_proxy_without_proxy() {
+        let mut cfg = RequestConfig::new("http://x/".into());
+
+        // Neither set, or only proxy set -> fine.
+        assert!(cfg.validate_proxy().is_ok());
+        cfg.proxy = Some("http://proxy:8080".into());
+        assert!(cfg.validate_proxy().is_ok());
+
+        // no_proxy alongside a proxy -> fine.
+        cfg.no_proxy = pats(&["127.0.0.1"]);
+        assert!(cfg.validate_proxy().is_ok());
+
+        // no_proxy without a proxy -> error.
+        cfg.proxy = None;
+        assert!(cfg.validate_proxy().is_err());
+        // An empty/whitespace proxy counts as unset.
+        cfg.proxy = Some("   ".into());
+        assert!(cfg.validate_proxy().is_err());
     }
 }

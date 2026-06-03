@@ -684,6 +684,8 @@ pub(crate) async fn connect_stream(
 > {
     use super::proxy::{self, ProxyScheme};
 
+    config.validate_proxy().map_err(ClientError::other)?;
+
     let v = config.verbosity;
     let host = target_uri.host().unwrap_or("").to_string();
     let is_https = target_uri.scheme_str() == Some("https");
@@ -1183,6 +1185,7 @@ fn retry_backoff(attempt: u32, min_wait: Duration, max_wait: Duration) -> Durati
 
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
+        config.validate_proxy().map_err(ClientError::other)?;
         let timeout_duration = Duration::from_secs(config.timeout());
         let max_retries = config.max_retries();
         let min_wait = config.retry_wait_min();

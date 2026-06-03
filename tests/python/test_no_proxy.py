@@ -112,3 +112,11 @@ async def test_redirect_onto_no_proxy_host_reevaluates_to_direct(client, http_fa
     assert r.body == "TARGET_DIRECT", f"post-redirect hop should be direct, got {r.body!r}"
     assert direct_hits[0] == 1, f"excluded host should be hit directly once, got {direct_hits[0]}"
     assert proxy_hits[0] == 1, f"proxy should only serve hop 1, got {proxy_hits[0]}"
+
+
+async def test_no_proxy_without_proxy_raises(client):
+    """no_proxy without a proxy is a mistake — it should raise, not silently do
+    nothing. Validation runs before any connection, so the URL is never dialed."""
+    with pytest.raises(RuntimeError) as exc:
+        await client.request("http://127.0.0.1:1/", no_proxy=["127.0.0.1"])
+    assert "no_proxy" in str(exc.value)

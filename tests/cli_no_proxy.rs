@@ -227,3 +227,26 @@ fn redirect_onto_no_proxy_host_connects_direct() {
         "the proxy should only have served the first hop, not the redirect loop"
     );
 }
+
+#[test]
+fn no_proxy_without_proxy_errors() {
+    // --no-proxy is meaningless without -x; the CLI should reject it up front
+    // rather than silently ignore it. Validation runs before any connection, so
+    // the unreachable URL is never dialed.
+    let output = Command::new(env!("CARGO_BIN_EXE_blasthttp"))
+        .arg("http://127.0.0.1:1/")
+        .arg("--no-proxy")
+        .arg("127.0.0.1")
+        .output()
+        .expect("failed to run blasthttp binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --no-proxy is used without --proxy"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no_proxy") && stderr.contains("no proxy is configured"),
+        "expected a no_proxy-without-proxy error, got: {stderr}"
+    );
+}
