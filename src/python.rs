@@ -871,6 +871,7 @@ impl BlastHTTP {
         max_redirects=None,
         verify_certs=None,
         proxy=None,
+        no_proxy=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
@@ -896,6 +897,7 @@ impl BlastHTTP {
         max_redirects: Option<u32>,
         verify_certs: Option<bool>,
         proxy: Option<String>,
+        no_proxy: Option<Vec<String>>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
@@ -919,6 +921,7 @@ impl BlastHTTP {
             max_redirects,
             verify_certs,
             proxy,
+            no_proxy: no_proxy.unwrap_or_default(),
             cipher_string,
             min_tls_version,
             max_tls_version,
@@ -1079,6 +1082,7 @@ impl BlastHTTP {
         timeout=None,
         verify_certs=None,
         proxy=None,
+        no_proxy=None,
         headers=None,
         retries=None,
     ))]
@@ -1092,6 +1096,7 @@ impl BlastHTTP {
         timeout: Option<u64>,
         verify_certs: Option<bool>,
         proxy: Option<String>,
+        no_proxy: Option<Vec<String>>,
         headers: Option<Vec<(String, String)>>,
         retries: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1106,6 +1111,7 @@ impl BlastHTTP {
             max_redirects: Some(10),
             verify_certs,
             proxy,
+            no_proxy: no_proxy.unwrap_or_default(),
             cipher_string: None,
             min_tls_version: None,
             max_tls_version: None,
@@ -1163,6 +1169,7 @@ impl BlastHTTP {
         max_tls_version=None,
         resolve_ip=None,
         proxy=None,
+        no_proxy=None,
         alpn_protocols=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1176,6 +1183,7 @@ impl BlastHTTP {
         max_tls_version: Option<String>,
         resolve_ip: Option<String>,
         proxy: Option<String>,
+        no_proxy: Option<Vec<String>>,
         alpn_protocols: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut config = RequestConfig::new(url.clone());
@@ -1185,6 +1193,7 @@ impl BlastHTTP {
         config.max_tls_version = max_tls_version;
         config.resolve_ip = resolve_ip;
         config.proxy = proxy;
+        config.no_proxy = no_proxy.unwrap_or_default();
         config.alpn_protocols = alpn_protocols;
 
         let limiter = self.rate_limiter.clone();
@@ -1330,6 +1339,8 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     proxy: Option<String>,
     #[pyo3(get, set)]
+    no_proxy: Option<Vec<String>>,
+    #[pyo3(get, set)]
     cipher_string: Option<String>,
     #[pyo3(get, set)]
     min_tls_version: Option<String>,
@@ -1363,6 +1374,7 @@ impl PyBatchConfig {
         max_redirects=None,
         verify_certs=None,
         proxy=None,
+        no_proxy=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
@@ -1385,6 +1397,7 @@ impl PyBatchConfig {
         max_redirects: Option<u32>,
         verify_certs: Option<bool>,
         proxy: Option<String>,
+        no_proxy: Option<Vec<String>>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
@@ -1406,6 +1419,7 @@ impl PyBatchConfig {
             max_redirects,
             verify_certs,
             proxy,
+            no_proxy,
             cipher_string,
             min_tls_version,
             max_tls_version,
@@ -1432,6 +1446,7 @@ impl Clone for PyBatchConfig {
             max_redirects: self.max_redirects,
             verify_certs: self.verify_certs,
             proxy: self.proxy.clone(),
+            no_proxy: self.no_proxy.clone(),
             cipher_string: self.cipher_string.clone(),
             min_tls_version: self.min_tls_version.clone(),
             max_tls_version: self.max_tls_version.clone(),
@@ -1461,6 +1476,7 @@ impl PyBatchConfig {
             max_redirects: self.max_redirects,
             verify_certs: self.verify_certs,
             proxy: self.proxy,
+            no_proxy: self.no_proxy.unwrap_or_default(),
             cipher_string: self.cipher_string,
             min_tls_version: self.min_tls_version,
             max_tls_version: self.max_tls_version,
