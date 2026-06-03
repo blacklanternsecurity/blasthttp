@@ -532,7 +532,7 @@ impl HyperClient {
 
     /// Determine the connection mode for a given request config + target URI.
     fn conn_mode(config: &RequestConfig, target_uri: &http::Uri) -> Result<ConnMode, ClientError> {
-        match config.proxy.as_deref() {
+        match config.effective_proxy(target_uri.host().unwrap_or("")) {
             None => Ok(ConnMode::Direct),
             Some(proxy_url) => {
                 let proxy_uri: http::Uri =
@@ -684,6 +684,8 @@ pub(crate) async fn connect_stream(
 > {
     use super::proxy::{self, ProxyScheme};
 
+    config.validate_proxy().map_err(ClientError::other)?;
+
     let v = config.verbosity;
     let host = target_uri.host().unwrap_or("").to_string();
     let is_https = target_uri.scheme_str() == Some("https");
@@ -694,7 +696,7 @@ pub(crate) async fn connect_stream(
     // tunnel from there. resolve_ip is ignored when a proxy is set — DNS
     // resolution happens at the proxy for SOCKS5, and CONNECT addresses the
     // target by hostname.
-    let proxy_config = match config.proxy.as_ref() {
+    let proxy_config = match config.effective_proxy(&host) {
         Some(p) => Some(proxy::parse_proxy_url(p)?),
         None => None,
     };
@@ -1183,6 +1185,7 @@ fn retry_backoff(attempt: u32, min_wait: Duration, max_wait: Duration) -> Durati
 
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
+        config.validate_proxy().map_err(ClientError::other)?;
         let timeout_duration = Duration::from_secs(config.timeout());
         let max_retries = config.max_retries();
         let min_wait = config.retry_wait_min();
@@ -1267,7 +1270,7 @@ impl HyperClient {
         })?;
 
         debug_record(log, v, 1, &format!("-> {} {}", config.method(), uri));
-        if let Some(ref proxy) = config.proxy {
+        if let Some(proxy) = config.effective_proxy(uri.host().unwrap_or("")) {
             debug_record(log, v, 1, &format!("   Proxy: {}", proxy));
         }
         if !config.should_verify_certs() {
@@ -1321,41 +1324,37 @@ impl HyperClient {
             });
         }
 
-        let mode = Self::conn_mode(config, &uri)?;
-
-        // Forward proxy: dispatch directly via TCP + http1::SendRequest
-        // (bypasses hyper Client's URI normalization to preserve absolute-form)
-        let is_forward_proxy = matches!(&mode, ConnMode::ForwardProxy(_));
-        let proxy_url_for_fwd = if let ConnMode::ForwardProxy(ref url) = mode {
-            Some(url.clone())
-        } else {
-            None
-        };
-
-        // For non-forward-proxy modes, get the cached hyper Client
-        let cached = if is_forward_proxy {
-            None
-        } else {
-            Some(self.get_or_build(config, &mode)?)
-        };
-
         let mut redirect_chain: Vec<RedirectHop> = Vec::new();
         let mut hops = 0u32;
 
-        // Per-hop peer IP lookup. Returns None when:
-        //   • the request went through a proxy (the connector recorded
-        //     the proxy IP under the proxy's authority, so the target's
-        //     authority isn't in the map)
-        //   • forward-proxy dispatch (bypasses the connector entirely)
-        //   • peer_addr() failed at connect time (vanishingly rare)
-        let lookup_peer_ip = |target_uri: &http::Uri| -> Option<String> {
-            let key = peer_slot_key(target_uri)?;
-            let cached = cached.as_ref()?;
-            let map = cached.peer_slot.lock().ok()?;
-            map.get(&key).map(|ip| ip.to_string())
-        };
-
         loop {
+            // Decide the connection mode for the *current* target host on every
+            // hop, not just the first. A redirect can send the request to a
+            // different host, and the proxy / no_proxy decision has to follow
+            // it. Freezing the first hop's choice would otherwise let a request
+            // that started direct keep connecting directly after a redirect onto
+            // a proxied host (leaking traffic past the proxy), and let a request
+            // that started proxied keep using the proxy after a redirect onto a
+            // no_proxy host. Clients are cached by mode, so hops that share a
+            // mode reuse the same client.
+            let mode = Self::conn_mode(config, &uri)?;
+
+            // Forward proxy: dispatch directly via TCP + http1::SendRequest
+            // (bypasses hyper Client's URI normalization to preserve absolute-form)
+            let is_forward_proxy = matches!(&mode, ConnMode::ForwardProxy(_));
+            let proxy_url_for_fwd = if let ConnMode::ForwardProxy(ref url) = mode {
+                Some(url.clone())
+            } else {
+                None
+            };
+
+            // For non-forward-proxy modes, get the cached hyper Client.
+            let cached = if is_forward_proxy {
+                None
+            } else {
+                Some(self.get_or_build(config, &mode)?)
+            };
+
             let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
                 dispatch_forward_proxy(proxy_url, &uri, config, log).await?
             } else {
@@ -1364,7 +1363,17 @@ impl HyperClient {
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
-            let hop_peer_ip = lookup_peer_ip(&uri);
+            // Per-hop peer IP lookup. Returns None when:
+            //   • the request went through a proxy (the connector recorded
+            //     the proxy IP under the proxy's authority, so the target's
+            //     authority isn't in the map)
+            //   • forward-proxy dispatch (bypasses the connector entirely)
+            //   • peer_addr() failed at connect time (vanishingly rare)
+            let hop_peer_ip = peer_slot_key(&uri).and_then(|key| {
+                let cached = cached.as_ref()?;
+                let map = cached.peer_slot.lock().ok()?;
+                map.get(&key).map(|ip| ip.to_string())
+            });
 
             if is_redirect(resp.status) && config.should_follow_redirects() {
                 hops += 1;

@@ -60,6 +60,11 @@ struct Cli {
     #[arg(short = 'x', long)]
     proxy: Option<String>,
 
+    /// Hosts that bypass the proxy (repeatable). Accepts hostnames, domain
+    /// suffixes (*.corp), IPs, or CIDRs (10.0.0.0/8).
+    #[arg(long = "no-proxy", num_args = 1)]
+    no_proxy: Vec<String>,
+
     /// OpenSSL cipher string (e.g. "ALL", "HIGH", "RC4-SHA")
     #[arg(long)]
     ciphers: Option<String>,
@@ -109,6 +114,7 @@ fn build_config(cli: &Cli, url: String) -> RequestConfig {
     config.timeout_seconds = cli.timeout;
     config.max_body_size = cli.max_body_size;
     config.proxy = cli.proxy.clone();
+    config.no_proxy = cli.no_proxy.clone();
     config.cipher_string = cli.ciphers.clone();
     config.min_tls_version = cli.min_tls.clone();
     config.max_tls_version = cli.max_tls.clone();
