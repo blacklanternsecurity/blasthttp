@@ -20,7 +20,7 @@ managed = false
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
-    "ruff==0.15.15",
+    "ruff==0.15.16",
 ]
 
 [tool.pytest.ini_options]
