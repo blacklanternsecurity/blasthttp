@@ -249,6 +249,76 @@ fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
     }
 }
 
+/// Load system CA certificates into an SSL builder.
+///
+/// OpenSSL's `set_default_verify_paths` looks at the OPENSSLDIR compiled into
+/// the library, which may not match the system cert store (e.g. when OpenSSL
+/// is vendored). This function checks `SSL_CERT_FILE` / `SSL_CERT_DIR` env
+/// vars first, then probes well-known system paths.
+fn load_system_ca_certs(
+    builder: &mut openssl::ssl::SslConnectorBuilder,
+) -> Result<(), ClientError> {
+    use std::path::Path;
+
+    static CA_FILE_PATHS: &[&str] = &[
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+    ];
+
+    static CA_DIR_PATHS: &[&str] = &[
+        "/etc/ssl/certs",
+        "/etc/pki/tls/certs",
+        "/system/etc/security/cacerts",
+    ];
+
+    let mut loaded = false;
+
+    // SSL_CERT_FILE env var takes priority
+    if let Ok(cert_file) = std::env::var("SSL_CERT_FILE")
+        && Path::new(&cert_file).is_file()
+    {
+        builder.set_ca_file(&cert_file).map_err(|e| {
+            ClientError::tls(format!("failed to load CA file '{}': {}", cert_file, e))
+        })?;
+        loaded = true;
+    }
+
+    if !loaded {
+        for path in CA_FILE_PATHS {
+            if Path::new(path).is_file() && builder.set_ca_file(path).is_ok() {
+                loaded = true;
+                break;
+            }
+        }
+    }
+
+    // Also try SSL_CERT_DIR / well-known cert directories
+    if let Ok(cert_dir) = std::env::var("SSL_CERT_DIR") {
+        if Path::new(&cert_dir).is_dir() {
+            let _ = builder.load_verify_locations(None, Some(Path::new(&cert_dir)));
+        }
+    } else {
+        for path in CA_DIR_PATHS {
+            let p = Path::new(path);
+            if p.is_dir() && builder.load_verify_locations(None, Some(p)).is_ok() {
+                break;
+            }
+        }
+    }
+
+    if !loaded {
+        // Last resort: try the compiled-in OpenSSL defaults
+        builder
+            .set_default_verify_paths()
+            .map_err(|e| ClientError::tls(format!("no system CA certificates found: {}", e)))?;
+    }
+
+    Ok(())
+}
+
 impl OpenSslConnector {
     fn new(
         config: &RequestConfig,
@@ -268,6 +338,8 @@ impl OpenSslConnector {
 
         if !config.should_verify_certs() {
             builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+        } else {
+            load_system_ca_certs(&mut builder)?;
         }
 
         if let Some(ref ciphers) = config.cipher_string {
@@ -501,13 +573,19 @@ enum AnyClient {
 #[derive(Clone, Hash, Eq, PartialEq)]
 enum ConnMode {
     /// No proxy — connect directly to target.
-    Direct,
+    Direct { verify_certs: bool },
     /// HTTP proxy + HTTP target — forward proxy (absolute-form URI to proxy).
     ForwardProxy(String),
     /// HTTP proxy + HTTPS target — CONNECT tunnel through proxy.
-    Tunnel(String),
+    Tunnel {
+        proxy_url: String,
+        verify_certs: bool,
+    },
     /// SOCKS5 proxy — works for both HTTP and HTTPS targets.
-    Socks5(String),
+    Socks5 {
+        proxy_url: String,
+        verify_certs: bool,
+    },
 }
 
 pub struct HyperClient {
@@ -532,8 +610,11 @@ impl HyperClient {
 
     /// Determine the connection mode for a given request config + target URI.
     fn conn_mode(config: &RequestConfig, target_uri: &http::Uri) -> Result<ConnMode, ClientError> {
+        let verify = config.should_verify_certs();
         match config.effective_proxy(target_uri.host().unwrap_or("")) {
-            None => Ok(ConnMode::Direct),
+            None => Ok(ConnMode::Direct {
+                verify_certs: verify,
+            }),
             Some(proxy_url) => {
                 let proxy_uri: http::Uri =
                     proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
@@ -545,12 +626,18 @@ impl HyperClient {
                         // HTTP proxy: use forward proxy for HTTP targets, tunnel for HTTPS
                         let target_is_https = target_uri.scheme_str() == Some("https");
                         if target_is_https {
-                            Ok(ConnMode::Tunnel(proxy_url.to_string()))
+                            Ok(ConnMode::Tunnel {
+                                proxy_url: proxy_url.to_string(),
+                                verify_certs: verify,
+                            })
                         } else {
                             Ok(ConnMode::ForwardProxy(proxy_url.to_string()))
                         }
                     }
-                    "socks5" | "socks5h" => Ok(ConnMode::Socks5(proxy_url.to_string())),
+                    "socks5" | "socks5h" => Ok(ConnMode::Socks5 {
+                        proxy_url: proxy_url.to_string(),
+                        verify_certs: verify,
+                    }),
                     _ => Err(ClientError::other(format!(
                         "unsupported proxy scheme '{}' (use http, https, socks5)",
                         proxy_scheme
@@ -581,14 +668,14 @@ impl HyperClient {
         let builder = Client::builder(TokioExecutor::new());
 
         let inner = match mode {
-            ConnMode::Direct => AnyClient::Direct(builder.build(connector)),
+            ConnMode::Direct { .. } => AnyClient::Direct(builder.build(connector)),
             ConnMode::ForwardProxy(_) => {
                 // Forward proxy doesn't use a cached hyper Client — it dispatches
                 // directly via http1::SendRequest in send_inner. This branch should
                 // never be reached.
                 unreachable!("ForwardProxy uses dispatch_forward_proxy, not get_or_build")
             }
-            ConnMode::Tunnel(proxy_url) => {
+            ConnMode::Tunnel { proxy_url, .. } => {
                 let proxy_uri: http::Uri =
                     proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
                         ClientError::invalid_url(format!("invalid proxy URL: {}", e))
@@ -597,7 +684,7 @@ impl HyperClient {
                 let tunnel = Tunnel::new(proxy_uri, connector);
                 AnyClient::Tunnel(builder.build(tunnel))
             }
-            ConnMode::Socks5(proxy_url) => {
+            ConnMode::Socks5 { proxy_url, .. } => {
                 let proxy_uri: http::Uri =
                     proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
                         ClientError::invalid_url(format!("invalid proxy URL: {}", e))
@@ -726,11 +813,22 @@ pub(crate) async fn connect_stream(
         ),
     );
 
-    let mut tcp = tokio::net::TcpStream::connect(&connect_addr)
-        .await
-        .map_err(|e| {
-            ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
-        })?;
+    let connect_timeout = Duration::from_secs(config.timeout());
+    let mut tcp = tokio::time::timeout(
+        connect_timeout,
+        tokio::net::TcpStream::connect(&connect_addr),
+    )
+    .await
+    .map_err(|_| {
+        ClientError::timeout(format!(
+            "TCP connect to {} timed out after {}s",
+            connect_addr,
+            config.timeout()
+        ))
+    })?
+    .map_err(|e| {
+        ClientError::connection(format!("failed to connect to {}: {}", connect_addr, e))
+    })?;
 
     // Capture peer IP for the target. When a proxy is in use, peer_addr
     // points at the proxy — useless to callers asking "what IP served
@@ -795,6 +893,8 @@ pub(crate) async fn connect_stream(
 
     if !config.should_verify_certs() {
         ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+    } else {
+        load_system_ca_certs(&mut ssl_builder)?;
     }
     if let Some(ref ciphers) = config.cipher_string {
         ssl_builder

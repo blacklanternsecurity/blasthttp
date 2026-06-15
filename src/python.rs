@@ -1171,6 +1171,7 @@ impl BlastHTTP {
         proxy=None,
         no_proxy=None,
         alpn_protocols=None,
+        timeout=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn raw_connect<'py>(
@@ -1185,6 +1186,7 @@ impl BlastHTTP {
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
         alpn_protocols: Option<Vec<String>>,
+        timeout: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut config = RequestConfig::new(url.clone());
         config.verify_certs = verify_certs;
@@ -1195,6 +1197,7 @@ impl BlastHTTP {
         config.proxy = proxy;
         config.no_proxy = no_proxy.unwrap_or_default();
         config.alpn_protocols = alpn_protocols;
+        config.timeout_seconds = timeout;
 
         let limiter = self.rate_limiter.clone();
         // Hand the limiter to the PyRawConnection so send_bytes /

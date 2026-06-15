@@ -231,6 +231,84 @@ async fn test_invalid_cipher_string_returns_error() {
     );
 }
 
+// ── SSL certificate verification ──────────────────────────────────
+
+#[tokio::test]
+async fn test_verify_certs_true_rejects_self_signed() {
+    let server = TlsTestServer::start(TlsServerConfig::default()).await;
+
+    let mut config = RequestConfig::new(server.url());
+    config.verify_certs = Some(true);
+    config.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_err(),
+        "verify_certs=true should reject self-signed cert"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_verify_certs_false_accepts_self_signed() {
+    let server = TlsTestServer::start(TlsServerConfig::default()).await;
+
+    let mut config = RequestConfig::new(server.url());
+    config.verify_certs = Some(false);
+    config.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_ok(),
+        "verify_certs=false should accept self-signed cert: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_verify_certs_cache_isolation() {
+    // First request with verify=false should succeed against self-signed
+    let server1 = TlsTestServer::start(TlsServerConfig::default()).await;
+
+    let mut config1 = RequestConfig::new(server1.url());
+    config1.verify_certs = Some(false);
+    config1.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result1 = client.send(&config1).await;
+    assert!(
+        result1.is_ok(),
+        "verify=false should succeed: {:?}",
+        result1.err()
+    );
+
+    server1.shutdown().await;
+
+    // Second request with verify=true to a new server on a different port
+    // must NOT reuse the cached non-verifying client
+    let server2 = TlsTestServer::start(TlsServerConfig::default()).await;
+
+    let mut config2 = RequestConfig::new(server2.url());
+    config2.verify_certs = Some(true);
+    config2.timeout_seconds = Some(5);
+
+    let result2 = client.send(&config2).await;
+    assert!(
+        result2.is_err(),
+        "verify=true should reject self-signed even after verify=false succeeded"
+    );
+
+    server2.shutdown().await;
+}
+
 // ── Invalid TLS version ───────────────────────────────────────────
 
 #[tokio::test]
