@@ -26,6 +26,10 @@ pub struct TlsServerConfig {
     pub max_tls_version: Option<SslVersion>,
     pub response_body: String,
     pub response_status: u16,
+    /// DNS SANs for the self-signed cert. Default: ["localhost"].
+    pub san_dns: Vec<String>,
+    /// IP SANs for the self-signed cert. Default: ["127.0.0.1"].
+    pub san_ip: Vec<String>,
 }
 
 impl Default for TlsServerConfig {
@@ -36,12 +40,14 @@ impl Default for TlsServerConfig {
             max_tls_version: None,
             response_body: "OK".to_string(),
             response_status: 200,
+            san_dns: vec!["localhost".to_string()],
+            san_ip: vec!["127.0.0.1".to_string()],
         }
     }
 }
 
 // Generate a self-signed cert + key pair in memory (no files needed)
-fn generate_self_signed() -> (PKey<openssl::pkey::Private>, X509) {
+fn generate_self_signed(config: &TlsServerConfig) -> (PKey<openssl::pkey::Private>, X509) {
     let rsa = Rsa::generate(2048).unwrap();
     let pkey = PKey::from_rsa(rsa).unwrap();
 
@@ -66,12 +72,14 @@ fn generate_self_signed() -> (PKey<openssl::pkey::Private>, X509) {
 
     builder.set_pubkey(&pkey).unwrap();
 
-    // Add SAN for localhost + 127.0.0.1
-    let san = SubjectAlternativeName::new()
-        .dns("localhost")
-        .ip("127.0.0.1")
-        .build(&builder.x509v3_context(None, None))
-        .unwrap();
+    let mut san = SubjectAlternativeName::new();
+    for dns in &config.san_dns {
+        san.dns(dns);
+    }
+    for ip in &config.san_ip {
+        san.ip(ip);
+    }
+    let san = san.build(&builder.x509v3_context(None, None)).unwrap();
     builder.append_extension(san).unwrap();
 
     builder.sign(&pkey, MessageDigest::sha256()).unwrap();
@@ -109,7 +117,7 @@ fn build_acceptor(config: &TlsServerConfig) -> SslAcceptor {
         )
         .unwrap();
 
-    let (pkey, cert) = generate_self_signed();
+    let (pkey, cert) = generate_self_signed(config);
     builder.set_private_key(&pkey).unwrap();
     builder.set_certificate(&cert).unwrap();
 
