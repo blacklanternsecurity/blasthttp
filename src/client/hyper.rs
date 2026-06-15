@@ -112,8 +112,7 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
         .subject_name()
         .entries_by_nid(openssl::nid::Nid::COMMONNAME)
         .next()
-        .and_then(|e| e.data().as_utf8().ok())
-        .map(|s| s.to_string());
+        .and_then(|e| e.data().to_string().ok());
 
     // Subject Alternative Names (DNS entries)
     let sans = cert
@@ -132,18 +131,18 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
         .subject_name()
         .entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS)
     {
-        if let Ok(s) = entry.data().as_utf8() {
-            emails.push(s.to_string());
+        if let Ok(s) = entry.data().to_string() {
+            emails.push(s);
         }
     }
     for entry in cert
         .issuer_name()
         .entries_by_nid(openssl::nid::Nid::PKCS9_EMAILADDRESS)
     {
-        if let Ok(s) = entry.data().as_utf8()
-            && !emails.contains(&s.to_string())
+        if let Ok(s) = entry.data().to_string()
+            && !emails.contains(&s)
         {
-            emails.push(s.to_string());
+            emails.push(s);
         }
     }
     // Also check SANs for email addresses
@@ -163,8 +162,7 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
         .issuer_name()
         .entries_by_nid(openssl::nid::Nid::COMMONNAME)
         .next()
-        .and_then(|e| e.data().as_utf8().ok())
-        .map(|s| s.to_string());
+        .and_then(|e| e.data().to_string().ok());
 
     // Validity dates (ASN1 time -> string)
     let not_before = cert.not_before().to_string();
