@@ -205,6 +205,7 @@ struct OpenSslConnector {
     // opened, read after each redirect hop so the right IP gets stamped
     // on the `RedirectHop` (or final `Response`).
     peer_slot: PeerSlot,
+    connect_timeout: Duration,
 }
 
 /// Encode a list of ALPN protocol names into the wire format OpenSSL
@@ -295,13 +296,18 @@ fn load_system_ca_certs(
 
     // Also try SSL_CERT_DIR / well-known cert directories
     if let Ok(cert_dir) = std::env::var("SSL_CERT_DIR") {
-        if Path::new(&cert_dir).is_dir() {
-            let _ = builder.load_verify_locations(None, Some(Path::new(&cert_dir)));
+        if Path::new(&cert_dir).is_dir()
+            && builder
+                .load_verify_locations(None, Some(Path::new(&cert_dir)))
+                .is_ok()
+        {
+            loaded = true;
         }
     } else {
         for path in CA_DIR_PATHS {
             let p = Path::new(path);
             if p.is_dir() && builder.load_verify_locations(None, Some(p)).is_ok() {
+                loaded = true;
                 break;
             }
         }
@@ -367,14 +373,17 @@ impl OpenSslConnector {
             .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
         let ssl = builder.build();
+        let connect_timeout = Duration::from_secs(config.timeout());
         let mut http = HttpConnector::new();
         http.enforce_http(false);
+        http.set_connect_timeout(Some(connect_timeout));
 
         Ok(OpenSslConnector {
             http,
             ssl,
             cert_slot,
             peer_slot,
+            connect_timeout,
         })
     }
 }
@@ -486,6 +495,7 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
         let ssl_connector = self.ssl.clone();
         let cert_slot = self.cert_slot.clone();
         let peer_slot = self.peer_slot.clone();
+        let connect_timeout = self.connect_timeout;
 
         Box::pin(async move {
             let tcp = http_fut.await?;
@@ -512,13 +522,35 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
                     .set_hostname(&host)
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
             }
+            // Hostname verification: when verify mode is PEER, pin the
+            // expected identity so OpenSSL checks the cert's SAN/CN.
+            if ssl_conf.verify_mode() != openssl::ssl::SslVerifyMode::NONE {
+                let param = ssl_conf.param_mut();
+                match host.parse::<std::net::IpAddr>() {
+                    Ok(ip) => param
+                        .set_ip(ip)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+                    Err(_) => param
+                        .set_host(&host)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+                }
+            }
 
             let mut stream = tokio_openssl::SslStream::new(ssl_conf, tcp_stream)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
-            Pin::new(&mut stream)
-                .connect()
+            tokio::time::timeout(connect_timeout, Pin::new(&mut stream).connect())
                 .await
+                .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "TLS handshake with {} timed out after {}s",
+                            host,
+                            connect_timeout.as_secs()
+                        ),
+                    ))
+                })?
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
             // Extract cert info after successful handshake
@@ -567,23 +599,40 @@ enum AnyClient {
     Socks5(Socks5ProxyClient),
 }
 
+/// TLS config fields that must be part of the client cache key.
+/// Requests with different TLS settings must not share a cached client.
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct TlsKey {
+    verify_certs: bool,
+    cipher_string: Option<String>,
+    min_tls_version: Option<String>,
+    max_tls_version: Option<String>,
+    alpn_protocols: Option<Vec<String>>,
+}
+
+impl TlsKey {
+    fn from_config(config: &RequestConfig) -> Self {
+        TlsKey {
+            verify_certs: config.should_verify_certs(),
+            cipher_string: config.cipher_string.clone(),
+            min_tls_version: config.min_tls_version.clone(),
+            max_tls_version: config.max_tls_version.clone(),
+            alpn_protocols: config.alpn_protocols.clone(),
+        }
+    }
+}
+
 /// Which connection mode to use for a given request.
 #[derive(Clone, Hash, Eq, PartialEq)]
 enum ConnMode {
     /// No proxy — connect directly to target.
-    Direct { verify_certs: bool },
+    Direct(TlsKey),
     /// HTTP proxy + HTTP target — forward proxy (absolute-form URI to proxy).
     ForwardProxy(String),
     /// HTTP proxy + HTTPS target — CONNECT tunnel through proxy.
-    Tunnel {
-        proxy_url: String,
-        verify_certs: bool,
-    },
+    Tunnel { proxy_url: String, tls: TlsKey },
     /// SOCKS5 proxy — works for both HTTP and HTTPS targets.
-    Socks5 {
-        proxy_url: String,
-        verify_certs: bool,
-    },
+    Socks5 { proxy_url: String, tls: TlsKey },
 }
 
 pub struct HyperClient {
@@ -608,11 +657,9 @@ impl HyperClient {
 
     /// Determine the connection mode for a given request config + target URI.
     fn conn_mode(config: &RequestConfig, target_uri: &http::Uri) -> Result<ConnMode, ClientError> {
-        let verify = config.should_verify_certs();
+        let tls = TlsKey::from_config(config);
         match config.effective_proxy(target_uri.host().unwrap_or("")) {
-            None => Ok(ConnMode::Direct {
-                verify_certs: verify,
-            }),
+            None => Ok(ConnMode::Direct(tls)),
             Some(proxy_url) => {
                 let proxy_uri: http::Uri =
                     proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
@@ -626,7 +673,7 @@ impl HyperClient {
                         if target_is_https {
                             Ok(ConnMode::Tunnel {
                                 proxy_url: proxy_url.to_string(),
-                                verify_certs: verify,
+                                tls,
                             })
                         } else {
                             Ok(ConnMode::ForwardProxy(proxy_url.to_string()))
@@ -634,7 +681,7 @@ impl HyperClient {
                     }
                     "socks5" | "socks5h" => Ok(ConnMode::Socks5 {
                         proxy_url: proxy_url.to_string(),
-                        verify_certs: verify,
+                        tls,
                     }),
                     _ => Err(ClientError::other(format!(
                         "unsupported proxy scheme '{}' (use http, https, socks5)",
@@ -666,7 +713,7 @@ impl HyperClient {
         let builder = Client::builder(TokioExecutor::new());
 
         let inner = match mode {
-            ConnMode::Direct { .. } => AnyClient::Direct(builder.build(connector)),
+            ConnMode::Direct(_) => AnyClient::Direct(builder.build(connector)),
             ConnMode::ForwardProxy(_) => {
                 // Forward proxy doesn't use a cached hyper Client — it dispatches
                 // directly via http1::SendRequest in send_inner. This branch should
@@ -856,17 +903,38 @@ pub(crate) async fn connect_stream(
     if let Some(ref p) = proxy_config {
         match p.scheme {
             ProxyScheme::Http => {
-                proxy::perform_http_connect(&mut tcp, &host, port).await?;
+                tokio::time::timeout(
+                    connect_timeout,
+                    proxy::perform_http_connect(&mut tcp, &host, port),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::timeout(format!(
+                        "proxy CONNECT to {}:{} timed out after {}s",
+                        host,
+                        port,
+                        config.timeout()
+                    ))
+                })??;
             }
             ProxyScheme::Socks5 => {
-                proxy::perform_socks5(
-                    &mut tcp,
-                    &host,
-                    port,
-                    p.username.as_deref(),
-                    p.password.as_deref(),
+                tokio::time::timeout(
+                    connect_timeout,
+                    proxy::perform_socks5(
+                        &mut tcp,
+                        &host,
+                        port,
+                        p.username.as_deref(),
+                        p.password.as_deref(),
+                    ),
                 )
-                .await?;
+                .await
+                .map_err(|_| {
+                    ClientError::timeout(format!(
+                        "SOCKS5 handshake timed out after {}s",
+                        config.timeout()
+                    ))
+                })??;
             }
         }
         debug_record(
@@ -934,13 +1002,32 @@ pub(crate) async fn connect_stream(
             .set_hostname(&host)
             .map_err(|e| ClientError::tls(format!("SNI setup failed: {}", e)))?;
     }
+    // Hostname verification: when verify mode is PEER, pin the
+    // expected identity so OpenSSL checks the cert's SAN/CN.
+    if ssl_conf.verify_mode() != openssl::ssl::SslVerifyMode::NONE {
+        let param = ssl_conf.param_mut();
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => param
+                .set_ip(ip)
+                .map_err(|e| ClientError::tls(format!("hostname verify setup failed: {}", e)))?,
+            Err(_) => param
+                .set_host(&host)
+                .map_err(|e| ClientError::tls(format!("hostname verify setup failed: {}", e)))?,
+        }
+    }
 
     let mut tls_stream = tokio_openssl::SslStream::new(ssl_conf, tcp)
         .map_err(|e| ClientError::tls(format!("TLS stream setup failed: {}", e)))?;
 
-    Pin::new(&mut tls_stream)
-        .connect()
+    tokio::time::timeout(connect_timeout, Pin::new(&mut tls_stream).connect())
         .await
+        .map_err(|_| {
+            ClientError::timeout(format!(
+                "TLS handshake with {} timed out after {}s",
+                host,
+                config.timeout()
+            ))
+        })?
         .map_err(|e| ClientError::tls(format!("TLS handshake failed: {}", e)))?;
 
     let cert_info = extract_cert_info(tls_stream.ssl());

@@ -309,6 +309,61 @@ async fn test_verify_certs_cache_isolation() {
     server2.shutdown().await;
 }
 
+// ── Hostname verification ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_verify_certs_rejects_hostname_mismatch() {
+    // Cert is valid for "wronghost.test" only — no SAN for localhost or 127.0.0.1.
+    // verify_certs=true must reject this connection.
+    let server = TlsTestServer::start(TlsServerConfig {
+        san_dns: vec!["wronghost.test".to_string()],
+        san_ip: vec![],
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = RequestConfig::new(server.url());
+    config.verify_certs = Some(true);
+    config.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_err(),
+        "verify_certs=true must reject cert with hostname mismatch"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_verify_false_ignores_hostname_mismatch() {
+    // Same wrong-host cert, but verify_certs=false bypasses all checks.
+    let server = TlsTestServer::start(TlsServerConfig {
+        san_dns: vec!["wronghost.test".to_string()],
+        san_ip: vec![],
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = RequestConfig::new(server.url());
+    config.verify_certs = Some(false);
+    config.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_ok(),
+        "verify_certs=false should accept any cert: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
 // ── Invalid TLS version ───────────────────────────────────────────
 
 #[tokio::test]
