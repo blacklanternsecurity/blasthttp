@@ -79,9 +79,7 @@ fn generate_self_signed(config: &TlsServerConfig) -> (PKey<openssl::pkey::Privat
     for ip in &config.san_ip {
         san.ip(ip);
     }
-    let san = san
-        .build(&builder.x509v3_context(None, None))
-        .unwrap();
+    let san = san.build(&builder.x509v3_context(None, None)).unwrap();
     builder.append_extension(san).unwrap();
 
     builder.sign(&pkey, MessageDigest::sha256()).unwrap();
