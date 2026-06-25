@@ -24,7 +24,7 @@ cargo add blasthttp
 
 - **Batch connection reuse** — connections are pooled and reused within a batch, dramatically reducing overhead when scanning many URLs on the same hosts
 - **Rust performance** — async I/O, zero-copy where possible, and native concurrency give significant speed improvements over pure Python HTTP clients
-- **SSL cert info on every request** — extracts CN, SANs, and issuer during the TLS handshake that's already happening, eliminating the need for a separate connection to gather this information
+- **SSL cert info on every request** — extracts CN, SANs, emails, issuer, validity dates, and fingerprint during the TLS handshake that's already happening, eliminating the need for a separate connection to gather this information
 - **All TLS ciphers available by default** — custom-compiled OpenSSL 3.3.2 with legacy provider baked in (RC4, 3DES, export ciphers, SSLv3) so you can connect to anything
 - **No cert validation by default** — offensive-first: connects to self-signed, expired, and misconfigured TLS without extra config
 - **HTTP/2 support** — automatic via ALPN negotiation, falls back to HTTP/1.1
@@ -79,7 +79,10 @@ Output is JSON (one object per response), including status, headers, redirect ch
   "cert_info": {
     "common_name": "example.com",
     "sans": ["example.com", "www.example.com"],
+    "emails": [],
     "issuer": "DigiCert Global G2",
+    "not_before": "2024-01-15T00:00:00Z",
+    "not_after": "2025-02-15T23:59:59Z",
     "fingerprint_sha256": "a0b1c2..."
   },
   "hash": {
@@ -103,6 +106,7 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `-d, --data` | Request body | |
 | `-l, --list` | File of URLs for batch mode | |
 | `-c, --concurrency` | Max concurrent requests (batch) | `50` |
+| `--rate-limit` | Requests per second (batch mode) | unlimited |
 | `-L, --follow-redirects` | Follow redirects | off |
 | `--max-redirects` | Max redirect hops | `10` |
 | `-t, --timeout` | Request timeout (seconds) | `10` |
@@ -179,6 +183,7 @@ asyncio.run(main())
 | `redirect_chain` | `list[RedirectHop]` | each hop carries its own `peer_ip` |
 | `elapsed_ms` / `elapsed` | `int` / `timedelta` | total request time |
 | `request` | `Request` | original `request.url` and `request.method` |
+| `debug_log` | `list[str]` | internal debug/timing lines |
 | `json()` | callable | `json.loads(self.text)` |
 | `raise_for_status()` | callable | raises `HTTPStatusError` on 4xx/5xx |
 
@@ -209,6 +214,78 @@ Two ways to issue the same workload — pick whichever matches how you want to c
 | `request_batch_stream(configs, ...)` | async iterator of `list[BatchResult]` chunks, in completion order | `async for batch in ...: for r in batch:` | A slow request shouldn't block faster peers behind it; you want to overlap consumer work with in-flight HTTP I/O; partial results are useful before the slowest finishes. |
 
 `request_batch_stream` yields up to 1000 results per chunk, or whatever has accumulated after ~200ms — the timeout flushes partial chunks so the consumer is never starved when results trickle in slowly. Both functions accept the same `(configs, concurrency=50, rate_limit=None)` arguments and respect `set_rate_limit()` identically.
+
+### `request()` parameters
+
+All parameters except `url` are optional:
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `url` | `str` | Target URL |
+| `method` | `str` | HTTP method (default `GET`) |
+| `headers` | `list[tuple[str, str]]` | Request headers |
+| `body` | `str \| bytes` | Request body (mutually exclusive with `files`) |
+| `files` | `dict` | Multipart form-data (httpx-style `files=`; see below) |
+| `timeout` | `int` | Request timeout in seconds |
+| `follow_redirects` | `bool` | Follow redirects |
+| `max_redirects` | `int` | Max redirect hops |
+| `verify_certs` | `bool` | Enable TLS cert validation (default `False`) |
+| `proxy` | `str` | HTTP/SOCKS proxy URL |
+| `no_proxy` | `list[str]` | Hosts that bypass the proxy |
+| `cipher_string` | `str` | OpenSSL cipher string |
+| `min_tls_version` | `str` | Minimum TLS version (`"1.0"`–`"1.3"`) |
+| `max_tls_version` | `str` | Maximum TLS version (`"1.0"`–`"1.3"`) |
+| `retries` | `int` | Number of retries on failure |
+| `retry_wait_min_ms` | `int` | Minimum backoff between retries (ms) |
+| `retry_wait_max_ms` | `int` | Maximum backoff between retries (ms) |
+| `max_body_size` | `int` | Max response body bytes to download |
+| `request_target` | `str` | Override the HTTP request-line URI |
+| `resolve_ip` | `str` | Connect to this IP (DNS pinning / `curl --resolve`) |
+
+`BatchConfig` accepts the same parameters (pass them as constructor kwargs).
+
+### Multipart file uploads
+
+Pass `files` to `request()` or `BatchConfig` for httpx-style multipart form-data. `body` and `files` are mutually exclusive — passing both raises `ValueError`.
+
+```python
+r = await client.request(
+    "https://example.com/upload",
+    method="POST",
+    files={"document": ("report.pdf", pdf_bytes, "application/pdf")},
+)
+```
+
+The `Content-Type: multipart/form-data` boundary header is set automatically.
+
+### Retries
+
+`request()`, `download()`, and `BatchConfig` support automatic retries with exponential backoff:
+
+```python
+r = await client.request(
+    "https://flaky-api.example.com/data",
+    retries=3,
+    retry_wait_min_ms=100,
+    retry_wait_max_ms=5000,
+)
+```
+
+### `download()` parameters
+
+`download(url, path, ...)` saves a response body to a file. It always follows redirects (up to 10 hops).
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `url` | `str` | Target URL |
+| `path` | `str` | Local file path to write |
+| `max_size` | `int` | Max response body bytes |
+| `timeout` | `int` | Request timeout in seconds |
+| `verify_certs` | `bool` | Enable TLS cert validation |
+| `proxy` | `str` | HTTP/SOCKS proxy URL |
+| `no_proxy` | `list[str]` | Hosts that bypass the proxy |
+| `headers` | `list[tuple[str, str]]` | Request headers |
+| `retries` | `int` | Number of retries on failure |
 
 ### DNS Pinning & Request-Line Control
 
