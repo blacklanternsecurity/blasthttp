@@ -53,7 +53,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache OpenSSL build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: vendor/openssl/install
           key: openssl-3.3.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-openssl.sh') }}
