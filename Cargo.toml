@@ -4,6 +4,8 @@ version = "0.9.0"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
 license = "GPL-3.0"
+# CI-only pin. Shipping it would override the toolchain of anyone building from the sdist.
+exclude = ["rust-toolchain.toml"]
 
 [lib]
 # When building as a Python module, we need a cdylib (shared library).
