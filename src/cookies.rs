@@ -174,11 +174,7 @@ fn default_path(request_path: &str) -> String {
 /// malformed or its `Domain` doesn't cover `request_host` (§5.3 step 6),
 /// which is what stops a redirect target from setting cookies for
 /// unrelated hosts.
-fn parse_set_cookie(
-    value: &str,
-    request_host: &str,
-    request_path: &str,
-) -> Option<(Cookie, bool)> {
+fn parse_set_cookie(value: &str, request_host: &str, request_path: &str) -> Option<(Cookie, bool)> {
     let mut parts = value.split(';');
     let pair = parts.next()?.trim();
     let (name, val) = pair.split_once('=')?;
@@ -347,7 +343,11 @@ mod tests {
     #[test]
     fn cookie_set_on_redirect_is_sent_to_next_hop() {
         let mut jar = CookieJar::new();
-        set(&mut jar, "https://example.com/login", &["session=abc123; Path=/"]);
+        set(
+            &mut jar,
+            "https://example.com/login",
+            &["session=abc123; Path=/"],
+        );
         assert_eq!(
             jar.header_for(&uri("https://example.com/dashboard")),
             Some("session=abc123".to_string())
@@ -367,7 +367,11 @@ mod tests {
     #[test]
     fn domain_attribute_covers_subdomains() {
         let mut jar = CookieJar::new();
-        set(&mut jar, "https://www.example.com/", &["a=1; Domain=example.com"]);
+        set(
+            &mut jar,
+            "https://www.example.com/",
+            &["a=1; Domain=example.com"],
+        );
         assert!(jar.header_for(&uri("https://example.com/")).is_some());
         assert!(jar.header_for(&uri("https://api.example.com/")).is_some());
         // Suffix match must land on a label boundary.
@@ -415,7 +419,10 @@ mod tests {
                 .is_some()
         );
         // Prefix must break on a boundary, not mid-segment.
-        assert!(jar.header_for(&uri("https://example.com/administrator")).is_none());
+        assert!(
+            jar.header_for(&uri("https://example.com/administrator"))
+                .is_none()
+        );
         assert!(jar.header_for(&uri("https://example.com/other")).is_none());
     }
 
@@ -482,7 +489,11 @@ mod tests {
     #[test]
     fn malformed_set_cookie_is_ignored() {
         let mut jar = CookieJar::new();
-        set(&mut jar, "https://example.com/", &["novalue", "=noname", ""]);
+        set(
+            &mut jar,
+            "https://example.com/",
+            &["novalue", "=noname", ""],
+        );
         assert!(jar.is_empty());
     }
 
