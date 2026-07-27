@@ -1,0 +1,12 @@
+# Pinned so a new Rust release can't break every open PR at once.
+#
+# CI lints with `-D warnings`, so any lint that a fresh stable adds becomes a
+# hard failure on every branch the moment it ships, whether or not the branch
+# touched the code in question. Pinning here (rather than in the workflow) also
+# means local `cargo clippy` matches CI, so you find these before pushing.
+#
+# Bump this deliberately, fix whatever the new version complains about in the
+# same commit.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
