@@ -869,6 +869,7 @@ impl BlastHTTP {
         timeout=None,
         follow_redirects=None,
         max_redirects=None,
+        redirect_cookies=None,
         verify_certs=None,
         proxy=None,
         no_proxy=None,
@@ -895,6 +896,7 @@ impl BlastHTTP {
         timeout: Option<u64>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
+        redirect_cookies: Option<bool>,
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
@@ -919,6 +921,7 @@ impl BlastHTTP {
             max_body_size,
             follow_redirects,
             max_redirects,
+            redirect_cookies,
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
@@ -1085,6 +1088,7 @@ impl BlastHTTP {
         no_proxy=None,
         headers=None,
         retries=None,
+        redirect_cookies=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn download<'py>(
@@ -1099,6 +1103,7 @@ impl BlastHTTP {
         no_proxy: Option<Vec<String>>,
         headers: Option<Vec<(String, String)>>,
         retries: Option<u32>,
+        redirect_cookies: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let config = RequestConfig {
             url,
@@ -1109,6 +1114,7 @@ impl BlastHTTP {
             max_body_size: max_size,
             follow_redirects: Some(true),
             max_redirects: Some(10),
+            redirect_cookies,
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
@@ -1338,6 +1344,8 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     max_redirects: Option<u32>,
     #[pyo3(get, set)]
+    redirect_cookies: Option<bool>,
+    #[pyo3(get, set)]
     verify_certs: Option<bool>,
     #[pyo3(get, set)]
     proxy: Option<String>,
@@ -1375,6 +1383,7 @@ impl PyBatchConfig {
         timeout=None,
         follow_redirects=None,
         max_redirects=None,
+        redirect_cookies=None,
         verify_certs=None,
         proxy=None,
         no_proxy=None,
@@ -1398,6 +1407,7 @@ impl PyBatchConfig {
         timeout: Option<u64>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
+        redirect_cookies: Option<bool>,
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
@@ -1420,6 +1430,7 @@ impl PyBatchConfig {
             timeout,
             follow_redirects,
             max_redirects,
+            redirect_cookies,
             verify_certs,
             proxy,
             no_proxy,
@@ -1447,6 +1458,7 @@ impl Clone for PyBatchConfig {
             timeout: self.timeout,
             follow_redirects: self.follow_redirects,
             max_redirects: self.max_redirects,
+            redirect_cookies: self.redirect_cookies,
             verify_certs: self.verify_certs,
             proxy: self.proxy.clone(),
             no_proxy: self.no_proxy.clone(),
@@ -1477,6 +1489,7 @@ impl PyBatchConfig {
             max_body_size: None,
             follow_redirects: self.follow_redirects,
             max_redirects: self.max_redirects,
+            redirect_cookies: self.redirect_cookies,
             verify_certs: self.verify_certs,
             proxy: self.proxy,
             no_proxy: self.no_proxy.unwrap_or_default(),

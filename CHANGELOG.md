@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Cookies set on a redirect hop are applied to the hops that follow it, the way a browser does. The jar is request-scoped, so nothing carries between requests
+- `redirect_cookies=False` (or `--no-redirect-cookies`) reverts to the previous behavior
+
 ## 0.9.0
 
 - `no_proxy` support — bypass the proxy for specific hosts, domains, IPs, or CIDRs

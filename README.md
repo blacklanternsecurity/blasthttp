@@ -109,6 +109,7 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `--rate-limit` | Requests per second (batch mode) | unlimited |
 | `-L, --follow-redirects` | Follow redirects | off |
 | `--max-redirects` | Max redirect hops | `10` |
+| `--no-redirect-cookies` | Don't apply cookies a redirect sets to later hops | off |
 | `-t, --timeout` | Request timeout (seconds) | `10` |
 | `--max-body-size` | Max response body (bytes) | 10 MB |
 | `--verify` | Enable TLS cert validation | off |
@@ -229,6 +230,7 @@ All parameters except `url` are optional:
 | `timeout` | `int` | Request timeout in seconds |
 | `follow_redirects` | `bool` | Follow redirects |
 | `max_redirects` | `int` | Max redirect hops |
+| `redirect_cookies` | `bool` | Apply cookies a redirect sets to later hops (default `True`) |
 | `verify_certs` | `bool` | Enable TLS cert validation (default `False`) |
 | `proxy` | `str` | HTTP/SOCKS proxy URL |
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
@@ -312,6 +314,28 @@ response = await client.request(
     request_target="http://internal.server/admin",
 )
 ```
+
+### Cookies across redirects
+
+When `follow_redirects` is on, a cookie set by one hop is sent on the hops that follow it, the same way a browser does. That's what makes a login or bot-check page work: it hands you a cookie along with the redirect, and the cookie has to be on the next request to count for anything. Without this you'd loop or land back on the same page.
+
+The jar is **request-scoped**. It's created when the request starts and dropped when it returns, so nothing carries into the next request and no two requests can see each other's cookies. A batch of 500 URLs runs 500 independent jars, which keeps every result reproducible on its own.
+
+Which cookie goes to which hop follows the usual rules (RFC 6265): a cookie with no `Domain` goes back only to the exact host that set it, a `Domain` that doesn't cover the host that sent it is thrown out, `Path` has to match, and `Secure` cookies never go over plain HTTP. So a redirect can't be used to walk a session cookie onto some other host.
+
+Pass `redirect_cookies=False` (or `--no-redirect-cookies` on the CLI) to turn it off and send only your own headers on every hop.
+
+```python
+# On by default.
+r = await client.request("https://example.com/login", method="POST",
+                         body="user=x&pass=y", follow_redirects=True)
+
+# Off: every hop gets only the headers you supplied.
+r = await client.request("https://example.com/login", follow_redirects=True,
+                         redirect_cookies=False)
+```
+
+Cookies you supply yourself via a `Cookie` header are merged with the chain's into a single header, yours first.
 
 ### Proxy exclusions (`no_proxy`)
 

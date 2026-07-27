@@ -10,6 +10,11 @@ pub struct RequestConfig {
     pub max_body_size: Option<usize>,
     pub follow_redirects: Option<bool>,
     pub max_redirects: Option<u32>,
+    /// Apply cookies a redirect hop sets to the hops that follow it, within
+    /// this one request (default: true). The jar is request-scoped, so
+    /// nothing carries into the next request and results stay reproducible.
+    /// Set to `false` to send only the caller's own headers on every hop.
+    pub redirect_cookies: Option<bool>,
     pub verify_certs: Option<bool>,
     pub proxy: Option<String>,
     /// Hosts that bypass `proxy` and connect directly (NO_PROXY equivalent).
@@ -55,6 +60,7 @@ impl RequestConfig {
             max_body_size: None,
             follow_redirects: None,
             max_redirects: None,
+            redirect_cookies: None,
             verify_certs: None,
             proxy: None,
             no_proxy: Vec::new(),
@@ -90,6 +96,14 @@ impl RequestConfig {
 
     pub fn redirect_limit(&self) -> u32 {
         self.max_redirects.unwrap_or(10)
+    }
+
+    /// Whether cookies set mid-chain are replayed on later hops. On by
+    /// default: it's what a browser does, and it's what lets a login or
+    /// bot-check page (the kind that sets a cookie and redirects you back
+    /// to where you started) actually resolve instead of looping.
+    pub fn should_forward_redirect_cookies(&self) -> bool {
+        self.redirect_cookies.unwrap_or(true)
     }
 
     pub fn should_verify_certs(&self) -> bool {
