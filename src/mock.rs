@@ -838,7 +838,7 @@ impl PyBlasthttpMock {
                     Some(body_obj)
                 };
                 let files_obj = bound.getattr("files").ok();
-                let files = files_obj.and_then(|f| if f.is_none() { None } else { Some(f) });
+                let files = files_obj.filter(|f| !f.is_none());
                 let (body_bytes, final_headers) =
                     crate::python::apply_body_and_files(body, files, headers)?;
                 mock_entries.push(MockBatchEntry {
