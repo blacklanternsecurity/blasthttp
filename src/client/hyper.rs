@@ -368,8 +368,20 @@ impl OpenSslConnector {
 
         // ALPN: advertise HTTP/2 and HTTP/1.1 support during TLS handshake.
         // The wire format is length-prefixed: [2, b'h', b'2', 8, b'h', b't', ...].
+        //
+        // An explicit `alpn_protocols` wins, which is the escape hatch for a
+        // server that answers correctly over one protocol but not the other.
+        // For instance one that puts a connection-specific header in an
+        // HTTP/2 response, which RFC 9113 8.2.2 forbids and hyper treats as
+        // fatal.
+        // Requests offering different lists don't share a pooled connection:
+        // `TlsKey` includes `alpn_protocols`.
+        let alpn_wire: Vec<u8> = match &config.alpn_protocols {
+            Some(protos) => encode_alpn_protocols(protos)?,
+            None => b"\x02h2\x08http/1.1".to_vec(),
+        };
         builder
-            .set_alpn_protos(b"\x02h2\x08http/1.1")
+            .set_alpn_protos(&alpn_wire)
             .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
         let ssl = builder.build();
@@ -1291,22 +1303,57 @@ async fn parse_response(
         &format!("   Raw body: {} bytes", raw_bytes.len()),
     );
 
+    // `read_body` stops at `max_body`, so a body that hit the cap is one we
+    // cut ourselves, mid-stream. Worth telling apart from a server whose
+    // body doesn't match what it declared, but only for the log: neither is
+    // grounds for dropping the response.
+    let cut_by_cap = raw_bytes.len() >= max_body;
+
     let body_bytes = if content_encoding.is_empty() {
         raw_bytes
     } else {
-        let decompressed = decompress(&content_encoding, &raw_bytes)?;
-        debug_record(
-            log,
-            v,
-            1,
-            &format!(
-                "   Decompressed ({}): {} -> {} bytes",
-                content_encoding,
-                raw_bytes.len(),
-                decompressed.len()
-            ),
-        );
-        decompressed
+        match decompress(&content_encoding, &raw_bytes, max_body) {
+            Ok(decompressed) => {
+                debug_record(
+                    log,
+                    v,
+                    1,
+                    &format!(
+                        "   Decompressed ({}): {} -> {} bytes",
+                        content_encoding,
+                        raw_bytes.len(),
+                        decompressed.len()
+                    ),
+                );
+                decompressed
+            }
+            // Nothing inflated at all. The status line and headers still
+            // arrived cleanly, and these are the bytes the server really
+            // sent, so hand them back undecoded rather than throw the whole
+            // response away. Discarding it would look identical to an
+            // unreachable host, which loses far more than a body we can't
+            // read. `read_body` already bounded these bytes, so returning
+            // them can't blow past the cap.
+            Err(e) => {
+                let reason = if cut_by_cap {
+                    "hit the max_body cap mid-stream"
+                } else {
+                    "does not match its declared encoding"
+                };
+                debug_record(
+                    log,
+                    v,
+                    1,
+                    &format!(
+                        "   Body {} ({}), returning {} bytes undecoded",
+                        reason,
+                        e.message,
+                        raw_bytes.len()
+                    ),
+                );
+                raw_bytes
+            }
+        }
     };
 
     if body_bytes.len() >= max_body {
@@ -1641,33 +1688,120 @@ impl HyperClient {
 
 // ── Decompression ─────────────────────────────────────────────────
 
-fn decompress(encoding: &str, data: &[u8]) -> Result<Vec<u8>, ClientError> {
-    match encoding {
-        "gzip" => {
-            let mut decoder = flate2::read::GzDecoder::new(data);
-            let mut buf = Vec::new();
-            decoder
-                .read_to_end(&mut buf)
-                .map_err(|e| ClientError::other(format!("gzip decompression failed: {}", e)))?;
-            Ok(buf)
+/// Inflate a response body, bounded to `max_size` bytes of output.
+///
+/// A response whose status line and headers arrived cleanly should not be
+/// thrown away just because the body didn't inflate, so this is deliberately
+/// forgiving in two places:
+///
+///   * An empty body is empty, whatever the header claims. Servers routinely
+///     put a `Content-Encoding` on a response that has no body at all: any
+///     bodyless redirect, a `HEAD` (which echoes the entity headers of the
+///     `GET` it mirrors), a `304` (which carries the headers a `200` would).
+///     Handing zero bytes to a decoder makes it report a missing stream,
+///     which is true but not interesting.
+///   * A stream that breaks partway keeps whatever inflated before the break.
+///     The usual cause is our own `max_size` cap in `read_body` cutting the
+///     compressed bytes mid-stream, so the remainder was never going to
+///     arrive. Partial content beats no response.
+///
+/// A body that yields nothing at all is still an error, so a genuinely
+/// mislabelled or corrupt body is still reported rather than passed off as
+/// empty.
+///
+/// `max_size` bounds the *output*, not the input. Compression ratios are
+/// unbounded in principle, so without this a small response can inflate into
+/// an arbitrarily large allocation. It bounds each layer of a stacked
+/// encoding, so the result never exceeds it either way.
+///
+/// `encoding` is the whole header value, which is an ordered list of the
+/// codings applied to the body, so undoing it means walking them in reverse.
+/// The caller lowercases it.
+fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Result<Vec<u8>, ClientError> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut codecs = Vec::new();
+    for token in encoding.split(',') {
+        match Codec::from_token(token.trim()) {
+            // `identity` means no coding was applied, so there is nothing
+            // to undo for that entry.
+            Some(Codec::Identity) => {}
+            Some(codec) => codecs.push(codec),
+            // A coding we can't undo hides whatever is beneath it, so
+            // decoding the inner layers would produce nonsense. Hand back
+            // the bytes as they arrived instead of guessing.
+            None => return Ok(data.to_vec()),
         }
-        "deflate" => {
-            let mut decoder = flate2::read::DeflateDecoder::new(data);
-            let mut buf = Vec::new();
-            decoder
-                .read_to_end(&mut buf)
-                .map_err(|e| ClientError::other(format!("deflate decompression failed: {}", e)))?;
-            Ok(buf)
+    }
+
+    let mut remaining = codecs.into_iter().rev();
+    let Some(outermost) = remaining.next() else {
+        // Nothing but `identity`.
+        return Ok(data.to_vec());
+    };
+
+    let mut out = decode_one(outermost, data, max_size)?;
+    for codec in remaining {
+        out = decode_one(codec, &out, max_size)?;
+    }
+    Ok(out)
+}
+
+/// One entry from a `Content-Encoding` list.
+#[derive(Clone, Copy)]
+enum Codec {
+    Gzip,
+    Deflate,
+    Brotli,
+    Identity,
+}
+
+impl Codec {
+    fn from_token(token: &str) -> Option<Self> {
+        match token {
+            // `x-gzip` is a deprecated alias for `gzip` that servers do
+            // still send.
+            "gzip" | "x-gzip" => Some(Codec::Gzip),
+            "deflate" => Some(Codec::Deflate),
+            "br" => Some(Codec::Brotli),
+            "identity" => Some(Codec::Identity),
+            _ => None,
         }
-        "br" => {
-            let mut decoder = brotli::Decompressor::new(data, 4096);
-            let mut buf = Vec::new();
-            decoder
-                .read_to_end(&mut buf)
-                .map_err(|e| ClientError::other(format!("brotli decompression failed: {}", e)))?;
-            Ok(buf)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Codec::Gzip => "gzip",
+            Codec::Deflate => "deflate",
+            Codec::Brotli => "brotli",
+            Codec::Identity => "identity",
         }
-        _ => Ok(data.to_vec()),
+    }
+}
+
+/// Undo a single coding. See `decompress` for why this tolerates a stream
+/// that breaks partway.
+fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Result<Vec<u8>, ClientError> {
+    let decoder: Box<dyn Read + '_> = match codec {
+        Codec::Gzip => Box::new(flate2::read::GzDecoder::new(data)),
+        Codec::Deflate => Box::new(flate2::read::DeflateDecoder::new(data)),
+        Codec::Brotli => Box::new(brotli::Decompressor::new(data, 4096)),
+        Codec::Identity => return Ok(data.to_vec()),
+    };
+
+    let mut buf = Vec::new();
+    match decoder.take(max_size as u64).read_to_end(&mut buf) {
+        Ok(_) => Ok(buf),
+        // `read_to_end` keeps the bytes it managed to read before the error,
+        // so a truncated stream still leaves usable content in `buf`.
+        Err(_) if !buf.is_empty() => Ok(buf),
+        Err(e) => Err(ClientError::other(format!(
+            "{} decompression failed: {}",
+            codec.name(),
+            e
+        ))),
     }
 }
 
@@ -1821,5 +1955,189 @@ mod tests {
         let config = RequestConfig::new("http://example.com/".to_string());
         let req = build_request(&uri, &config, false, true).unwrap();
         assert_eq!(req.uri().to_string(), "http://evil.com/admin");
+    }
+
+    // ── Decompression ─────────────────────────────────────────────
+
+    const NO_LIMIT: usize = 10 * 1024 * 1024;
+    const SAMPLE: &[u8] = b"<html><body>hello hello hello</body></html>";
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn deflate_bytes(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn brotli_bytes(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+            w.write_all(data).unwrap();
+        }
+        out
+    }
+
+    fn each_codec() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("gzip", gzip_bytes(SAMPLE)),
+            ("deflate", deflate_bytes(SAMPLE)),
+            ("br", brotli_bytes(SAMPLE)),
+        ]
+    }
+
+    #[test]
+    fn test_decompress_round_trips_every_codec() {
+        for (encoding, compressed) in each_codec() {
+            let out = decompress(encoding, &compressed, NO_LIMIT).unwrap();
+            assert_eq!(out, SAMPLE, "{} did not round-trip", encoding);
+        }
+    }
+
+    #[test]
+    fn test_decompress_empty_body_yields_empty_not_error() {
+        // Servers put a Content-Encoding on bodyless responses all the
+        // time: any redirect with no body, a HEAD, a 304. There is no
+        // stream to read, which is not a failure worth losing a
+        // response over.
+        for encoding in ["gzip", "deflate", "br"] {
+            let out = decompress(encoding, b"", NO_LIMIT).unwrap();
+            assert!(out.is_empty(), "{} should yield an empty body", encoding);
+        }
+    }
+
+    #[test]
+    fn test_decompress_keeps_partial_output_from_a_truncated_stream() {
+        // What `read_body`'s max_size cap produces: the compressed bytes
+        // end mid-stream, so the rest was never going to arrive. Keep
+        // whatever inflated rather than dropping the whole response.
+        //
+        // gzip and deflate emit as they go, so a cut stream still leaves
+        // a usable prefix. brotli is block-based and is covered
+        // separately below.
+        let big = SAMPLE.repeat(400);
+        for (encoding, compressed) in [("gzip", gzip_bytes(&big)), ("deflate", deflate_bytes(&big))]
+        {
+            let cut = &compressed[..compressed.len() / 2];
+            let out = decompress(encoding, cut, NO_LIMIT).unwrap();
+            assert!(!out.is_empty(), "{} recovered nothing", encoding);
+            assert!(
+                big.starts_with(&out),
+                "{} partial output should prefix the original",
+                encoding
+            );
+        }
+    }
+
+    #[test]
+    fn test_decompress_truncated_brotli_recovers_nothing() {
+        // brotli buffers a whole block before emitting, so a stream cut
+        // partway usually yields no output at all and reports an error.
+        // `parse_response` is what turns that into an empty body when the
+        // cut was our own cap, since the status and headers are still
+        // good. Pinned here because it is the reason that call-site
+        // handling exists.
+        let big = SAMPLE.repeat(400);
+        let compressed = brotli_bytes(&big);
+        let cut = &compressed[..compressed.len() / 2];
+        assert!(decompress("br", cut, NO_LIMIT).is_err());
+    }
+
+    #[test]
+    fn test_decompress_bounds_output_at_max_size() {
+        // Compression ratios are unbounded, so the cap has to apply to
+        // the inflated size. 200KB of zeros is a few hundred bytes on
+        // the wire.
+        let zeros = vec![0u8; 200_000];
+        for (encoding, compressed) in [
+            ("gzip", gzip_bytes(&zeros)),
+            ("deflate", deflate_bytes(&zeros)),
+            ("br", brotli_bytes(&zeros)),
+        ] {
+            assert!(compressed.len() < 1000, "{} test setup", encoding);
+            let out = decompress(encoding, &compressed, 4096).unwrap();
+            assert_eq!(out.len(), 4096, "{} exceeded the cap", encoding);
+        }
+    }
+
+    #[test]
+    fn test_decompress_errors_when_nothing_inflates() {
+        // A body that isn't the encoding it claims yields no output at
+        // all, so it is still reported rather than passed off as empty.
+        let err = decompress("gzip", b"this is not gzip", NO_LIMIT).unwrap_err();
+        assert!(
+            err.message.contains("decompression failed"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_decompress_passes_through_unknown_encoding() {
+        let out = decompress("identity", SAMPLE, NO_LIMIT).unwrap();
+        assert_eq!(out, SAMPLE);
+        // A coding we can't undo means the layers beneath it are out of
+        // reach, so the body comes back exactly as it arrived.
+        let gz = gzip_bytes(SAMPLE);
+        assert_eq!(decompress("magic-codec", &gz, NO_LIMIT).unwrap(), gz);
+        assert_eq!(decompress("gzip, magic-codec", &gz, NO_LIMIT).unwrap(), gz);
+    }
+
+    #[test]
+    fn test_decompress_accepts_the_x_gzip_alias() {
+        // Deprecated, but servers still send it, and treating it as
+        // unknown hands the caller compressed bytes as if they were the
+        // body.
+        let out = decompress("x-gzip", &gzip_bytes(SAMPLE), NO_LIMIT).unwrap();
+        assert_eq!(out, SAMPLE);
+    }
+
+    #[test]
+    fn test_decompress_undoes_stacked_encodings_in_reverse() {
+        // `Content-Encoding: gzip, br` means gzip was applied first and
+        // brotli on top of it, so brotli comes off first.
+        let stacked = brotli_bytes(&gzip_bytes(SAMPLE));
+        assert_eq!(decompress("gzip, br", &stacked, NO_LIMIT).unwrap(), SAMPLE);
+        // Whitespace around the list separator is normal.
+        assert_eq!(decompress("gzip,br", &stacked, NO_LIMIT).unwrap(), SAMPLE);
+
+        let three = deflate_bytes(&brotli_bytes(&gzip_bytes(SAMPLE)));
+        assert_eq!(
+            decompress("gzip, br, deflate", &three, NO_LIMIT).unwrap(),
+            SAMPLE
+        );
+    }
+
+    #[test]
+    fn test_decompress_ignores_identity_entries_in_a_list() {
+        let gz = gzip_bytes(SAMPLE);
+        assert_eq!(decompress("identity, gzip", &gz, NO_LIMIT).unwrap(), SAMPLE);
+        assert_eq!(decompress("gzip, identity", &gz, NO_LIMIT).unwrap(), SAMPLE);
+    }
+
+    #[test]
+    fn test_decompress_bounds_output_of_stacked_encodings() {
+        let zeros = vec![0u8; 200_000];
+        let stacked = brotli_bytes(&gzip_bytes(&zeros));
+        let out = decompress("gzip, br", &stacked, 4096).unwrap();
+        assert_eq!(out.len(), 4096);
+    }
+
+    #[test]
+    fn test_decompress_error_names_the_codec_that_failed() {
+        let err = decompress("br", b"not brotli at all", NO_LIMIT).unwrap_err();
+        assert!(
+            err.message.starts_with("brotli decompression failed"),
+            "unexpected message: {}",
+            err.message
+        );
     }
 }

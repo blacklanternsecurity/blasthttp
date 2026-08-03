@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0
+
+- Fix responses being discarded when `Content-Encoding` is declared on an empty body (bodyless redirects, `HEAD`, `304`)
+- `max_body_size` now bounds the decompressed body, not just the bytes read off the wire
+- A compressed body cut short by `max_body_size` keeps whatever inflated instead of failing the whole request
+- Decode stacked encodings (`Content-Encoding: gzip, br`) and the `x-gzip` alias, which previously returned the body still compressed
+- A body that doesn't match its declared `Content-Encoding` is returned undecoded instead of failing the request, so the response is never dropped over a body we can't read
+- `alpn_protocols` on `request()`, to pick the ALPN offer on the pooled path (default unchanged: h2 then http/1.1)
+
 ## 0.9.0
 
 - `no_proxy` support — bypass the proxy for specific hosts, domains, IPs, or CIDRs

@@ -176,6 +176,55 @@ async def test_alpn_negotiated_is_none_when_server_has_no_alpn(
     await conn.close()
 
 
+async def test_request_alpn_reaches_the_pooled_path(client, selfsigned_cert):
+    """`request()` also honors `alpn_protocols`, which is the escape
+    hatch for a server that only answers correctly over one protocol.
+    Asserted from the server side, since a Response doesn't expose the
+    negotiated protocol.
+
+    The server offers both and lets the client's list decide, so what it
+    records is what blasthttp actually asked for.
+    """
+    cert, key = selfsigned_cert
+    negotiated = []
+
+    async def handle(reader, writer):
+        ssl_obj = writer.get_extra_info("ssl_object")
+        negotiated.append(ssl_obj.selected_alpn_protocol() if ssl_obj else None)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    ctx = _server_ctx(cert, key, ["h2", "http/1.1"])
+    srv = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+    port = srv.sockets[0].getsockname()[1]
+
+    async def negotiate(**kw):
+        negotiated.clear()
+        # The server hangs up right after the handshake, so the request
+        # itself fails. The ALPN outcome is the point.
+        try:
+            await client.request(f"https://127.0.0.1:{port}/", timeout=10, verify_certs=False, **kw)
+        except Exception:
+            pass
+        return negotiated[0] if negotiated else None
+
+    try:
+        assert await negotiate(alpn_protocols=["http/1.1"]) == "http/1.1"
+        assert await negotiate(alpn_protocols=["h2"]) == "h2"
+        # Unspecified keeps the h2-first default the pooled path has
+        # always offered.
+        assert await negotiate() == "h2"
+    finally:
+        srv.close()
+        try:
+            await srv.wait_closed()
+        except Exception:
+            pass
+
+
 async def test_alpn_negotiated_is_none_for_plain_http():
     """Plain HTTP → no TLS → no ALPN. Using the existing local TCP
     echo fixture path rather than the TLS factory."""

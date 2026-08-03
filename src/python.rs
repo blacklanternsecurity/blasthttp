@@ -860,6 +860,11 @@ impl BlastHTTP {
     /// body is built as a `multipart/form-data` payload and the
     /// `Content-Type` header is set automatically (unless the caller
     /// supplied one). `files` takes precedence over `body`.
+    ///
+    /// `alpn_protocols` overrides what gets offered during the TLS
+    /// handshake; the default offers `["h2", "http/1.1"]`. Pass
+    /// `["http/1.1"]` to keep a request off HTTP/2, which is what you
+    /// want for a server that only answers correctly over HTTP/1.1.
     #[pyo3(signature = (
         url,
         method=None,
@@ -882,6 +887,7 @@ impl BlastHTTP {
         raw_path=None,
         request_target=None,
         resolve_ip=None,
+        alpn_protocols=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn request<'py>(
@@ -908,6 +914,7 @@ impl BlastHTTP {
         raw_path: Option<bool>,
         request_target: Option<String>,
         resolve_ip: Option<String>,
+        alpn_protocols: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (body_bytes, headers) = apply_body_and_files(body, files, headers)?;
         let config = RequestConfig {
@@ -931,7 +938,7 @@ impl BlastHTTP {
             raw_path,
             request_target,
             resolve_ip,
-            alpn_protocols: None,
+            alpn_protocols,
             verbosity: 0,
         };
 
