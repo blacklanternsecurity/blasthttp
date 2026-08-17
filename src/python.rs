@@ -477,6 +477,7 @@ impl PyResponse {
             request_url,
             request_method,
             debug_log: Vec::new(),
+            decode_error: None,
             body_cache: OnceLock::new(),
             raw_headers_cache: OnceLock::new(),
             cookies_cache: OnceLock::new(),
@@ -542,6 +543,19 @@ impl PyResponse {
     #[getter]
     fn content(&self) -> &[u8] {
         &self.inner.body_bytes
+    }
+
+    /// Why `content` is not decoded content, when it isn't.
+    ///
+    /// `None` on any ordinary response, including one with no
+    /// `Content-Encoding`. A string means the declared coding could not be
+    /// undone, so `content` holds the bytes exactly as the server sent them,
+    /// still encoded. The response is worth keeping either way, but code that
+    /// hashes, matches or diffs bodies should check this first rather than
+    /// treat compressed bytes as content.
+    #[getter]
+    fn decode_error(&self) -> Option<String> {
+        self.inner.decode_error.clone()
     }
 
     /// The originally-requested URL and method (httpx-style
@@ -862,9 +876,23 @@ impl BlastHTTP {
     /// supplied one). `files` takes precedence over `body`.
     ///
     /// `alpn_protocols` overrides what gets offered during the TLS
-    /// handshake; the default offers `["h2", "http/1.1"]`. Pass
-    /// `["http/1.1"]` to keep a request off HTTP/2, which is what you
-    /// want for a server that only answers correctly over HTTP/1.1.
+    /// handshake, and the request is then spoken over whatever the
+    /// server picks from that list. Pass `["http/1.1"]` to keep a
+    /// request off HTTP/2, which is what you want for a server that
+    /// only answers correctly over HTTP/1.1, or `["h2"]` to force
+    /// HTTP/2.
+    ///
+    /// The default differs by path, because the offer is part of the
+    /// client's TLS fingerprint and changing it changes how every
+    /// existing caller looks on the wire. Ordinary pooled requests
+    /// offer `["h2", "http/1.1"]`. Requests with `resolve_ip` or
+    /// `request_target` set bypass the pool and offer `["http/1.1"]`
+    /// alone.
+    ///
+    /// `request_target` cannot be combined with an HTTP/2 offer: h2
+    /// carries the target in `:path`, which is built from the URI, so
+    /// there is no request-line to control. Use `raw_connect` with
+    /// `blasthttp.h2` to write pseudo-headers directly.
     #[pyo3(signature = (
         url,
         method=None,

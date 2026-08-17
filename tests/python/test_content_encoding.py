@@ -31,18 +31,27 @@ INCOMPRESSIBLE = os.urandom(200_000)
 # Codecs blasthttp requests by default. `deflate` already tolerated an
 # empty body before the fix; gzip and br did not.
 ALL_ENCODINGS = ["gzip", "deflate", "br"]
-# Codecs the stdlib can produce, for the cases that need a real body.
-COMPRESSIBLE = ["gzip", "deflate"]
 
 
-def _compress(encoding, data):
-    if encoding == "gzip":
-        return gzip.compress(data)
-    if encoding == "deflate":
-        # Raw deflate, which is what blasthttp's DeflateDecoder expects.
-        c = zlib.compressobj(wbits=-zlib.MAX_WBITS)
-        return c.compress(data) + c.flush()
-    raise AssertionError(f"no stdlib compressor for {encoding}")
+def _raw_deflate(data):
+    """Bare deflate, no zlib wrapper (RFC 1951)."""
+    c = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    return c.compress(data) + c.flush()
+
+
+# Bodies for the `/ok` route: what to declare, and what to send. Both
+# shapes of `deflate` are here because both are in the wild.
+# RFC 9110 8.4.1.2 specifies it as a zlib stream (`zlib.compress`), which
+# is what IIS and several CDN fronts send, while plenty of other servers
+# send the bare deflate stream. Neither decoder can read the other's
+# input, so handling only one hands back a compressed body as content.
+OK_BODIES = {
+    "gzip": ("gzip", gzip.compress(PAYLOAD)),
+    "deflate": ("deflate", _raw_deflate(PAYLOAD)),
+    "deflate-zlib": ("deflate", zlib.compress(PAYLOAD)),
+}
+# Bodies the stdlib can produce, for the cases that need a real body.
+COMPRESSIBLE = list(OK_BODIES)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -52,7 +61,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html")
         if encoding:
-            self.send_header("Content-Encoding", encoding)
+            # A list means one header line per entry, which is how an edge
+            # that compresses an already-compressed body does it: it adds
+            # its own line rather than editing the one underneath.
+            for enc in [encoding] if isinstance(encoding, str) else encoding:
+                self.send_header("Content-Encoding", enc)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if send_body:
@@ -77,7 +90,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Encoding", arg)
             self.end_headers()
         elif kind == "ok":
-            self._respond(200, arg, _compress(arg, PAYLOAD))
+            encoding, body = OK_BODIES[arg]
+            self._respond(200, encoding, body)
+        elif kind == "doubled":
+            # Two Content-Encoding lines, both applied. Reading only the
+            # first peels one layer and calls the rest a body.
+            self._respond(200, ["gzip", "gzip"], gzip.compress(gzip.compress(PAYLOAD)))
+        elif kind == "doubled-mismatch":
+            # Two lines, only the first applied.
+            self._respond(200, ["gzip", "br"], gzip.compress(PAYLOAD))
         elif kind == "alias":
             # `x-gzip` is a deprecated alias for `gzip`, still seen.
             self._respond(200, "x-gzip", gzip.compress(PAYLOAD))
@@ -93,6 +114,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(200, "gzip, br", gzip.compress(PAYLOAD))
         elif kind == "incompressible":
             self._respond(200, "gzip", gzip.compress(INCOMPRESSIBLE))
+        elif kind == "incompressible-plain":
+            # No encoding, so the only cap that applies is the one on the
+            # wire read.
+            self._respond(200, None, INCOMPRESSIBLE)
         elif kind == "big":
             # ~5KB on the wire, 5MB inflated: only a bound on the output
             # makes a cap below that mean anything.
@@ -150,6 +175,45 @@ async def test_normal_compressed_body_still_decompresses(client, server, encodin
     r = await client.request(f"{server}/ok/{encoding}", timeout=10, follow_redirects=False)
     assert r.status_code == 200
     assert r.content == PAYLOAD
+    assert r.decode_error is None
+
+
+async def test_zlib_wrapped_deflate_is_not_handed_back_compressed(client, server):
+    """`Content-Encoding: deflate` is specified as a zlib stream, and only
+    raw deflate was handled, so the spec-conformant form came back as
+    compressed bytes with nothing to distinguish it from a real body."""
+    r = await client.request(f"{server}/ok/deflate-zlib", timeout=10, follow_redirects=False)
+    assert r.status_code == 200
+    assert r.content == PAYLOAD
+    assert r.content != zlib.compress(PAYLOAD)
+
+
+async def test_repeated_content_encoding_lines_are_all_undone(client, server):
+    """Two `Content-Encoding: gzip` lines mean the same thing as one line
+    reading `gzip, gzip`. Only the first was read, so one layer came off
+    and the still-compressed remainder was returned as the body."""
+    r = await client.request(f"{server}/doubled", timeout=10, follow_redirects=False)
+    assert r.status_code == 200
+    assert r.content == PAYLOAD
+    assert r.decode_error is None
+
+
+async def test_repeated_lines_preserve_both_headers(client, server):
+    """Joining the values for decoding must not flatten what arrived. Two
+    lines is a front-end/back-end disagreement worth seeing."""
+    r = await client.request(f"{server}/doubled", timeout=10, follow_redirects=False)
+    encodings = [v for k, v in r.headers.items() if k.lower() == "content-encoding"]
+    assert encodings == ["gzip", "gzip"]
+
+
+async def test_repeated_lines_that_were_not_all_applied_are_flagged(client, server):
+    """Declares gzip and br on separate lines but only applied gzip. Same
+    as the single-line case: keep the response, hand back what arrived,
+    and say the body isn't decoded."""
+    r = await client.request(f"{server}/doubled-mismatch", timeout=10, follow_redirects=False)
+    assert r.status_code == 200
+    assert r.content == gzip.compress(PAYLOAD)
+    assert r.decode_error is not None
 
 
 async def test_x_gzip_alias_is_decompressed(client, server):
@@ -162,10 +226,11 @@ async def test_x_gzip_alias_is_decompressed(client, server):
 
 async def test_unknown_encoding_returns_the_body_untouched(client, server):
     """Nothing to undo it with, so don't pretend. The caller gets the
-    bytes exactly as they arrived."""
+    bytes exactly as they arrived, and `decode_error` names the coding."""
     r = await client.request(f"{server}/unknown", timeout=10, follow_redirects=False)
     assert r.status_code == 200
     assert r.content == gzip.compress(PAYLOAD)
+    assert "magic-codec" in r.decode_error
 
 
 async def test_body_that_is_not_actually_compressed_is_returned_raw(client, server):
@@ -175,6 +240,7 @@ async def test_body_that_is_not_actually_compressed_is_returned_raw(client, serv
     r = await client.request(f"{server}/garbage", timeout=10, follow_redirects=False)
     assert r.status_code == 200
     assert r.content == b"this is not compressed"
+    assert "decompression failed" in r.decode_error
 
 
 async def test_declared_stack_that_was_not_applied_is_returned_raw(client, server):
@@ -183,6 +249,15 @@ async def test_declared_stack_that_was_not_applied_is_returned_raw(client, serve
     r = await client.request(f"{server}/mismatch", timeout=10, follow_redirects=False)
     assert r.status_code == 200
     assert r.content == gzip.compress(PAYLOAD)
+    assert r.decode_error is not None
+
+
+async def test_decode_error_is_none_when_there_is_no_encoding(client, server):
+    """The flag only speaks up when `content` isn't content. A plain
+    response has nothing to report."""
+    r = await client.request(f"{server}/nothing-here", timeout=10, follow_redirects=False)
+    assert r.status_code == 404
+    assert r.decode_error is None
 
 
 async def test_max_body_size_truncating_a_compressed_stream(client, server):
@@ -200,10 +275,12 @@ async def test_max_body_size_truncating_a_compressed_stream(client, server):
 
 async def test_max_body_size_too_small_to_inflate_anything(client, server):
     """A 2-byte cap doesn't even cover the gzip header, so nothing
-    inflates. The response survives with the bytes that did arrive."""
+    inflates. The response survives with the bytes that did arrive, and
+    says why they aren't content."""
     r = await client.request(f"{server}/ok/gzip", timeout=10, follow_redirects=False, max_body_size=2)
     assert r.status_code == 200
     assert r.content == gzip.compress(PAYLOAD)[:2]
+    assert "max_body cap" in r.decode_error
 
 
 async def test_max_body_size_bounds_the_decompressed_body(client, server):
@@ -212,6 +289,17 @@ async def test_max_body_size_bounds_the_decompressed_body(client, server):
     r = await client.request(f"{server}/big", timeout=20, follow_redirects=False, max_body_size=50_000)
     assert r.status_code == 200
     assert len(r.content) == 50_000
+
+
+async def test_max_body_size_bounds_the_wire_read(client, server):
+    """Exercises the streaming read against a real server: the cap stops
+    the read partway through a body the server is still writing, which
+    means abandoning the connection. That the read actually stops early,
+    rather than buffering and slicing, is pinned in the Rust unit tests
+    where the frames can be counted."""
+    r = await client.request(f"{server}/incompressible-plain", timeout=20, follow_redirects=False, max_body_size=1000)
+    assert r.status_code == 200
+    assert r.content == INCOMPRESSIBLE[:1000]
 
 
 async def test_empty_body_in_batch(client, server):

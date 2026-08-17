@@ -1051,27 +1051,59 @@ pub(crate) async fn connect_stream(
     Ok((Box::new(tls_stream), cert_info, negotiated_alpn, peer_ip))
 }
 
-/// One-shot HTTP/1.1 request over a direct, un-pooled connection. Used when
+/// One-shot request over a direct, un-pooled connection. Used when
 /// `resolve_ip` or `request_target` is set and hyper's Client wrapper would
 /// either normalize the URI (stripping absolute-form) or route through the
 /// shared connection pool, neither of which matches the caller's intent for
 /// these specialized requests (host_header, generic_ssrf, virtualhost
 /// discovery).
+///
+/// Speaks whatever ALPN negotiated. `connect_stream` offers http/1.1 alone
+/// unless the caller set `alpn_protocols`, so this is HTTP/1.1 by default and
+/// HTTP/2 only when asked for and agreed to.
 async fn dispatch_direct(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
 ) -> Result<(SingleResponse, Option<CertInfo>, Option<IpAddr>), ClientError> {
     let v = config.verbosity;
-    let (stream, cert_info, _alpn, peer_ip) = connect_stream(target_uri, config, log).await?;
+    let (stream, cert_info, alpn, peer_ip) = connect_stream(target_uri, config, log).await?;
     let io = hyper_util::rt::TokioIo::new(stream);
+    let h2 = alpn.as_deref() == Some("h2");
 
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| ClientError::connection(format!("HTTP handshake failed: {}", e)))?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    // HTTP/2 carries the target in `:path`, which hyper derives from the
+    // request URI, so there is no request-line for `request_target` to
+    // control and no way to hand hyper a verbatim one. Say so instead of
+    // quietly sending something else: an odd `:path` is a real primitive
+    // (H2-to-H1 downgrade smuggling), it just needs the raw path to build.
+    if h2 && config.request_target.is_some() {
+        return Err(ClientError::other(
+            "request_target cannot be sent over HTTP/2: hyper builds :path from the \
+             request URI, so a verbatim request target has nowhere to go. Offer \
+             http/1.1 in alpn_protocols, or use raw_connect with blasthttp.h2 to \
+             write the pseudo-headers yourself."
+                .to_string(),
+        ));
+    }
+
+    let mut sender = if h2 {
+        debug_record(log, v, 1, "   ALPN negotiated h2, dispatching over HTTP/2");
+        let (sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .map_err(|e| ClientError::connection(format!("HTTP/2 handshake failed: {}", e)))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        DirectSender::Http2(sender)
+    } else {
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| ClientError::connection(format!("HTTP handshake failed: {}", e)))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        DirectSender::Http1(sender)
+    };
 
     let request_uri = if let Some(ref rt) = config.request_target {
         rt.parse::<http::Uri>()
@@ -1087,8 +1119,16 @@ async fn dispatch_direct(
     // The low-level http1 sender below doesn't auto-populate Host from the URI
     // the way the pooled high-level client does, so we ask build_request to do
     // it manually.
-    let use_origin_form = config.request_target.is_none();
-    let request = build_request(&request_uri, config, use_origin_form, true)?;
+    //
+    // HTTP/2 has neither: hyper needs the whole URI to build :scheme,
+    // :authority and :path, and a Host header of our own would duplicate
+    // :authority in the HPACK block.
+    let request = if h2 {
+        build_request(&request_uri, config, false, false)?
+    } else {
+        let use_origin_form = config.request_target.is_none();
+        build_request(&request_uri, config, use_origin_form, true)?
+    };
 
     debug_record(log, v, 1, "   Request headers:");
     for (name, value) in request.headers() {
@@ -1113,6 +1153,25 @@ async fn dispatch_direct(
 
     let resp = parse_response(hyper_response, config, log).await?;
     Ok((resp, cert_info, peer_ip))
+}
+
+/// The two one-shot senders `dispatch_direct` can end up holding, picked by
+/// what ALPN negotiated. Separate types in hyper, same job here.
+enum DirectSender {
+    Http1(hyper::client::conn::http1::SendRequest<FullBody>),
+    Http2(hyper::client::conn::http2::SendRequest<FullBody>),
+}
+
+impl DirectSender {
+    async fn send_request(
+        &mut self,
+        request: hyper::Request<FullBody>,
+    ) -> hyper::Result<hyper::Response<hyper::body::Incoming>> {
+        match self {
+            DirectSender::Http1(s) => s.send_request(request).await,
+            DirectSender::Http2(s) => s.send_request(request).await,
+        }
+    }
 }
 
 /// Stream types returned by `connect_stream`: plain TCP or TLS over TCP.
@@ -1287,33 +1346,73 @@ async fn parse_response(
         headers.push((name.to_string(), val_str));
     }
 
+    // A repeated `Content-Encoding` line means the same thing as one line
+    // carrying the values comma-joined, in the order they arrived (RFC 9110
+    // 5.3), and stacked codings show up both ways: an edge that compresses
+    // an already-compressed body usually adds its own line rather than
+    // editing the one below it. Reading only the first line would peel one
+    // layer and hand back a still-compressed body. The lines themselves are
+    // already in `headers` untouched, so a caller looking for the
+    // front-end/back-end disagreement can still see it.
     let content_encoding = hyper_response
         .headers()
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
+        .get_all("content-encoding")
+        .iter()
+        // A value that isn't text is a coding we can't name, let alone
+        // undo. `decompress` hands the body back as it arrived for a token
+        // it doesn't recognize, which is what we want here.
+        .map(|v| v.to_str().unwrap_or("<unreadable>"))
+        .collect::<Vec<_>>()
+        .join(",")
         .to_lowercase();
 
     let max_body = config.max_body();
-    let raw_bytes = read_body(hyper_response.into_body(), max_body).await?;
+    let (raw_bytes, cut_by_cap) = read_body(hyper_response.into_body(), max_body).await?;
     debug_record(
         log,
         v,
         1,
         &format!("   Raw body: {} bytes", raw_bytes.len()),
     );
+    if cut_by_cap {
+        debug_record(
+            log,
+            v,
+            1,
+            &format!("   Body cut at the {} byte max_body cap", max_body),
+        );
+    }
 
-    // `read_body` stops at `max_body`, so a body that hit the cap is one we
-    // cut ourselves, mid-stream. Worth telling apart from a server whose
-    // body doesn't match what it declared, but only for the log: neither is
-    // grounds for dropping the response.
-    let cut_by_cap = raw_bytes.len() >= max_body;
+    // Which shape of `deflate` a server sends says something about what is
+    // in front of it, so record it while the wire bytes are still in hand.
+    // Only the outermost coding describes those bytes, and that's the last
+    // entry in the list. See `decode_deflate`.
+    if content_encoding
+        .rsplit(',')
+        .next()
+        .is_some_and(|token| token.trim() == "deflate")
+    {
+        debug_record(
+            log,
+            v,
+            1,
+            &format!(
+                "   deflate body: {}",
+                if has_zlib_header(&raw_bytes) {
+                    "zlib header present (RFC 1950)"
+                } else {
+                    "no zlib header, raw stream (RFC 1951)"
+                }
+            ),
+        );
+    }
 
-    let body_bytes = if content_encoding.is_empty() {
-        raw_bytes
+    let (body_bytes, decode_error) = if content_encoding.is_empty() {
+        (raw_bytes, None)
     } else {
-        match decompress(&content_encoding, &raw_bytes, max_body) {
-            Ok(decompressed) => {
+        let decoded = decompress(&content_encoding, &raw_bytes, max_body);
+        match decoded.undecoded {
+            None => {
                 debug_record(
                     log,
                     v,
@@ -1322,36 +1421,39 @@ async fn parse_response(
                         "   Decompressed ({}): {} -> {} bytes",
                         content_encoding,
                         raw_bytes.len(),
-                        decompressed.len()
+                        decoded.body.len()
                     ),
                 );
-                decompressed
+                (decoded.body, None)
             }
             // Nothing inflated at all. The status line and headers still
             // arrived cleanly, and these are the bytes the server really
             // sent, so hand them back undecoded rather than throw the whole
             // response away. Discarding it would look identical to an
             // unreachable host, which loses far more than a body we can't
-            // read. `read_body` already bounded these bytes, so returning
-            // them can't blow past the cap.
-            Err(e) => {
-                let reason = if cut_by_cap {
-                    "hit the max_body cap mid-stream"
+            // read.
+            //
+            // The reason travels with the response as `decode_error`, since
+            // a caller hashing or matching bodies has no other way to tell
+            // compressed bytes from content, and the debug log only reaches
+            // them at verbosity >= 1.
+            Some(reason) => {
+                let cause = if cut_by_cap {
+                    format!("{} (body hit the max_body cap mid-stream)", reason)
                 } else {
-                    "does not match its declared encoding"
+                    reason
                 };
                 debug_record(
                     log,
                     v,
                     1,
                     &format!(
-                        "   Body {} ({}), returning {} bytes undecoded",
-                        reason,
-                        e.message,
-                        raw_bytes.len()
+                        "   Body returned undecoded, {} bytes: {}",
+                        decoded.body.len(),
+                        cause
                     ),
                 );
-                raw_bytes
+                (decoded.body, Some(cause))
             }
         }
     };
@@ -1370,6 +1472,7 @@ async fn parse_response(
         headers,
         body_bytes,
         location,
+        decode_error,
     })
 }
 
@@ -1378,6 +1481,9 @@ struct SingleResponse {
     headers: Vec<(String, String)>,
     body_bytes: Vec<u8>,
     location: Option<String>,
+    /// Why `body_bytes` is not decoded content, when it isn't. See
+    /// `Response::decode_error`.
+    decode_error: Option<String>,
 }
 
 fn is_redirect(status: u16) -> bool {
@@ -1549,6 +1655,7 @@ impl HyperClient {
                 request_url: config.url.clone(),
                 request_method: config.method().to_string(),
                 debug_log,
+                decode_error: resp.decode_error,
                 body_cache: std::sync::OnceLock::new(),
                 raw_headers_cache: std::sync::OnceLock::new(),
                 cookies_cache: std::sync::OnceLock::new(),
@@ -1677,6 +1784,7 @@ impl HyperClient {
                 request_url: config.url.clone(),
                 request_method: config.method().to_string(),
                 debug_log,
+                decode_error: resp.decode_error,
                 body_cache: std::sync::OnceLock::new(),
                 raw_headers_cache: std::sync::OnceLock::new(),
                 cookies_cache: std::sync::OnceLock::new(),
@@ -1705,26 +1813,34 @@ impl HyperClient {
 ///     compressed bytes mid-stream, so the remainder was never going to
 ///     arrive. Partial content beats no response.
 ///
-/// A body that yields nothing at all is still an error, so a genuinely
-/// mislabelled or corrupt body is still reported rather than passed off as
-/// empty.
+/// A body that yields nothing at all comes back as it arrived, marked
+/// undecoded, so a genuinely mislabelled or corrupt body is still reported
+/// rather than passed off as empty or as content. See `Decoded`.
 ///
-/// `max_size` bounds the *output*, not the input. Compression ratios are
-/// unbounded in principle, so without this a small response can inflate into
-/// an arbitrarily large allocation. It bounds each layer of a stacked
-/// encoding, so the result never exceeds it either way.
+/// `max_size` bounds the output of each layer here. `read_body` bounds the
+/// input separately, since both directions need it: compression ratios are
+/// unbounded in principle, so a small response can inflate into an
+/// arbitrarily large allocation, and a response can be arbitrarily large on
+/// the wire to begin with.
 ///
 /// `encoding` is the whole header value, which is an ordered list of the
 /// codings applied to the body, so undoing it means walking them in reverse.
 /// The caller lowercases it.
-fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Result<Vec<u8>, ClientError> {
+fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
     if data.is_empty() {
-        return Ok(Vec::new());
+        return Decoded::content(Vec::new());
     }
 
     let mut codecs = Vec::new();
     for token in encoding.split(',') {
-        match Codec::from_token(token.trim()) {
+        let token = token.trim();
+        // Empty list elements are legal noise a recipient is meant to
+        // ignore (RFC 9110 5.6.1.2), and joining repeated header lines can
+        // produce them from a line that carried no value at all.
+        if token.is_empty() {
+            continue;
+        }
+        match Codec::from_token(token) {
             // `identity` means no coding was applied, so there is nothing
             // to undo for that entry.
             Some(Codec::Identity) => {}
@@ -1732,21 +1848,64 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Result<Vec<u8>, C
             // A coding we can't undo hides whatever is beneath it, so
             // decoding the inner layers would produce nonsense. Hand back
             // the bytes as they arrived instead of guessing.
-            None => return Ok(data.to_vec()),
+            None => {
+                return Decoded::raw(data, format!("unsupported content-encoding '{}'", token));
+            }
         }
     }
 
     let mut remaining = codecs.into_iter().rev();
     let Some(outermost) = remaining.next() else {
         // Nothing but `identity`.
-        return Ok(data.to_vec());
+        return Decoded::content(data.to_vec());
     };
 
-    let mut out = decode_one(outermost, data, max_size)?;
+    let mut out = match decode_one(outermost, data, max_size) {
+        Ok(out) => out,
+        Err(reason) => return Decoded::raw(data, reason),
+    };
     for codec in remaining {
-        out = decode_one(codec, &out, max_size)?;
+        out = match decode_one(codec, &out, max_size) {
+            Ok(next) => next,
+            // An inner layer didn't come off, so what we have is a
+            // half-peeled body: not content, and not what arrived either.
+            // Hand back the original bytes, which at least are what the
+            // server sent.
+            Err(reason) => return Decoded::raw(data, reason),
+        };
     }
-    Ok(out)
+    Decoded::content(out)
+}
+
+/// The outcome of `decompress`: bytes for the caller, plus whether they are
+/// actually decoded content.
+///
+/// There is no error variant on purpose. A body that won't decode is not
+/// grounds for dropping a response whose status line and headers arrived
+/// cleanly, so every path here produces bytes. What the caller must not do is
+/// mistake one kind for the other, which is what `undecoded` is for.
+struct Decoded {
+    body: Vec<u8>,
+    /// `None` when `body` is content: every declared coding came off (though
+    /// it may be short, if a stream broke or a cap cut it). `Some(reason)`
+    /// when `body` is the bytes as they arrived, still encoded.
+    undecoded: Option<String>,
+}
+
+impl Decoded {
+    fn content(body: Vec<u8>) -> Self {
+        Decoded {
+            body,
+            undecoded: None,
+        }
+    }
+
+    fn raw(data: &[u8], reason: String) -> Self {
+        Decoded {
+            body: data.to_vec(),
+            undecoded: Some(reason),
+        }
+    }
 }
 
 /// One entry from a `Content-Encoding` list.
@@ -1781,47 +1940,124 @@ impl Codec {
     }
 }
 
-/// Undo a single coding. See `decompress` for why this tolerates a stream
-/// that breaks partway.
-fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Result<Vec<u8>, ClientError> {
-    let decoder: Box<dyn Read + '_> = match codec {
-        Codec::Gzip => Box::new(flate2::read::GzDecoder::new(data)),
-        Codec::Deflate => Box::new(flate2::read::DeflateDecoder::new(data)),
-        Codec::Brotli => Box::new(brotli::Decompressor::new(data, 4096)),
-        Codec::Identity => return Ok(data.to_vec()),
+/// Undo a single coding. The error is a reason string rather than a
+/// `ClientError` because nothing here is fatal to a response: see `Decoded`.
+fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
+    match codec {
+        Codec::Gzip => read_bounded(flate2::read::GzDecoder::new(data), max_size, codec),
+        Codec::Deflate => decode_deflate(data, max_size),
+        Codec::Brotli => read_bounded(brotli::Decompressor::new(data, 4096), max_size, codec),
+        Codec::Identity => Ok(data.to_vec()),
+    }
+}
+
+/// Undo `Content-Encoding: deflate`, which arrives in two different shapes.
+///
+/// RFC 9110 8.4.1.2 defines it as a zlib stream (RFC 1950) wrapping deflate
+/// data, and that is what IIS and several CDN fronts send. Plenty of other
+/// servers send a bare deflate stream (RFC 1951) with no zlib wrapper.
+/// Neither decoder can read the other's input, and we ask for `deflate` on
+/// every request, so both shapes have to work or a real body comes back
+/// looking like garbage.
+///
+/// The first two bytes say which one it is: the low nibble of the first byte
+/// is the compression method (8 for deflate) and the pair read big-endian is
+/// a multiple of 31. A raw stream can satisfy that by coincidence, so the
+/// flavor the header points at is tried first and the other one is the
+/// fallback.
+fn decode_deflate(data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
+    let attempt = |zlib: bool| -> Result<Vec<u8>, String> {
+        if zlib {
+            read_bounded(
+                flate2::read::ZlibDecoder::new(data),
+                max_size,
+                Codec::Deflate,
+            )
+        } else {
+            read_bounded(
+                flate2::read::DeflateDecoder::new(data),
+                max_size,
+                Codec::Deflate,
+            )
+        }
     };
 
+    let zlib_first = has_zlib_header(data);
+    match attempt(zlib_first) {
+        Ok(out) if !out.is_empty() => Ok(out),
+        // Whatever the header suggested didn't inflate. Report its failure
+        // rather than the fallback's, since it's the likelier diagnosis.
+        expected => match attempt(!zlib_first) {
+            Ok(out) if !out.is_empty() => Ok(out),
+            _ => expected,
+        },
+    }
+}
+
+/// Whether `data` starts with something that reads as a zlib header (RFC 1950
+/// 2.2): compression method 8 in the low nibble of CMF, and a CMF/FLG pair
+/// that is a multiple of 31. True for every zlib stream, and true for a raw
+/// deflate stream only by coincidence, which is why `decode_deflate` keeps a
+/// fallback rather than trusting this outright.
+fn has_zlib_header(data: &[u8]) -> bool {
+    match data {
+        [cmf, flg, ..] => cmf & 0x0f == 8 && u16::from_be_bytes([*cmf, *flg]) % 31 == 0,
+        _ => false,
+    }
+}
+
+/// Run a decoder, keeping at most `max_size` bytes of output.
+fn read_bounded<R: Read>(reader: R, max_size: usize, codec: Codec) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    match decoder.take(max_size as u64).read_to_end(&mut buf) {
+    match reader.take(max_size as u64).read_to_end(&mut buf) {
         Ok(_) => Ok(buf),
         // `read_to_end` keeps the bytes it managed to read before the error,
         // so a truncated stream still leaves usable content in `buf`.
         Err(_) if !buf.is_empty() => Ok(buf),
-        Err(e) => Err(ClientError::other(format!(
-            "{} decompression failed: {}",
-            codec.name(),
-            e
-        ))),
+        Err(e) => Err(format!("{} decompression failed: {}", codec.name(), e)),
     }
 }
 
-async fn read_body<B>(body: B, max_size: usize) -> Result<Vec<u8>, ClientError>
+/// Read a response body, stopping once `max_size` bytes are in hand. Returns
+/// the bytes and whether the cap cut the body short.
+///
+/// The cap bounds what gets read off the wire, not just what gets kept.
+/// Buffering a whole body before truncating it leaves `max_body_size` looking
+/// like a limit while a target can still answer with a body of any size,
+/// including one that never ends, so a caller sweeping untrusted hosts has no
+/// bound on memory at all. Stopping early means walking away mid-response,
+/// which costs the connection (it can't be reused) and is visible to the
+/// server. That is the better trade when the alternative is unbounded, and a
+/// caller who needs the connection intact has `raw_connect`.
+async fn read_body<B>(body: B, max_size: usize) -> Result<(Vec<u8>, bool), ClientError>
 where
     B: hyper::body::Body<Data = bytes::Bytes>,
     B::Error: std::fmt::Display,
 {
-    let collected = body
-        .collect()
-        .await
-        .map_err(|e| ClientError::connection(format!("failed to read body: {}", e)))?;
+    let mut body = std::pin::pin!(body);
+    let mut out: Vec<u8> = Vec::new();
 
-    let bytes = collected.to_bytes();
-
-    if bytes.len() > max_size {
-        Ok(bytes[..max_size].to_vec())
-    } else {
-        Ok(bytes.to_vec())
+    while let Some(frame) = body.frame().await {
+        let frame =
+            frame.map_err(|e| ClientError::connection(format!("failed to read body: {}", e)))?;
+        // Trailers carry no body bytes.
+        let Some(chunk) = frame.data_ref() else {
+            continue;
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        let room = max_size - out.len();
+        if chunk.len() > room {
+            out.extend_from_slice(&chunk[..room]);
+            return Ok((out, true));
+        }
+        out.extend_from_slice(chunk);
     }
+
+    // Falling out of the loop means the body ended on its own, even if it
+    // ended exactly on the cap.
+    Ok((out, false))
 }
 
 #[cfg(test)]
@@ -1969,9 +2205,19 @@ mod tests {
         e.finish().unwrap()
     }
 
+    /// Bare deflate, no zlib wrapper (RFC 1951).
     fn deflate_bytes(data: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// deflate inside a zlib wrapper (RFC 1950), which is what
+    /// `Content-Encoding: deflate` is actually specified as.
+    fn zlib_bytes(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         e.write_all(data).unwrap();
         e.finish().unwrap()
     }
@@ -1994,12 +2240,84 @@ mod tests {
         ]
     }
 
+    /// `decompress` reports both the bytes and whether they count as
+    /// content. Most cases care about one or the other, so assert the
+    /// classification here and hand back the part under test.
+    fn decoded(encoding: &str, data: &[u8], max: usize) -> Vec<u8> {
+        let out = decompress(encoding, data, max);
+        assert!(
+            out.undecoded.is_none(),
+            "expected decoded content, got undecoded: {:?}",
+            out.undecoded
+        );
+        out.body
+    }
+
+    fn undecoded(encoding: &str, data: &[u8], max: usize) -> (Vec<u8>, String) {
+        let out = decompress(encoding, data, max);
+        let reason = out
+            .undecoded
+            .expect("expected the body to come back undecoded");
+        (out.body, reason)
+    }
+
     #[test]
     fn test_decompress_round_trips_every_codec() {
         for (encoding, compressed) in each_codec() {
-            let out = decompress(encoding, &compressed, NO_LIMIT).unwrap();
+            let out = decoded(encoding, &compressed, NO_LIMIT);
             assert_eq!(out, SAMPLE, "{} did not round-trip", encoding);
         }
+    }
+
+    #[test]
+    fn test_decompress_accepts_both_deflate_flavors() {
+        // RFC 9110 8.4.1.2 says `deflate` is a zlib stream, which is what
+        // IIS and several CDN fronts send. Others send bare deflate. Only
+        // handling one of the two hands back a compressed body as if it
+        // were content, since neither decoder can read the other's input.
+        for (flavor, compressed) in [
+            ("zlib-wrapped", zlib_bytes(SAMPLE)),
+            ("raw", deflate_bytes(SAMPLE)),
+        ] {
+            let out = decoded("deflate", &compressed, NO_LIMIT);
+            assert_eq!(out, SAMPLE, "{} deflate did not round-trip", flavor);
+        }
+    }
+
+    #[test]
+    fn test_zlib_header_detection() {
+        assert!(has_zlib_header(&zlib_bytes(SAMPLE)));
+        // Default-compression zlib output starts 0x78 0x9c.
+        assert!(has_zlib_header(&[0x78, 0x9c]));
+        assert!(!has_zlib_header(&deflate_bytes(SAMPLE)));
+        // Too short to carry a header, and not a header anyway.
+        assert!(!has_zlib_header(b"x"));
+        assert!(!has_zlib_header(b""));
+        // Right method nibble, wrong check value.
+        assert!(!has_zlib_header(&[0x78, 0x9d]));
+    }
+
+    #[test]
+    fn test_decompress_deflate_falls_back_when_the_header_misleads() {
+        // The zlib header check can match a raw stream by coincidence,
+        // which is the whole reason for the fallback. Only one shape of raw
+        // stream can collide: a non-final stored block, since the method
+        // nibble pins the first three bits to BFINAL=0, BTYPE=00. Here a
+        // stored block of 29 bytes lands on 0x08 0x1d, which also happens
+        // to be a multiple of 31.
+        let payload = b"twenty-nine bytes of content!";
+        assert_eq!(payload.len(), 29, "test setup");
+        let mut raw = vec![0x08, 0x1d, 0x00, 0xe2, 0xff];
+        raw.extend_from_slice(payload);
+        // Final, empty stored block to end the stream.
+        raw.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+
+        assert!(
+            has_zlib_header(&raw),
+            "test setup: these bytes must look like a zlib header"
+        );
+        let out = decoded("deflate", &raw, NO_LIMIT);
+        assert_eq!(out, payload, "fallback to raw deflate didn't happen");
     }
 
     #[test]
@@ -2009,7 +2327,7 @@ mod tests {
         // stream to read, which is not a failure worth losing a
         // response over.
         for encoding in ["gzip", "deflate", "br"] {
-            let out = decompress(encoding, b"", NO_LIMIT).unwrap();
+            let out = decoded(encoding, b"", NO_LIMIT);
             assert!(out.is_empty(), "{} should yield an empty body", encoding);
         }
     }
@@ -2024,10 +2342,13 @@ mod tests {
         // a usable prefix. brotli is block-based and is covered
         // separately below.
         let big = SAMPLE.repeat(400);
-        for (encoding, compressed) in [("gzip", gzip_bytes(&big)), ("deflate", deflate_bytes(&big))]
-        {
+        for (encoding, compressed) in [
+            ("gzip", gzip_bytes(&big)),
+            ("deflate", deflate_bytes(&big)),
+            ("deflate", zlib_bytes(&big)),
+        ] {
             let cut = &compressed[..compressed.len() / 2];
-            let out = decompress(encoding, cut, NO_LIMIT).unwrap();
+            let out = decoded(encoding, cut, NO_LIMIT);
             assert!(!out.is_empty(), "{} recovered nothing", encoding);
             assert!(
                 big.starts_with(&out),
@@ -2048,7 +2369,15 @@ mod tests {
         let big = SAMPLE.repeat(400);
         let compressed = brotli_bytes(&big);
         let cut = &compressed[..compressed.len() / 2];
-        assert!(decompress("br", cut, NO_LIMIT).is_err());
+        let (body, reason) = undecoded("br", cut, NO_LIMIT);
+        // The caller gets the bytes as they arrived, and something that
+        // says they aren't content.
+        assert_eq!(body, cut);
+        assert!(
+            reason.starts_with("brotli decompression failed"),
+            "unexpected reason: {}",
+            reason
+        );
     }
 
     #[test]
@@ -2060,35 +2389,45 @@ mod tests {
         for (encoding, compressed) in [
             ("gzip", gzip_bytes(&zeros)),
             ("deflate", deflate_bytes(&zeros)),
+            ("deflate", zlib_bytes(&zeros)),
             ("br", brotli_bytes(&zeros)),
         ] {
             assert!(compressed.len() < 1000, "{} test setup", encoding);
-            let out = decompress(encoding, &compressed, 4096).unwrap();
+            let out = decoded(encoding, &compressed, 4096);
             assert_eq!(out.len(), 4096, "{} exceeded the cap", encoding);
         }
     }
 
     #[test]
-    fn test_decompress_errors_when_nothing_inflates() {
-        // A body that isn't the encoding it claims yields no output at
-        // all, so it is still reported rather than passed off as empty.
-        let err = decompress("gzip", b"this is not gzip", NO_LIMIT).unwrap_err();
+    fn test_decompress_reports_a_body_that_doesnt_inflate() {
+        // A body that isn't the encoding it claims yields no output at all.
+        // The bytes still come back, but flagged, so a caller can't mistake
+        // them for content.
+        let (body, reason) = undecoded("gzip", b"this is not gzip", NO_LIMIT);
+        assert_eq!(body, b"this is not gzip");
         assert!(
-            err.message.contains("decompression failed"),
-            "unexpected message: {}",
-            err.message
+            reason.contains("decompression failed"),
+            "unexpected reason: {}",
+            reason
         );
     }
 
     #[test]
     fn test_decompress_passes_through_unknown_encoding() {
-        let out = decompress("identity", SAMPLE, NO_LIMIT).unwrap();
+        let out = decoded("identity", SAMPLE, NO_LIMIT);
         assert_eq!(out, SAMPLE);
         // A coding we can't undo means the layers beneath it are out of
-        // reach, so the body comes back exactly as it arrived.
+        // reach, so the body comes back exactly as it arrived, and says so.
         let gz = gzip_bytes(SAMPLE);
-        assert_eq!(decompress("magic-codec", &gz, NO_LIMIT).unwrap(), gz);
-        assert_eq!(decompress("gzip, magic-codec", &gz, NO_LIMIT).unwrap(), gz);
+        for encoding in ["magic-codec", "gzip, magic-codec"] {
+            let (body, reason) = undecoded(encoding, &gz, NO_LIMIT);
+            assert_eq!(body, gz);
+            assert!(
+                reason.contains("magic-codec"),
+                "reason should name the coding: {}",
+                reason
+            );
+        }
     }
 
     #[test]
@@ -2096,7 +2435,7 @@ mod tests {
         // Deprecated, but servers still send it, and treating it as
         // unknown hands the caller compressed bytes as if they were the
         // body.
-        let out = decompress("x-gzip", &gzip_bytes(SAMPLE), NO_LIMIT).unwrap();
+        let out = decoded("x-gzip", &gzip_bytes(SAMPLE), NO_LIMIT);
         assert_eq!(out, SAMPLE);
     }
 
@@ -2105,39 +2444,113 @@ mod tests {
         // `Content-Encoding: gzip, br` means gzip was applied first and
         // brotli on top of it, so brotli comes off first.
         let stacked = brotli_bytes(&gzip_bytes(SAMPLE));
-        assert_eq!(decompress("gzip, br", &stacked, NO_LIMIT).unwrap(), SAMPLE);
+        assert_eq!(decoded("gzip, br", &stacked, NO_LIMIT), SAMPLE);
         // Whitespace around the list separator is normal.
-        assert_eq!(decompress("gzip,br", &stacked, NO_LIMIT).unwrap(), SAMPLE);
+        assert_eq!(decoded("gzip,br", &stacked, NO_LIMIT), SAMPLE);
 
         let three = deflate_bytes(&brotli_bytes(&gzip_bytes(SAMPLE)));
-        assert_eq!(
-            decompress("gzip, br, deflate", &three, NO_LIMIT).unwrap(),
-            SAMPLE
-        );
+        assert_eq!(decoded("gzip, br, deflate", &three, NO_LIMIT), SAMPLE);
+
+        // The same list arriving as repeated header lines is joined by
+        // `parse_response` before it gets here, so this is the doubled
+        // `Content-Encoding: gzip` case a proxy in front of a gzipping
+        // backend produces.
+        let twice = gzip_bytes(&gzip_bytes(SAMPLE));
+        assert_eq!(decoded("gzip,gzip", &twice, NO_LIMIT), SAMPLE);
     }
 
     #[test]
     fn test_decompress_ignores_identity_entries_in_a_list() {
         let gz = gzip_bytes(SAMPLE);
-        assert_eq!(decompress("identity, gzip", &gz, NO_LIMIT).unwrap(), SAMPLE);
-        assert_eq!(decompress("gzip, identity", &gz, NO_LIMIT).unwrap(), SAMPLE);
+        assert_eq!(decoded("identity, gzip", &gz, NO_LIMIT), SAMPLE);
+        assert_eq!(decoded("gzip, identity", &gz, NO_LIMIT), SAMPLE);
+    }
+
+    #[test]
+    fn test_decompress_ignores_empty_list_elements() {
+        // RFC 9110 5.6.1.2 says to ignore these. They turn up from a
+        // trailing comma, and from joining a repeated header line that
+        // carried no value at all.
+        let gz = gzip_bytes(SAMPLE);
+        for encoding in ["gzip,", ",gzip", "gzip, ,", " , gzip"] {
+            assert_eq!(decoded(encoding, &gz, NO_LIMIT), SAMPLE, "{}", encoding);
+        }
     }
 
     #[test]
     fn test_decompress_bounds_output_of_stacked_encodings() {
         let zeros = vec![0u8; 200_000];
         let stacked = brotli_bytes(&gzip_bytes(&zeros));
-        let out = decompress("gzip, br", &stacked, 4096).unwrap();
+        let out = decoded("gzip, br", &stacked, 4096);
         assert_eq!(out.len(), 4096);
     }
 
     #[test]
-    fn test_decompress_error_names_the_codec_that_failed() {
-        let err = decompress("br", b"not brotli at all", NO_LIMIT).unwrap_err();
+    fn test_decompress_reason_names_the_codec_that_failed() {
+        let (_, reason) = undecoded("br", b"not brotli at all", NO_LIMIT);
         assert!(
-            err.message.starts_with("brotli decompression failed"),
-            "unexpected message: {}",
-            err.message
+            reason.starts_with("brotli decompression failed"),
+            "unexpected reason: {}",
+            reason
         );
+    }
+
+    #[test]
+    fn test_decompress_reports_a_half_peeled_stack_as_undecoded() {
+        // Declares `gzip, br` but only gzip was applied, so brotli finds
+        // no stream. Handing back the gunzipped inner layer would look
+        // like content and isn't, so the original bytes come back instead.
+        let gz = gzip_bytes(SAMPLE);
+        let (body, _) = undecoded("gzip, br", &gz, NO_LIMIT);
+        assert_eq!(body, gz);
+    }
+
+    // ── Body reads ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_read_body_stops_reading_at_the_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A body that would be 10MB if read to the end, served 1KB at a
+        // time. A 4KB cap has to stop asking for frames, not read it all
+        // and then slice: an unbounded read is what lets a target exhaust
+        // us while max_body_size looks like it's holding.
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        let stream = futures::stream::iter((0..10_000).map(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, std::io::Error>(hyper::body::Frame::data(bytes::Bytes::from(vec![
+                b'x';
+                1024
+            ])))
+        }));
+
+        let (body, cut) = read_body(http_body_util::StreamBody::new(stream), 4096)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 4096);
+        assert!(cut, "should report the cap cut the body");
+        // Four frames of room, plus the one that overran it.
+        let frames = served.load(Ordering::Relaxed);
+        assert!(frames <= 5, "read {} frames past the cap", frames);
+    }
+
+    #[tokio::test]
+    async fn test_read_body_ending_exactly_on_the_cap_is_not_cut() {
+        // Length alone can't tell a truncated body from one that happens
+        // to be exactly cap-sized, which is why the flag comes from the
+        // read itself.
+        let body = FullBody::new(bytes::Bytes::from(vec![b'x'; 4096]));
+        let (out, cut) = read_body(body, 4096).await.unwrap();
+        assert_eq!(out.len(), 4096);
+        assert!(!cut);
+    }
+
+    #[tokio::test]
+    async fn test_read_body_under_the_cap() {
+        let body = FullBody::new(bytes::Bytes::from_static(SAMPLE));
+        let (out, cut) = read_body(body, NO_LIMIT).await.unwrap();
+        assert_eq!(out, SAMPLE);
+        assert!(!cut);
     }
 }
