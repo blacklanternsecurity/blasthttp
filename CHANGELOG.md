@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Cookies set on a redirect hop are applied to the hops that follow it, the way a browser does. The jar is request-scoped, so nothing carries between requests
+- A cookie set in the request's own `Cookie` header always wins: every hop sends it, and a `Set-Cookie` naming it is ignored rather than replacing it, deleting it, or being sent alongside it
 - `redirect_cookies=False` (or `--no-redirect-cookies`) reverts to the previous behavior
 
 ## 0.9.0

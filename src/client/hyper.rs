@@ -1187,8 +1187,9 @@ fn build_request(
     origin_form: bool,
     manual_host_header: bool,
     // Cookies picked up from earlier hops of this redirect chain, already
-    // filtered down to the ones that apply to `uri`. Merged into the
-    // caller's own `Cookie` header when there is one, so we never send two.
+    // filtered down to the ones that apply to `uri` and to names the caller
+    // didn't set themselves. Merged into the caller's own `Cookie` header
+    // when there is one, so we never send two.
     redirect_cookies: Option<&str>,
 ) -> Result<hyper::Request<FullBody>, ClientError> {
     // For direct connections (dispatch_direct), use origin-form (path + query only)
@@ -1250,6 +1251,12 @@ fn build_request(
     // Emit the caller's headers, folding any redirect-chain cookies into the
     // first `Cookie` header they supplied. If they supplied none, the
     // chain's cookies go out as their own header after the caller's.
+    //
+    // The chain's list can't contain a name the caller set, because the jar
+    // refuses to store one, so this concatenation never produces the same
+    // name twice. That matters: duplicate names are read inconsistently
+    // across servers (some take the first, some the last), so a request
+    // carrying both would behave differently depending on the target.
     let mut merged_cookies = false;
     if let Some(ref custom_headers) = config.headers {
         for (name, value) in custom_headers {
@@ -1540,9 +1547,14 @@ impl HyperClient {
         // each other's cookies and a request's result depends only on its own
         // inputs. `hop_cookies` is the `Cookie` header for the hop we're about
         // to make, recomputed per hop because each one may be a different host.
-        let mut jar = config
-            .should_forward_redirect_cookies()
-            .then(crate::cookies::CookieJar::new);
+        // The caller's own cookies are recorded up front so the chain can
+        // never touch them: whatever they put in a `Cookie` header is what
+        // every hop sends.
+        let mut jar = config.should_forward_redirect_cookies().then(|| {
+            crate::cookies::CookieJar::with_caller_cookies(crate::cookies::caller_cookie_names(
+                config.headers.as_deref().unwrap_or(&[]),
+            ))
+        });
         let mut hop_cookies: Option<String> = None;
 
         loop {
@@ -1632,7 +1644,18 @@ impl HyperClient {
                 // The domain / path / Secure rules are what stop a cookie from
                 // following a redirect onto a host it doesn't belong to.
                 if let Some(jar) = jar.as_mut() {
-                    jar.store(&resp.headers, &uri);
+                    let refused = jar.store(&resp.headers, &uri);
+                    if !refused.is_empty() {
+                        debug_record(
+                            log,
+                            v,
+                            1,
+                            &format!(
+                                "   Kept the caller's own cookie(s) over a Set-Cookie for: {}",
+                                refused.join(", ")
+                            ),
+                        );
+                    }
                     hop_cookies = jar.header_for(&next_uri);
                     if let Some(ref c) = hop_cookies {
                         debug_record(log, v, 1, &format!("   Sending cookies: {}", c));

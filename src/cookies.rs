@@ -14,6 +14,16 @@
 //! anything. Bot-check pages work the same way. Which cookie goes to which
 //! hop follows the RFC 6265 domain, path, and `Secure` rules, so a cookie
 //! is never sent to a host it doesn't belong to.
+//!
+//! One rule overrides all of that: **a cookie the caller set themselves is
+//! what gets sent, always.** If a request carries `Cookie: session=mine`,
+//! every hop of that chain sends `session=mine`, whatever the site says.
+//! A `Set-Cookie` for a name the caller pinned is not stored, so it can
+//! neither replace their value nor delete it, and the two never go out
+//! together as a duplicate pair. Sites reset cookies mid-redirect all the
+//! time and duplicate names are read inconsistently (some servers take the
+//! first, some the last), so the only answer that stays predictable is that
+//! what the caller wrote is what lands on the wire.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,12 +47,26 @@ struct Cookie {
 #[derive(Debug, Default, Clone)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
+    /// Names the caller set in their own `Cookie` header. The chain never
+    /// stores or sends a cookie under one of these.
+    caller_names: Vec<String>,
 }
 
 impl CookieJar {
     pub fn new() -> Self {
         CookieJar {
             cookies: Vec::new(),
+            caller_names: Vec::new(),
+        }
+    }
+
+    /// A jar that leaves the caller's own cookies alone. `caller_names` are
+    /// the names from their `Cookie` header, via [`caller_cookie_names`];
+    /// nothing the chain sets under those names is ever stored or sent.
+    pub fn with_caller_cookies(caller_names: Vec<String>) -> Self {
+        CookieJar {
+            cookies: Vec::new(),
+            caller_names,
         }
     }
 
@@ -55,8 +79,16 @@ impl CookieJar {
     /// dropped, and an expired cookie (`Max-Age=0`, or `Expires` in the
     /// past, the usual "log out" / "clear this" signal) deletes any
     /// matching cookie already held instead of being stored.
-    pub fn store(&mut self, headers: &[(String, String)], uri: &http::Uri) {
-        let Some(host) = uri.host() else { return };
+    ///
+    /// Anything naming a cookie the caller set is refused outright, and its
+    /// name comes back in the return value. Worth logging rather than
+    /// swallowing: a site trying to overwrite a cookie you pinned is
+    /// something you want to know it did.
+    pub fn store(&mut self, headers: &[(String, String)], uri: &http::Uri) -> Vec<String> {
+        let mut refused: Vec<String> = Vec::new();
+        let Some(host) = uri.host() else {
+            return refused;
+        };
         let host = canonical_host(host);
         let request_path = uri.path();
 
@@ -67,6 +99,17 @@ impl CookieJar {
             let Some((cookie, expired)) = parse_set_cookie(value, &host, request_path) else {
                 continue;
             };
+            // The caller's own cookie wins, always. Refusing to store it is
+            // what makes that hold everywhere at once: the value can't be
+            // replaced, can't be deleted by an expiry, and can't go out
+            // beside the caller's as a duplicate name. Cookie names are
+            // case-sensitive (RFC 6265 4.1.1), so compare them exactly.
+            if self.caller_names.contains(&cookie.name) {
+                if !refused.contains(&cookie.name) {
+                    refused.push(cookie.name);
+                }
+                continue;
+            }
             // §5.3 step 11: a new cookie replaces one with the same
             // name/domain/path rather than adding a duplicate.
             self.cookies.retain(|c| {
@@ -76,6 +119,7 @@ impl CookieJar {
                 self.cookies.push(cookie);
             }
         }
+        refused
     }
 
     /// The `Cookie` header value to send to `uri`, or `None` when nothing
@@ -120,6 +164,31 @@ impl CookieJar {
                 .join("; "),
         )
     }
+}
+
+/// The cookie names a caller set in their own request headers.
+///
+/// These are off limits to the redirect chain: whatever the caller wrote is
+/// what goes on the wire, on every hop. Every `Cookie` header they supplied
+/// counts, since the server sees all of them. A pair with no `=` isn't a
+/// cookie and is skipped.
+pub fn caller_cookie_names(headers: &[(String, String)]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("cookie") {
+            continue;
+        }
+        for pair in value.split(';') {
+            let Some((n, _)) = pair.split_once('=') else {
+                continue;
+            };
+            let n = n.trim();
+            if !n.is_empty() && !names.iter().any(|existing| existing.as_str() == n) {
+                names.push(n.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Lowercase a host and strip a single trailing dot so `Example.COM.` and
@@ -512,6 +581,112 @@ mod tests {
             jar.header_for(&uri("https://example.com/")),
             Some("a=".to_string())
         );
+    }
+
+    #[test]
+    fn caller_cookie_beats_one_the_site_sets() {
+        // The whole rule in one case: caller pinned `session`, site tries to
+        // reset it mid-chain, and the site loses.
+        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
+        let refused = jar.store(
+            &[(
+                "Set-Cookie".to_string(),
+                "session=theirs; Path=/".to_string(),
+            )],
+            &uri("http://example.com/start"),
+        );
+        assert_eq!(refused, vec!["session".to_string()]);
+        // Nothing to add to the caller's header, so the jar has nothing to
+        // say for the next hop and their `Cookie` goes out untouched.
+        assert_eq!(jar.header_for(&uri("http://example.com/end")), None);
+    }
+
+    #[test]
+    fn caller_cookie_wins_whatever_scope_the_site_claims() {
+        // Domain and Path don't buy the site a way around it, and neither
+        // does setting it from a subdomain.
+        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
+        jar.store(
+            &[
+                (
+                    "Set-Cookie".to_string(),
+                    "session=wide; Domain=example.com; Path=/".to_string(),
+                ),
+                (
+                    "Set-Cookie".to_string(),
+                    "session=deep; Path=/admin".to_string(),
+                ),
+            ],
+            &uri("http://app.example.com/admin/x"),
+        );
+        assert_eq!(jar.header_for(&uri("http://app.example.com/admin/x")), None);
+    }
+
+    #[test]
+    fn site_cannot_delete_a_caller_cookie() {
+        // An expiry is a delete signal, and the caller's cookie isn't the
+        // site's to delete.
+        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
+        let refused = jar.store(
+            &[("Set-Cookie".to_string(), "session=; Max-Age=0".to_string())],
+            &uri("http://example.com/logout"),
+        );
+        assert_eq!(refused, vec!["session".to_string()]);
+        assert_eq!(jar.header_for(&uri("http://example.com/")), None);
+    }
+
+    #[test]
+    fn other_names_the_site_sets_still_come_through() {
+        // Only the names the caller claimed are off limits.
+        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
+        jar.store(
+            &[
+                ("Set-Cookie".to_string(), "session=theirs".to_string()),
+                ("Set-Cookie".to_string(), "csrf=xyz".to_string()),
+            ],
+            &uri("http://example.com/start"),
+        );
+        assert_eq!(
+            jar.header_for(&uri("http://example.com/end")).as_deref(),
+            Some("csrf=xyz")
+        );
+    }
+
+    #[test]
+    fn cookie_names_are_case_sensitive() {
+        // RFC 6265 4.1.1: `Session` and `session` are different cookies, so
+        // pinning one doesn't pin the other.
+        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
+        jar.store(
+            &[("Set-Cookie".to_string(), "Session=theirs".to_string())],
+            &uri("http://example.com/start"),
+        );
+        assert_eq!(
+            jar.header_for(&uri("http://example.com/end")).as_deref(),
+            Some("Session=theirs")
+        );
+    }
+
+    #[test]
+    fn caller_cookie_names_reads_every_cookie_header() {
+        let headers = vec![
+            ("Cookie".to_string(), "a=1; b=2".to_string()),
+            ("Accept".to_string(), "*/*".to_string()),
+            // A second `Cookie` header counts too: the server sees both.
+            ("cookie".to_string(), " c=3 ;  a=9 ".to_string()),
+        ];
+        assert_eq!(
+            caller_cookie_names(&headers),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn caller_cookie_names_ignores_what_is_not_a_cookie() {
+        // No `=` is not a name/value pair, and an empty name is not a name.
+        let headers = vec![("Cookie".to_string(), "novalue; =orphan; real=1".to_string())];
+        assert_eq!(caller_cookie_names(&headers), vec!["real".to_string()]);
+        assert!(caller_cookie_names(&[]).is_empty());
     }
 
     #[test]

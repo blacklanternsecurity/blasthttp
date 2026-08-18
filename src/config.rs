@@ -14,6 +14,11 @@ pub struct RequestConfig {
     /// this one request (default: true). The jar is request-scoped, so
     /// nothing carries into the next request and results stay reproducible.
     /// Set to `false` to send only the caller's own headers on every hop.
+    ///
+    /// A cookie set in `headers` is never affected by this. Whatever the
+    /// caller put in a `Cookie` header is what every hop sends, and a
+    /// `Set-Cookie` naming one of those cookies is ignored, so the chain can
+    /// neither overwrite it nor delete it.
     pub redirect_cookies: Option<bool>,
     pub verify_certs: Option<bool>,
     pub proxy: Option<String>,
@@ -102,6 +107,9 @@ impl RequestConfig {
     /// default: it's what a browser does, and it's what lets a login or
     /// bot-check page (the kind that sets a cookie and redirects you back
     /// to where you started) actually resolve instead of looping.
+    ///
+    /// Cookies the caller set in `headers` are sent either way, and win over
+    /// anything the chain sets under the same name.
     pub fn should_forward_redirect_cookies(&self) -> bool {
         self.redirect_cookies.unwrap_or(true)
     }

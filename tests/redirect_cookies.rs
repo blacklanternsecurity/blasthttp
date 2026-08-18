@@ -142,6 +142,33 @@ async fn chain_cookie_merges_with_a_caller_supplied_cookie_header() {
 }
 
 #[tokio::test]
+async fn caller_cookie_beats_one_the_chain_sets_under_the_same_name() {
+    // The caller pinned `session`, the redirect tries to reset it. What they
+    // set is what goes out, and it goes out once: sending both values would
+    // land on whichever one the target's framework happens to read first.
+    let (port, rx) = spawn_server("session=theirs; Path=/");
+    run(port, |c| {
+        c.headers = Some(vec![("Cookie".to_string(), "session=mine".to_string())]);
+    })
+    .await;
+    assert_eq!(second_hop_cookie(&rx).as_deref(), Some("session=mine"));
+}
+
+#[tokio::test]
+async fn chain_cookie_under_a_different_name_still_joins_the_callers() {
+    // Only the names the caller claimed are off limits to the chain.
+    let (port, rx) = spawn_server("csrf=xyz; Path=/");
+    run(port, |c| {
+        c.headers = Some(vec![("Cookie".to_string(), "session=mine".to_string())]);
+    })
+    .await;
+    assert_eq!(
+        second_hop_cookie(&rx).as_deref(),
+        Some("session=mine; csrf=xyz")
+    );
+}
+
+#[tokio::test]
 async fn caller_cookie_survives_when_the_chain_adds_nothing() {
     let (port, rx) = spawn_server("bad; no-equals-sign");
     run(port, |c| {
