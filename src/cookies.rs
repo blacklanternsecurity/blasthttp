@@ -5,7 +5,7 @@
 //! dropped when the request returns. Nothing survives into the next request,
 //! so a result depends only on that request's own inputs.
 //!
-//! Deliberately not a cookie chain in the sense the word usually carries. There
+//! Deliberately not a cookie jar in the sense the word usually carries. There
 //! is no session behind it, no storage that outlives a request, and nothing
 //! shared between them. Client-wide storage would take away the property that
 //! matters here, since concurrent requests sharing it would race to write it,
@@ -18,6 +18,12 @@
 //! anything. Bot-check pages work the same way. Which cookie goes to which
 //! hop follows the RFC 6265 domain, path, and `Secure` rules, so a cookie
 //! is never sent to a host it doesn't belong to.
+//!
+//! The domain rules are the load-bearing ones there, and the shape check
+//! alone isn't enough for them: `Domain=com` covers the host that set it, so
+//! it passes, and then covers every other `.com` in the chain. A `Domain` is
+//! therefore checked against the Public Suffix List, and a cookie may only
+//! widen within one registrable domain. See `parse_set_cookie`.
 //!
 //! One rule overrides all of that: **a cookie the caller set themselves is
 //! what gets sent, always.** If a request carries `Cookie: session=mine`,
@@ -272,9 +278,33 @@ fn canonical_host(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// True when `domain` is a public suffix: a name anyone can register under,
+/// like `com`, `co.uk`, `github.io` or `s3.amazonaws.com`. A `Domain`
+/// attribute naming one of these is not a boundary a cookie may span, since
+/// the hosts beneath it belong to unrelated parties.
+///
+/// A name whose TLD isn't in the list (`corp`, `localhost`) counts as a
+/// suffix, which is the safe direction: an unknown name gets treated as a
+/// boundary rather than as somewhere a cookie may widen into.
+fn is_public_suffix(domain: &str) -> bool {
+    psl::domain_str(domain).is_none()
+}
+
+/// The registrable domain, one label below the public suffix: `example.com`
+/// for `auth.example.com`, `example.co.uk` for `a.b.example.co.uk`. `None`
+/// when the name is a public suffix and has no registrable part.
+fn registrable(host: &str) -> Option<&str> {
+    psl::domain_str(host)
+}
+
 /// RFC 6265 §5.1.3. True when `host` is `domain` or a subdomain of it. An
 /// IP literal only ever matches itself, so a `Domain` attribute can never
 /// widen a cookie set by an IP address.
+///
+/// This is only the shape check. Whether the `Domain` is somewhere a cookie
+/// is allowed to reach is decided in `parse_set_cookie`, which is where the
+/// public suffix rules live: on its own this happily accepts `Domain=com`
+/// from any `.com` host.
 fn domain_matches(host: &str, domain: &str) -> bool {
     if host == domain {
         return true;
@@ -357,16 +387,50 @@ fn parse_set_cookie(value: &str, request_host: &str, request_path: &str) -> Opti
         }
     }
 
-    // §5.3 step 6: reject outright if the Domain attribute doesn't cover
-    // the host that sent it.
     let (domain, host_only) = match domain {
+        // No `Domain` at all: the cookie goes back only to the exact host
+        // that set it.
+        None => (request_host.to_string(), true),
         Some(d) => {
+            // §5.3 step 6: the attribute has to cover the host that sent it.
             if !domain_matches(request_host, &d) {
                 return None;
             }
-            (d, false)
+            if request_host.parse::<std::net::IpAddr>().is_ok() {
+                // An IP has no domain hierarchy to widen into, so the only
+                // `Domain` that got past step 6 is the address itself, and it
+                // buys nothing over host-only.
+                (request_host.to_string(), true)
+            } else if is_public_suffix(&d) {
+                // §5.3 step 5. `Domain=com` from `attacker.com` passes step 6
+                // and would then be sent to every other `.com` in the chain,
+                // which is a redirect walking a cookie onto an unrelated
+                // host. Anyone can register under a public suffix, so it can
+                // never be a boundary a cookie is allowed to span. The
+                // exception the RFC carves out is a host that *is* the
+                // suffix, where the attribute says nothing extra and the
+                // cookie stays host-only. That's what keeps `Domain=localhost`
+                // working, since an unlisted TLD counts as a suffix.
+                if d == request_host {
+                    (request_host.to_string(), true)
+                } else {
+                    return None;
+                }
+            } else if registrable(request_host) != registrable(&d) {
+                // Stricter than step 5, and cheap once the list is here. Step
+                // 5 alone still lets a host under a suffix reach past its own
+                // registrable domain when the wider name isn't itself listed:
+                // `attacker.s3.amazonaws.com` setting `Domain=amazonaws.com`
+                // would reach `victim.s3.amazonaws.com`, because only
+                // `s3.amazonaws.com` is in the list. Requiring both names to
+                // land on the same registrable domain closes that and still
+                // allows every real widening, `auth.example.com` handing a
+                // cookie to `app.example.com` included.
+                return None;
+            } else {
+                (d, false)
+            }
         }
-        None => (request_host.to_string(), true),
     };
 
     // Max-Age wins over Expires (§5.3 step 3). A non-positive Max-Age, or
@@ -533,6 +597,124 @@ mod tests {
         );
         assert!(chain.is_empty());
         assert!(chain.header_for(&uri("https://example.com/")).is_none());
+    }
+
+    #[test]
+    fn domain_of_a_public_suffix_is_refused() {
+        // The case that makes this rule necessary: hop 1 on a host the
+        // attacker owns sets a cookie scoped to the whole suffix, and without
+        // this every later hop under that suffix carries it. Anyone can
+        // register under these, so the hosts beneath them are unrelated
+        // parties, not one site.
+        for (setter, suffix, victim) in [
+            ("https://attacker.com/x", "com", "https://victim.com/"),
+            ("https://attacker.co.uk/x", "co.uk", "https://victim.co.uk/"),
+            (
+                "https://attacker.github.io/x",
+                "github.io",
+                "https://victim.github.io/",
+            ),
+            (
+                "https://attacker.s3.amazonaws.com/x",
+                "s3.amazonaws.com",
+                "https://victim.s3.amazonaws.com/",
+            ),
+            // Only `s3.amazonaws.com` is listed, not `amazonaws.com`, so the
+            // RFC's own rule would let this one through. Requiring the same
+            // registrable domain is what stops it.
+            (
+                "https://attacker.s3.amazonaws.com/x",
+                "amazonaws.com",
+                "https://victim.s3.amazonaws.com/",
+            ),
+        ] {
+            let mut chain = ChainCookies::new();
+            set(
+                &mut chain,
+                setter,
+                &[&format!("session=forced; Domain={}; Path=/", suffix)],
+            );
+            assert_eq!(
+                chain.header_for(&uri(victim)),
+                None,
+                "Domain={} reached {}",
+                suffix,
+                victim
+            );
+            // Not even kept for the host that set it: a cookie scoped that
+            // wide is one the RFC says to ignore outright.
+            assert_eq!(chain.header_for(&uri(setter)), None, "Domain={}", suffix);
+        }
+    }
+
+    #[test]
+    fn widening_within_one_registrable_domain_still_works() {
+        // The flows this whole feature exists for: an auth host hands a
+        // cookie to the app host under the same domain.
+        let mut chain = ChainCookies::new();
+        set(
+            &mut chain,
+            "https://auth.example.com/login",
+            &["session=abc; Domain=example.com; Path=/"],
+        );
+        assert_eq!(
+            chain
+                .header_for(&uri("https://app.example.com/dashboard"))
+                .as_deref(),
+            Some("session=abc")
+        );
+
+        // Same one label deeper, and under a two-label suffix.
+        let mut chain = ChainCookies::new();
+        set(
+            &mut chain,
+            "https://a.b.example.co.uk/login",
+            &["session=abc; Domain=example.co.uk"],
+        );
+        assert_eq!(
+            chain
+                .header_for(&uri("https://www.example.co.uk/"))
+                .as_deref(),
+            Some("session=abc")
+        );
+
+        // An unlisted TLD is treated as a suffix, so `internal.corp` is a
+        // registrable domain and a cookie may span it. Local and lab targets
+        // keep working.
+        let mut chain = ChainCookies::new();
+        set(
+            &mut chain,
+            "https://host.internal.corp/login",
+            &["session=abc; Domain=internal.corp"],
+        );
+        assert_eq!(
+            chain
+                .header_for(&uri("https://other.internal.corp/"))
+                .as_deref(),
+            Some("session=abc")
+        );
+    }
+
+    #[test]
+    fn domain_equal_to_the_host_stays_host_only() {
+        // RFC 6265 5.3 step 5's carve-out. `localhost` is a suffix as far as
+        // the list is concerned, so without this a cookie set on localhost
+        // with an explicit Domain would be dropped, and testing against a
+        // local target would quietly stop working.
+        let mut chain = ChainCookies::new();
+        set(
+            &mut chain,
+            "http://localhost:8080/login",
+            &["session=abc; Domain=localhost"],
+        );
+        assert_eq!(
+            chain
+                .header_for(&uri("http://localhost:8080/next"))
+                .as_deref(),
+            Some("session=abc")
+        );
+        // Host-only, so it doesn't reach a subdomain of it.
+        assert_eq!(chain.header_for(&uri("http://sub.localhost/")), None);
     }
 
     #[test]
