@@ -185,10 +185,13 @@ asyncio.run(main())
 | `elapsed_ms` / `elapsed` | `int` / `timedelta` | total request time |
 | `request` | `Request` | original `request.url` and `request.method` |
 | `debug_log` | `list[str]` | internal debug/timing lines |
+| `decode_error` | `str \| None` | why `content` is not decoded content; `None` on any ordinary response |
 | `json()` | callable | `json.loads(self.text)` |
 | `raise_for_status()` | callable | raises `HTTPStatusError` on 4xx/5xx |
 
 `body`, `raw_headers`, `cookies`, and `hash` are lazy — first access computes, subsequent accesses are free. Hashing a 10 MB body is real work; batch jobs that filter on `status` and never look at the body don't pay for it.
+
+A response whose body won't decode is still returned: the status line and headers arrived cleanly, and losing the response looks the same to the caller as an unreachable host. When that happens `decode_error` says why, and how far decoding got. With nothing undone, `content` is exactly what the server sent. With a stack of codings only partly undone, `content` is as far in as decoding reached, which is usually the body, since a header that overstates the codings (a proxy re-adding `Content-Encoding: gzip` in front of a backend that already set it) is more common than a body really encoded that many times. Anything that hashes, matches, or diffs bodies should check it, since encoded bytes are otherwise indistinguishable from content.
 
 `headers` is a `Headers` instance (case-insensitive view), not a list of tuples. Iterate with `.items()` to get `(name, value)` pairs preserving original case and duplicate names (e.g. multiple `Set-Cookie`). `Headers` is registered with `collections.abc.MutableMapping`, so libraries that special-case mappings (`DeepDiff`, `dataclasses`, etc.) recognize it.
 
@@ -240,11 +243,14 @@ All parameters except `url` are optional:
 | `retries` | `int` | Number of retries on failure |
 | `retry_wait_min_ms` | `int` | Minimum backoff between retries (ms) |
 | `retry_wait_max_ms` | `int` | Maximum backoff between retries (ms) |
-| `max_body_size` | `int` | Max response body bytes to download |
+| `max_body_size` | `int` | Max response body bytes to read; stops the read, not just what's kept |
 | `request_target` | `str` | Override the HTTP request-line URI |
 | `resolve_ip` | `str` | Connect to this IP (DNS pinning / `curl --resolve`) |
+| `alpn_protocols` | `list[str]` | ALPN list to offer; the request is spoken over whatever the server picks |
 
 `BatchConfig` accepts the same parameters (pass them as constructor kwargs).
+
+`alpn_protocols` defaults differ by path, because the offer is part of the client's TLS fingerprint and changing it changes how existing callers look on the wire. Ordinary pooled requests offer `["h2", "http/1.1"]`; requests with `resolve_ip` or `request_target` set bypass the pool and offer `["http/1.1"]` alone. Pass `["http/1.1"]` to keep a request off HTTP/2, or `["h2"]` to force it. `request_target` can't be combined with an HTTP/2 offer, since h2 carries the target in `:path` rather than a request-line — use `raw_connect` with `blasthttp.h2` for that.
 
 ### Multipart file uploads
 
