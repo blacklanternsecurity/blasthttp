@@ -1411,7 +1411,7 @@ async fn parse_response(
         (raw_bytes, None)
     } else {
         let decoded = decompress(&content_encoding, &raw_bytes, max_body);
-        match decoded.undecoded {
+        match decoded.decode_error {
             None => {
                 debug_record(
                     log,
@@ -1448,7 +1448,7 @@ async fn parse_response(
                     v,
                     1,
                     &format!(
-                        "   Body returned undecoded, {} bytes: {}",
+                        "   Body not fully decoded, {} bytes: {}",
                         decoded.body.len(),
                         cause
                     ),
@@ -1854,6 +1854,7 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
         }
     }
 
+    let declared = codecs.len();
     let mut remaining = codecs.into_iter().rev();
     let Some(outermost) = remaining.next() else {
         // Nothing but `identity`.
@@ -1862,17 +1863,36 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
 
     let mut out = match decode_one(outermost, data, max_size) {
         Ok(out) => out,
+        // Nothing came off at all, so the bytes are what arrived.
         Err(reason) => return Decoded::raw(data, reason),
     };
+    let mut peeled = 1;
+
     for codec in remaining {
-        out = match decode_one(codec, &out, max_size) {
-            Ok(next) => next,
-            // An inner layer didn't come off, so what we have is a
-            // half-peeled body: not content, and not what arrived either.
-            // Hand back the original bytes, which at least are what the
-            // server sent.
-            Err(reason) => return Decoded::raw(data, reason),
-        };
+        match decode_one(codec, &out, max_size) {
+            Ok(next) => {
+                out = next;
+                peeled += 1;
+            }
+            // A layer underneath one that did come off won't inflate. Keep
+            // the deepest peel rather than reverting to the original bytes,
+            // because the likeliest cause is a header that overstates the
+            // codings rather than a body that was really encoded that many
+            // times: a proxy re-adding `Content-Encoding: gzip` in front of
+            // a backend that already set it, without compressing again,
+            // gives `gzip, gzip` over a singly-compressed body. What is in
+            // hand there is the body. Still flagged, since the other
+            // possibility is a layer genuinely left on.
+            Err(reason) => {
+                return Decoded::partial(
+                    out,
+                    format!(
+                        "{} of {} content-encoding layers came off: {}",
+                        peeled, declared, reason
+                    ),
+                );
+            }
+        }
     }
     Decoded::content(out)
 }
@@ -1883,27 +1903,37 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
 /// There is no error variant on purpose. A body that won't decode is not
 /// grounds for dropping a response whose status line and headers arrived
 /// cleanly, so every path here produces bytes. What the caller must not do is
-/// mistake one kind for the other, which is what `undecoded` is for.
+/// mistake one kind for the other, which is what `decode_error` is for.
 struct Decoded {
     body: Vec<u8>,
     /// `None` when `body` is content: every declared coding came off (though
-    /// it may be short, if a stream broke or a cap cut it). `Some(reason)`
-    /// when `body` is the bytes as they arrived, still encoded.
-    undecoded: Option<String>,
+    /// it may be short, if a stream broke or a cap cut it).
+    ///
+    /// `Some(reason)` when it isn't, which covers two shapes. Either nothing
+    /// came off and `body` is exactly what arrived, or some layers came off
+    /// and `body` is as far in as we got. The reason distinguishes them.
+    decode_error: Option<String>,
 }
 
 impl Decoded {
     fn content(body: Vec<u8>) -> Self {
         Decoded {
             body,
-            undecoded: None,
+            decode_error: None,
         }
     }
 
     fn raw(data: &[u8], reason: String) -> Self {
         Decoded {
             body: data.to_vec(),
-            undecoded: Some(reason),
+            decode_error: Some(reason),
+        }
+    }
+
+    fn partial(body: Vec<u8>, reason: String) -> Self {
+        Decoded {
+            body,
+            decode_error: Some(reason),
         }
     }
 }
@@ -2246,9 +2276,9 @@ mod tests {
     fn decoded(encoding: &str, data: &[u8], max: usize) -> Vec<u8> {
         let out = decompress(encoding, data, max);
         assert!(
-            out.undecoded.is_none(),
-            "expected decoded content, got undecoded: {:?}",
-            out.undecoded
+            out.decode_error.is_none(),
+            "expected decoded content, got: {:?}",
+            out.decode_error
         );
         out.body
     }
@@ -2256,8 +2286,8 @@ mod tests {
     fn undecoded(encoding: &str, data: &[u8], max: usize) -> (Vec<u8>, String) {
         let out = decompress(encoding, data, max);
         let reason = out
-            .undecoded
-            .expect("expected the body to come back undecoded");
+            .decode_error
+            .expect("expected the body to be flagged as not fully decoded");
         (out.body, reason)
     }
 
@@ -2496,13 +2526,43 @@ mod tests {
     }
 
     #[test]
-    fn test_decompress_reports_a_half_peeled_stack_as_undecoded() {
-        // Declares `gzip, br` but only gzip was applied, so brotli finds
-        // no stream. Handing back the gunzipped inner layer would look
-        // like content and isn't, so the original bytes come back instead.
+    fn test_decompress_returns_what_arrived_when_the_outermost_layer_fails() {
+        // Declares `gzip, br`, so brotli comes off first, and only gzip was
+        // applied. Nothing came off, so the caller gets exactly what
+        // arrived, flagged.
         let gz = gzip_bytes(SAMPLE);
         let (body, _) = undecoded("gzip, br", &gz, NO_LIMIT);
         assert_eq!(body, gz);
+    }
+
+    #[test]
+    fn test_decompress_keeps_the_deepest_peel_when_a_declared_layer_is_absent() {
+        // A proxy that re-adds `Content-Encoding: gzip` in front of a
+        // backend that already set it, without compressing again, sends two
+        // header lines over a singly-compressed body. Reverting to the
+        // original bytes there loses a body that reads fine, so keep the
+        // deepest peel: one gzip came off and what's left is the content.
+        let gz = gzip_bytes(SAMPLE);
+        let (body, reason) = undecoded("gzip,gzip", &gz, NO_LIMIT);
+        assert_eq!(body, SAMPLE);
+        assert!(
+            reason.starts_with("1 of 2 content-encoding layers came off"),
+            "reason should say how far it got: {}",
+            reason
+        );
+
+        // Same shape with different codings: br declared under a gzip that
+        // did come off, but never applied.
+        let (body, _) = undecoded("br, gzip", &gz, NO_LIMIT);
+        assert_eq!(body, SAMPLE);
+    }
+
+    #[test]
+    fn test_decompress_still_undoes_a_genuinely_doubled_encoding() {
+        // The other reading of the same header, where both layers are
+        // really there. This one decodes clean and isn't flagged.
+        let twice = gzip_bytes(&gzip_bytes(SAMPLE));
+        assert_eq!(decoded("gzip,gzip", &twice, NO_LIMIT), SAMPLE);
     }
 
     // ── Body reads ────────────────────────────────────────────────

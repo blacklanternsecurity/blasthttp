@@ -35,10 +35,13 @@ pub struct Response {
     /// Why `body_bytes` is not decoded content, when it isn't.
     ///
     /// `None` on any ordinary response, including one with no
-    /// `Content-Encoding` at all. `Some(reason)` means the declared coding
+    /// `Content-Encoding` at all. `Some(reason)` means a declared coding
     /// could not be undone (unsupported coding, a body that doesn't match
-    /// what it claims, a stream that inflates to nothing), so `body_bytes`
-    /// holds the bytes exactly as they arrived, still encoded.
+    /// what it claims, a stream that inflates to nothing), and the reason
+    /// says how far decoding got. With nothing off, `body_bytes` is exactly
+    /// what arrived. With a stack only partly undone, it is as far in as
+    /// decoding reached, which is usually the body: a header that overstates
+    /// the codings is more common than a body encoded that many times.
     ///
     /// A response is worth keeping either way, since the status line and
     /// headers arrived cleanly and losing the response looks the same as an

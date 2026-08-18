@@ -10,6 +10,7 @@
 - `Response.decode_error` says why `content` is not decoded content, so compressed bytes can't be mistaken for a body by anything that hashes, matches, or diffs them
 - Accept zlib-wrapped `deflate` (RFC 1950), which is what `Content-Encoding: deflate` is specified as and what IIS and several CDN fronts send; only bare deflate (RFC 1951) worked before
 - Undo every `Content-Encoding` line, not just the first, so a doubled header from a proxy in front of a compressing backend no longer leaves the body compressed
+- A stack of codings that only partly comes off keeps the deepest result rather than reverting to the bytes that arrived, since a header listing more codings than were applied (a proxy re-adding `Content-Encoding: gzip` without compressing again) is the common case and that result is the body
 - `max_body_size` now stops the read instead of buffering the whole body and slicing it, so a target can't answer with an unbounded body regardless of the cap
 - `alpn_protocols` on `request()`, to pick the ALPN offer (defaults unchanged: h2 then http/1.1 pooled, http/1.1 alone on the `resolve_ip` / `request_target` path)
 - Requests with `resolve_ip` set now speak HTTP/2 when ALPN negotiates it, instead of negotiating h2 and then sending HTTP/1.1 over it. `request_target` with an h2 offer is rejected outright, since h2 has no request-line to override

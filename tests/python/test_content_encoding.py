@@ -96,6 +96,11 @@ class _Handler(BaseHTTPRequestHandler):
             # Two Content-Encoding lines, both applied. Reading only the
             # first peels one layer and calls the rest a body.
             self._respond(200, ["gzip", "gzip"], gzip.compress(gzip.compress(PAYLOAD)))
+        elif kind == "doubled-once":
+            # Two lines, compressed once. The misconfig shape: a proxy
+            # re-adds the header in front of a backend that already set
+            # it, without compressing again.
+            self._respond(200, ["gzip", "gzip"], gzip.compress(PAYLOAD))
         elif kind == "doubled-mismatch":
             # Two lines, only the first applied.
             self._respond(200, ["gzip", "br"], gzip.compress(PAYLOAD))
@@ -206,12 +211,26 @@ async def test_repeated_lines_preserve_both_headers(client, server):
     assert encodings == ["gzip", "gzip"]
 
 
+async def test_doubled_header_over_a_singly_compressed_body_still_reads(client, server):
+    """The other reading of two identical lines, and the more common one:
+    the header was added twice but the body was compressed once. One gzip
+    comes off and what's left is the body, so keep that rather than
+    reverting to the bytes that arrived. Flagged, because the alternative
+    reading leaves a layer on and the two are indistinguishable."""
+    r = await client.request(f"{server}/doubled-once", timeout=10, follow_redirects=False)
+    assert r.status_code == 200
+    assert r.content == PAYLOAD
+    assert "1 of 2 content-encoding layers came off" in r.decode_error
+
+
 async def test_repeated_lines_that_were_not_all_applied_are_flagged(client, server):
     """Declares gzip and br on separate lines but only applied gzip. Same
     as the single-line case: keep the response, hand back what arrived,
     and say the body isn't decoded."""
     r = await client.request(f"{server}/doubled-mismatch", timeout=10, follow_redirects=False)
     assert r.status_code == 200
+    # br is the outermost coding and was never applied, so nothing came
+    # off and the caller gets exactly what arrived.
     assert r.content == gzip.compress(PAYLOAD)
     assert r.decode_error is not None
 

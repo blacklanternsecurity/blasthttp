@@ -548,11 +548,11 @@ impl PyResponse {
     /// Why `content` is not decoded content, when it isn't.
     ///
     /// `None` on any ordinary response, including one with no
-    /// `Content-Encoding`. A string means the declared coding could not be
-    /// undone, so `content` holds the bytes exactly as the server sent them,
-    /// still encoded. The response is worth keeping either way, but code that
-    /// hashes, matches or diffs bodies should check this first rather than
-    /// treat compressed bytes as content.
+    /// `Content-Encoding`. A string means a declared coding could not be
+    /// undone, and says how far decoding got: `content` is either exactly
+    /// what the server sent, or a stack only partly undone. The response is
+    /// worth keeping either way, but code that hashes, matches or diffs
+    /// bodies should check this rather than treat encoded bytes as content.
     #[getter]
     fn decode_error(&self) -> Option<String> {
         self.inner.decode_error.clone()
