@@ -283,6 +283,7 @@ fn make_response(
         request_url: url,
         request_method: method,
         debug_log: Vec::new(),
+        decode_error: None,
         body_cache: OnceLock::new(),
         raw_headers_cache: OnceLock::new(),
         cookies_cache: OnceLock::new(),
