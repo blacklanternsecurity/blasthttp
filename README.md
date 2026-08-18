@@ -319,7 +319,9 @@ response = await client.request(
 
 When `follow_redirects` is on, a cookie set by one hop is sent on the hops that follow it, the same way a browser does. That's what makes a login or bot-check page work: it hands you a cookie along with the redirect, and the cookie has to be on the next request to count for anything. Without this you'd loop or land back on the same page.
 
-The jar is **request-scoped**. It's created when the request starts and dropped when it returns, so nothing carries into the next request and no two requests can see each other's cookies. A batch of 500 URLs runs 500 independent jars, which keeps every result reproducible on its own.
+This is **not a session**, and there's no cookie storage behind it. What a chain collects is created when the request starts and dropped when it returns, so nothing carries into the next request and no two requests can see each other's cookies. A batch of 500 URLs runs 500 independent chains, which keeps every result reproducible on its own.
+
+What a chain will hold is capped, since a response can set as many cookies as it likes and every later hop would carry all of them: 4096 bytes per cookie and 50 cookies, which is what RFC 6265 asks a client to support and roughly what browsers allow, and 8KB across the whole chain, which is about where servers stop accepting a header line. Past those, later cookies are dropped and the ones already held are kept, with a line in the debug log saying what went.
 
 Which cookie goes to which hop follows the usual rules (RFC 6265): a cookie with no `Domain` goes back only to the exact host that set it, a `Domain` that doesn't cover the host that sent it is thrown out, `Path` has to match, and `Secure` cookies never go over plain HTTP. So a redirect can't be used to walk a cookie the chain picked up onto some other host. Headers you supply yourself are a different matter: those are sent as given on every hop, including after a redirect to another host, because a header you set is a header we send.
 

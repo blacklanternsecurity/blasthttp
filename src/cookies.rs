@@ -1,11 +1,15 @@
 //! Request-scoped cookie handling for redirect chains.
 //!
-//! A [`CookieJar`] lives for exactly one request: cookies set by one hop
-//! are offered to later hops in the same redirect chain, then dropped when
-//! the request returns. Nothing survives into the next request, so a
-//! result depends only on that request's own inputs. A client-wide jar
-//! would destroy that, since concurrent requests sharing one would race
-//! to write it.
+//! [`ChainCookies`] holds what one request's redirect chain picked up:
+//! cookies set by one hop are offered to later hops in the same chain, then
+//! dropped when the request returns. Nothing survives into the next request,
+//! so a result depends only on that request's own inputs.
+//!
+//! Deliberately not a cookie chain in the sense the word usually carries. There
+//! is no session behind it, no storage that outlives a request, and nothing
+//! shared between them. Client-wide storage would take away the property that
+//! matters here, since concurrent requests sharing it would race to write it,
+//! and a batch of 500 URLs would stop being 500 independent results.
 //!
 //! Within a chain the behavior matches a browser: `Set-Cookie` on a `302`
 //! is applied to the hop that follows it. That's how nearly every login
@@ -27,6 +31,34 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Ceilings on what one chain will hold.
+///
+/// A response may legally carry as many `Set-Cookie` headers as it likes, and
+/// without a ceiling every hop after it carries all of them: 90 cookies of 2KB
+/// in a single redirect is enough to make the next request send a 180KB
+/// `Cookie` header, and each further hop can add more. Pointed at hosts we
+/// don't trust, which is the normal case, that is a target deciding how much
+/// memory we hold and how much traffic we send.
+///
+/// The numbers come from what real clients and servers already do. RFC 6265
+/// 6.1 asks a user agent to support at least 4096 bytes per cookie and at
+/// least 50 cookies per domain, which browsers implement as roughly their
+/// limits too, so a chain needing more than that is not a login flow. And a
+/// `Cookie` header past about 8KB is one the next server rejects anyway
+/// (nginx's `large_client_header_buffers` and Apache's `LimitRequestFieldSize`
+/// both default near there), so growing past it would only mean sending
+/// traffic that cannot be answered.
+const MAX_COOKIE_BYTES: usize = 4096;
+const MAX_COOKIES: usize = 50;
+const MAX_CHAIN_BYTES: usize = 8192;
+
+/// What one cookie costs against `MAX_CHAIN_BYTES`: the `name=value` pair plus
+/// the `; ` that joins it to the next one, so the budget bounds the header
+/// that actually goes on the wire rather than just the parts of it.
+fn entry_size(name: &str, value: &str) -> usize {
+    name.len() + value.len() + 3
+}
+
 /// One stored cookie, normalized per RFC 6265 §5.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cookie {
@@ -43,28 +75,48 @@ struct Cookie {
     secure: bool,
 }
 
+/// What [`ChainCookies::store`] decided not to keep. Both kinds are worth
+/// logging: a site trying to overwrite a cookie you pinned is something you
+/// want to see, and a cap that silently drops cookies reads as full coverage
+/// when it isn't.
+#[derive(Debug, Default)]
+pub struct Rejected {
+    /// Names the caller set themselves, so the site doesn't get to touch them.
+    pub caller_owned: Vec<String>,
+    /// Names dropped because the chain is at one of its ceilings.
+    pub over_limit: Vec<String>,
+}
+
+impl Rejected {
+    fn note(list: &mut Vec<String>, name: &str) {
+        if !list.iter().any(|n| n == name) {
+            list.push(name.to_string());
+        }
+    }
+}
+
 /// Cookies accumulated over one request's redirect chain.
 #[derive(Debug, Default, Clone)]
-pub struct CookieJar {
+pub struct ChainCookies {
     cookies: Vec<Cookie>,
     /// Names the caller set in their own `Cookie` header. The chain never
     /// stores or sends a cookie under one of these.
     caller_names: Vec<String>,
 }
 
-impl CookieJar {
+impl ChainCookies {
     pub fn new() -> Self {
-        CookieJar {
+        ChainCookies {
             cookies: Vec::new(),
             caller_names: Vec::new(),
         }
     }
 
-    /// A jar that leaves the caller's own cookies alone. `caller_names` are
+    /// Chain cookies that leave the caller's own alone. `caller_names` are
     /// the names from their `Cookie` header, via [`caller_cookie_names`];
     /// nothing the chain sets under those names is ever stored or sent.
     pub fn with_caller_cookies(caller_names: Vec<String>) -> Self {
-        CookieJar {
+        ChainCookies {
             cookies: Vec::new(),
             caller_names,
         }
@@ -80,14 +132,13 @@ impl CookieJar {
     /// past, the usual "log out" / "clear this" signal) deletes any
     /// matching cookie already held instead of being stored.
     ///
-    /// Anything naming a cookie the caller set is refused outright, and its
-    /// name comes back in the return value. Worth logging rather than
-    /// swallowing: a site trying to overwrite a cookie you pinned is
-    /// something you want to know it did.
-    pub fn store(&mut self, headers: &[(String, String)], uri: &http::Uri) -> Vec<String> {
-        let mut refused: Vec<String> = Vec::new();
+    /// Anything naming a cookie the caller set is refused outright, as is
+    /// anything that would push the chain past its ceilings. Both come back
+    /// in the [`Rejected`] report for the caller to log.
+    pub fn store(&mut self, headers: &[(String, String)], uri: &http::Uri) -> Rejected {
+        let mut rejected = Rejected::default();
         let Some(host) = uri.host() else {
-            return refused;
+            return rejected;
         };
         let host = canonical_host(host);
         let request_path = uri.path();
@@ -105,25 +156,49 @@ impl CookieJar {
             // beside the caller's as a duplicate name. Cookie names are
             // case-sensitive (RFC 6265 4.1.1), so compare them exactly.
             if self.caller_names.contains(&cookie.name) {
-                if !refused.contains(&cookie.name) {
-                    refused.push(cookie.name);
-                }
+                Rejected::note(&mut rejected.caller_owned, &cookie.name);
+                continue;
+            }
+            // One oversized cookie is refused on its own, before it can eat
+            // the whole chain's budget.
+            if entry_size(&cookie.name, &cookie.value) > MAX_COOKIE_BYTES {
+                Rejected::note(&mut rejected.over_limit, &cookie.name);
                 continue;
             }
             // §5.3 step 11: a new cookie replaces one with the same
-            // name/domain/path rather than adding a duplicate.
+            // name/domain/path rather than adding a duplicate. Done before
+            // the budget check so a reset frees what the old value held.
             self.cookies.retain(|c| {
                 !(c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path)
             });
-            if !expired {
-                self.cookies.push(cookie);
+            if expired {
+                continue;
             }
+            // Whoever gets there first keeps the room. A chain's own early
+            // cookies are the ones a login flow needs, so the sensible thing
+            // to drop is whatever a later hop piles on top, not what we
+            // already hold.
+            if self.cookies.len() >= MAX_COOKIES
+                || self.bytes() + entry_size(&cookie.name, &cookie.value) > MAX_CHAIN_BYTES
+            {
+                Rejected::note(&mut rejected.over_limit, &cookie.name);
+                continue;
+            }
+            self.cookies.push(cookie);
         }
-        refused
+        rejected
+    }
+
+    /// What the stored cookies currently cost against `MAX_CHAIN_BYTES`.
+    fn bytes(&self) -> usize {
+        self.cookies
+            .iter()
+            .map(|c| entry_size(&c.name, &c.value))
+            .sum()
     }
 
     /// The `Cookie` header value to send to `uri`, or `None` when nothing
-    /// in the jar applies to it.
+    /// stored applies to it.
     pub fn header_for(&self, uri: &http::Uri) -> Option<String> {
         let host = canonical_host(uri.host()?);
         let path = uri.path();
@@ -401,78 +476,83 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn set(jar: &mut CookieJar, url: &str, values: &[&str]) {
+    fn set(chain: &mut ChainCookies, url: &str, values: &[&str]) {
         let headers: Vec<(String, String)> = values
             .iter()
             .map(|v| ("set-cookie".to_string(), v.to_string()))
             .collect();
-        jar.store(&headers, &uri(url));
+        chain.store(&headers, &uri(url));
     }
 
     #[test]
     fn cookie_set_on_redirect_is_sent_to_next_hop() {
-        let mut jar = CookieJar::new();
+        let mut chain = ChainCookies::new();
         set(
-            &mut jar,
+            &mut chain,
             "https://example.com/login",
             &["session=abc123; Path=/"],
         );
         assert_eq!(
-            jar.header_for(&uri("https://example.com/dashboard")),
+            chain.header_for(&uri("https://example.com/dashboard")),
             Some("session=abc123".to_string())
         );
     }
 
     #[test]
     fn host_only_cookie_does_not_reach_subdomains_or_siblings() {
-        let mut jar = CookieJar::new();
+        let mut chain = ChainCookies::new();
         // No Domain attribute -> host-only.
-        set(&mut jar, "https://example.com/", &["a=1"]);
-        assert!(jar.header_for(&uri("https://www.example.com/")).is_none());
-        assert!(jar.header_for(&uri("https://evil.com/")).is_none());
-        assert!(jar.header_for(&uri("https://example.com/")).is_some());
+        set(&mut chain, "https://example.com/", &["a=1"]);
+        assert!(chain.header_for(&uri("https://www.example.com/")).is_none());
+        assert!(chain.header_for(&uri("https://evil.com/")).is_none());
+        assert!(chain.header_for(&uri("https://example.com/")).is_some());
     }
 
     #[test]
     fn domain_attribute_covers_subdomains() {
-        let mut jar = CookieJar::new();
+        let mut chain = ChainCookies::new();
         set(
-            &mut jar,
+            &mut chain,
             "https://www.example.com/",
             &["a=1; Domain=example.com"],
         );
-        assert!(jar.header_for(&uri("https://example.com/")).is_some());
-        assert!(jar.header_for(&uri("https://api.example.com/")).is_some());
+        assert!(chain.header_for(&uri("https://example.com/")).is_some());
+        assert!(chain.header_for(&uri("https://api.example.com/")).is_some());
         // Suffix match must land on a label boundary.
-        assert!(jar.header_for(&uri("https://notexample.com/")).is_none());
+        assert!(chain.header_for(&uri("https://notexample.com/")).is_none());
     }
 
     #[test]
     fn domain_not_covering_the_setting_host_is_rejected() {
-        let mut jar = CookieJar::new();
+        let mut chain = ChainCookies::new();
         // A redirect target must not be able to set cookies for elsewhere.
-        set(&mut jar, "https://evil.com/", &["a=1; Domain=example.com"]);
-        assert!(jar.is_empty());
-        assert!(jar.header_for(&uri("https://example.com/")).is_none());
+        set(
+            &mut chain,
+            "https://evil.com/",
+            &["a=1; Domain=example.com"],
+        );
+        assert!(chain.is_empty());
+        assert!(chain.header_for(&uri("https://example.com/")).is_none());
     }
 
     #[test]
     fn ip_host_cannot_widen_via_domain() {
-        let mut jar = CookieJar::new();
-        set(&mut jar, "http://10.0.0.1/", &["a=1; Domain=0.0.1"]);
-        assert!(jar.is_empty());
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "http://10.0.0.1/", &["a=1; Domain=0.0.1"]);
+        assert!(chain.is_empty());
     }
 
     #[test]
     fn secure_cookie_is_withheld_over_plaintext() {
-        let mut jar = CookieJar::new();
-        set(&mut jar, "https://example.com/", &["s=1; Secure", "p=2"]);
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://example.com/", &["s=1; Secure", "p=2"]);
         assert_eq!(
-            jar.header_for(&uri("http://example.com/")),
+            chain.header_for(&uri("http://example.com/")),
             Some("p=2".to_string())
         );
         assert!(
-            jar.header_for(&uri("https://example.com/"))
+            chain
+                .header_for(&uri("https://example.com/"))
                 .unwrap()
                 .contains("s=1")
         );
@@ -480,19 +560,29 @@ mod tests {
 
     #[test]
     fn path_scoping() {
-        let mut jar = CookieJar::new();
-        set(&mut jar, "https://example.com/", &["a=1; Path=/admin"]);
-        assert!(jar.header_for(&uri("https://example.com/admin")).is_some());
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://example.com/", &["a=1; Path=/admin"]);
         assert!(
-            jar.header_for(&uri("https://example.com/admin/users"))
+            chain
+                .header_for(&uri("https://example.com/admin"))
+                .is_some()
+        );
+        assert!(
+            chain
+                .header_for(&uri("https://example.com/admin/users"))
                 .is_some()
         );
         // Prefix must break on a boundary, not mid-segment.
         assert!(
-            jar.header_for(&uri("https://example.com/administrator"))
+            chain
+                .header_for(&uri("https://example.com/administrator"))
                 .is_none()
         );
-        assert!(jar.header_for(&uri("https://example.com/other")).is_none());
+        assert!(
+            chain
+                .header_for(&uri("https://example.com/other"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -505,80 +595,80 @@ mod tests {
 
     #[test]
     fn longer_paths_are_sent_first() {
-        let mut jar = CookieJar::new();
+        let mut chain = ChainCookies::new();
         set(
-            &mut jar,
+            &mut chain,
             "https://example.com/",
             &["broad=1; Path=/", "narrow=2; Path=/admin/panel"],
         );
         assert_eq!(
-            jar.header_for(&uri("https://example.com/admin/panel")),
+            chain.header_for(&uri("https://example.com/admin/panel")),
             Some("narrow=2; broad=1".to_string())
         );
     }
 
     #[test]
     fn resetting_the_same_cookie_replaces_it() {
-        let mut jar = CookieJar::new();
-        set(&mut jar, "https://example.com/", &["a=1"]);
-        set(&mut jar, "https://example.com/", &["a=2"]);
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://example.com/", &["a=1"]);
+        set(&mut chain, "https://example.com/", &["a=2"]);
         assert_eq!(
-            jar.header_for(&uri("https://example.com/")),
+            chain.header_for(&uri("https://example.com/")),
             Some("a=2".to_string())
         );
     }
 
     #[test]
     fn expired_cookie_deletes_instead_of_storing() {
-        let mut jar = CookieJar::new();
-        set(&mut jar, "https://example.com/", &["a=1"]);
-        set(&mut jar, "https://example.com/", &["a=; Max-Age=0"]);
-        assert!(jar.header_for(&uri("https://example.com/")).is_none());
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://example.com/", &["a=1"]);
+        set(&mut chain, "https://example.com/", &["a=; Max-Age=0"]);
+        assert!(chain.header_for(&uri("https://example.com/")).is_none());
 
-        set(&mut jar, "https://example.com/", &["b=1"]);
+        set(&mut chain, "https://example.com/", &["b=1"]);
         set(
-            &mut jar,
+            &mut chain,
             "https://example.com/",
             &["b=; Expires=Thu, 01 Jan 1970 00:00:00 GMT"],
         );
-        assert!(jar.header_for(&uri("https://example.com/")).is_none());
+        assert!(chain.header_for(&uri("https://example.com/")).is_none());
     }
 
     #[test]
     fn future_expiry_is_kept() {
-        let mut jar = CookieJar::new();
+        let mut chain = ChainCookies::new();
         set(
-            &mut jar,
+            &mut chain,
             "https://example.com/",
             &["a=1; Expires=Tue, 01 Jan 2999 00:00:00 GMT"],
         );
-        assert!(jar.header_for(&uri("https://example.com/")).is_some());
+        assert!(chain.header_for(&uri("https://example.com/")).is_some());
     }
 
     #[test]
     fn malformed_set_cookie_is_ignored() {
-        let mut jar = CookieJar::new();
+        let mut chain = ChainCookies::new();
         set(
-            &mut jar,
+            &mut chain,
             "https://example.com/",
             &["novalue", "=noname", ""],
         );
-        assert!(jar.is_empty());
+        assert!(chain.is_empty());
     }
 
     #[test]
     fn host_matching_is_case_and_trailing_dot_insensitive() {
-        let mut jar = CookieJar::new();
-        set(&mut jar, "https://Example.COM./", &["a=1"]);
-        assert!(jar.header_for(&uri("https://example.com/")).is_some());
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://Example.COM./", &["a=1"]);
+        assert!(chain.header_for(&uri("https://example.com/")).is_some());
     }
 
     #[test]
     fn empty_value_is_preserved() {
-        let mut jar = CookieJar::new();
-        set(&mut jar, "https://example.com/", &["a="]);
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://example.com/", &["a="]);
         assert_eq!(
-            jar.header_for(&uri("https://example.com/")),
+            chain.header_for(&uri("https://example.com/")),
             Some("a=".to_string())
         );
     }
@@ -587,26 +677,26 @@ mod tests {
     fn caller_cookie_beats_one_the_site_sets() {
         // The whole rule in one case: caller pinned `session`, site tries to
         // reset it mid-chain, and the site loses.
-        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
-        let refused = jar.store(
+        let mut chain = ChainCookies::with_caller_cookies(vec!["session".to_string()]);
+        let refused = chain.store(
             &[(
                 "Set-Cookie".to_string(),
                 "session=theirs; Path=/".to_string(),
             )],
             &uri("http://example.com/start"),
         );
-        assert_eq!(refused, vec!["session".to_string()]);
-        // Nothing to add to the caller's header, so the jar has nothing to
+        assert_eq!(refused.caller_owned, vec!["session".to_string()]);
+        // Nothing to add to the caller's header, so the chain has nothing to
         // say for the next hop and their `Cookie` goes out untouched.
-        assert_eq!(jar.header_for(&uri("http://example.com/end")), None);
+        assert_eq!(chain.header_for(&uri("http://example.com/end")), None);
     }
 
     #[test]
     fn caller_cookie_wins_whatever_scope_the_site_claims() {
         // Domain and Path don't buy the site a way around it, and neither
         // does setting it from a subdomain.
-        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
-        jar.store(
+        let mut chain = ChainCookies::with_caller_cookies(vec!["session".to_string()]);
+        chain.store(
             &[
                 (
                     "Set-Cookie".to_string(),
@@ -619,27 +709,30 @@ mod tests {
             ],
             &uri("http://app.example.com/admin/x"),
         );
-        assert_eq!(jar.header_for(&uri("http://app.example.com/admin/x")), None);
+        assert_eq!(
+            chain.header_for(&uri("http://app.example.com/admin/x")),
+            None
+        );
     }
 
     #[test]
     fn site_cannot_delete_a_caller_cookie() {
         // An expiry is a delete signal, and the caller's cookie isn't the
         // site's to delete.
-        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
-        let refused = jar.store(
+        let mut chain = ChainCookies::with_caller_cookies(vec!["session".to_string()]);
+        let refused = chain.store(
             &[("Set-Cookie".to_string(), "session=; Max-Age=0".to_string())],
             &uri("http://example.com/logout"),
         );
-        assert_eq!(refused, vec!["session".to_string()]);
-        assert_eq!(jar.header_for(&uri("http://example.com/")), None);
+        assert_eq!(refused.caller_owned, vec!["session".to_string()]);
+        assert_eq!(chain.header_for(&uri("http://example.com/")), None);
     }
 
     #[test]
     fn other_names_the_site_sets_still_come_through() {
         // Only the names the caller claimed are off limits.
-        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
-        jar.store(
+        let mut chain = ChainCookies::with_caller_cookies(vec!["session".to_string()]);
+        chain.store(
             &[
                 ("Set-Cookie".to_string(), "session=theirs".to_string()),
                 ("Set-Cookie".to_string(), "csrf=xyz".to_string()),
@@ -647,7 +740,7 @@ mod tests {
             &uri("http://example.com/start"),
         );
         assert_eq!(
-            jar.header_for(&uri("http://example.com/end")).as_deref(),
+            chain.header_for(&uri("http://example.com/end")).as_deref(),
             Some("csrf=xyz")
         );
     }
@@ -656,13 +749,13 @@ mod tests {
     fn cookie_names_are_case_sensitive() {
         // RFC 6265 4.1.1: `Session` and `session` are different cookies, so
         // pinning one doesn't pin the other.
-        let mut jar = CookieJar::with_caller_cookies(vec!["session".to_string()]);
-        jar.store(
+        let mut chain = ChainCookies::with_caller_cookies(vec!["session".to_string()]);
+        chain.store(
             &[("Set-Cookie".to_string(), "Session=theirs".to_string())],
             &uri("http://example.com/start"),
         );
         assert_eq!(
-            jar.header_for(&uri("http://example.com/end")).as_deref(),
+            chain.header_for(&uri("http://example.com/end")).as_deref(),
             Some("Session=theirs")
         );
     }
@@ -687,6 +780,85 @@ mod tests {
         let headers = vec![("Cookie".to_string(), "novalue; =orphan; real=1".to_string())];
         assert_eq!(caller_cookie_names(&headers), vec!["real".to_string()]);
         assert!(caller_cookie_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn one_oversized_cookie_is_refused() {
+        // 4096 bytes is what RFC 6265 6.1 asks a client to support, so
+        // anything past it is past what a real site needs.
+        let mut chain = ChainCookies::new();
+        let big = "A".repeat(MAX_COOKIE_BYTES);
+        let rejected = chain.store(
+            &[("Set-Cookie".to_string(), format!("big={}", big))],
+            &uri("http://example.com/"),
+        );
+        assert_eq!(rejected.over_limit, vec!["big".to_string()]);
+        assert_eq!(chain.header_for(&uri("http://example.com/")), None);
+
+        // Just inside the limit still goes in.
+        let mut chain = ChainCookies::new();
+        let ok = "A".repeat(MAX_COOKIE_BYTES - entry_size("ok", ""));
+        let rejected = chain.store(
+            &[("Set-Cookie".to_string(), format!("ok={}", ok))],
+            &uri("http://example.com/"),
+        );
+        assert!(rejected.over_limit.is_empty());
+        assert!(chain.header_for(&uri("http://example.com/")).is_some());
+    }
+
+    #[test]
+    fn storage_stops_at_the_cookie_count() {
+        let mut chain = ChainCookies::new();
+        let headers: Vec<(String, String)> = (0..MAX_COOKIES + 10)
+            .map(|i| ("Set-Cookie".to_string(), format!("c{}=v", i)))
+            .collect();
+        let rejected = chain.store(&headers, &uri("http://example.com/"));
+        assert_eq!(rejected.over_limit.len(), 10);
+        let header = chain.header_for(&uri("http://example.com/")).unwrap();
+        assert_eq!(header.split("; ").count(), MAX_COOKIES);
+        // First come, first served: what the chain set early is what a login
+        // flow needs, so a later hop can't push it out.
+        assert!(header.contains("c0=v"));
+        assert!(!header.contains(&format!("c{}=v", MAX_COOKIES)));
+    }
+
+    #[test]
+    fn storage_stops_at_the_byte_budget() {
+        // 30 cookies of 1KB is under the count limit but way over the byte
+        // budget, which is the shape that produced a 180KB `Cookie` header
+        // before there were any ceilings.
+        let mut chain = ChainCookies::new();
+        let value = "A".repeat(1024);
+        let headers: Vec<(String, String)> = (0..30)
+            .map(|i| ("Set-Cookie".to_string(), format!("c{}={}", i, value)))
+            .collect();
+        let rejected = chain.store(&headers, &uri("http://example.com/"));
+        assert!(!rejected.over_limit.is_empty());
+        let header = chain.header_for(&uri("http://example.com/")).unwrap();
+        assert!(
+            header.len() <= MAX_CHAIN_BYTES,
+            "emitted {} bytes, budget is {}",
+            header.len(),
+            MAX_CHAIN_BYTES
+        );
+        assert!(header.contains("c0="));
+    }
+
+    #[test]
+    fn resetting_a_cookie_does_not_leak_budget() {
+        // Replacing a value frees what the old one held, so a site that
+        // updates the same cookie every hop never fills the budget.
+        let mut chain = ChainCookies::new();
+        let value = "A".repeat(1000);
+        for _ in 0..50 {
+            let rejected = chain.store(
+                &[("Set-Cookie".to_string(), format!("session={}", value))],
+                &uri("http://example.com/"),
+            );
+            assert!(rejected.over_limit.is_empty());
+        }
+        let header = chain.header_for(&uri("http://example.com/")).unwrap();
+        assert_eq!(header.len(), entry_size("session", &value) - 2);
     }
 
     #[test]

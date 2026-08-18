@@ -1252,8 +1252,9 @@ fn build_request(
     // first `Cookie` header they supplied. If they supplied none, the
     // chain's cookies go out as their own header after the caller's.
     //
-    // The chain's list can't contain a name the caller set, because the jar
-    // refuses to store one, so this concatenation never produces the same
+    // The chain's list can't contain a name the caller set, because
+    // `ChainCookies` refuses to store one, so this concatenation never
+    // produces the same
     // name twice. That matters: duplicate names are read inconsistently
     // across servers (some take the first, some the last), so a request
     // carrying both would behave differently depending on the target.
@@ -1550,8 +1551,8 @@ impl HyperClient {
         // The caller's own cookies are recorded up front so the chain can
         // never touch them: whatever they put in a `Cookie` header is what
         // every hop sends.
-        let mut jar = config.should_forward_redirect_cookies().then(|| {
-            crate::cookies::CookieJar::with_caller_cookies(crate::cookies::caller_cookie_names(
+        let mut chain_cookies = config.should_forward_redirect_cookies().then(|| {
+            crate::cookies::ChainCookies::with_caller_cookies(crate::cookies::caller_cookie_names(
                 config.headers.as_deref().unwrap_or(&[]),
             ))
         });
@@ -1643,20 +1644,33 @@ impl HyperClient {
                 // everything collected so far applies to where we're going.
                 // The domain / path / Secure rules are what stop a cookie from
                 // following a redirect onto a host it doesn't belong to.
-                if let Some(jar) = jar.as_mut() {
-                    let refused = jar.store(&resp.headers, &uri);
-                    if !refused.is_empty() {
+                if let Some(chain) = chain_cookies.as_mut() {
+                    let rejected = chain.store(&resp.headers, &uri);
+                    if !rejected.caller_owned.is_empty() {
                         debug_record(
                             log,
                             v,
                             1,
                             &format!(
                                 "   Kept the caller's own cookie(s) over a Set-Cookie for: {}",
-                                refused.join(", ")
+                                rejected.caller_owned.join(", ")
                             ),
                         );
                     }
-                    hop_cookies = jar.header_for(&next_uri);
+                    // Say so rather than quietly holding fewer cookies than
+                    // the chain set: a cap nobody can see reads as coverage.
+                    if !rejected.over_limit.is_empty() {
+                        debug_record(
+                            log,
+                            v,
+                            1,
+                            &format!(
+                                "   Cookie limit reached, dropped: {}",
+                                rejected.over_limit.join(", ")
+                            ),
+                        );
+                    }
+                    hop_cookies = chain.header_for(&next_uri);
                     if let Some(ref c) = hop_cookies {
                         debug_record(log, v, 1, &format!("   Sending cookies: {}", c));
                     }

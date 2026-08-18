@@ -11,8 +11,9 @@ pub struct RequestConfig {
     pub follow_redirects: Option<bool>,
     pub max_redirects: Option<u32>,
     /// Apply cookies a redirect hop sets to the hops that follow it, within
-    /// this one request (default: true). The jar is request-scoped, so
-    /// nothing carries into the next request and results stay reproducible.
+    /// this one request (default: true). What the chain collects lives for
+    /// that request only, so nothing carries into the next one and results
+    /// stay reproducible.
     /// Set to `false` to send only the caller's own headers on every hop.
     ///
     /// A cookie set in `headers` is never affected by this. Whatever the

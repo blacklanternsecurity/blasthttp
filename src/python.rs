@@ -863,8 +863,10 @@ impl BlastHTTP {
     ///
     /// `redirect_cookies` (default `True`) applies a cookie set by one
     /// redirect hop to the hops after it, the way a browser does, which
-    /// is what lets a login or bot-check page resolve. The jar lives for
-    /// this request only, so nothing carries into the next one.
+    /// is what lets a login or bot-check page resolve. What the chain
+    /// collects lives for that request only, so nothing carries into the
+    /// next one. This is not a session: there is no cookie storage behind
+    /// it and no state shared between requests.
     ///
     /// A cookie you send yourself always wins. If `headers` carries
     /// `Cookie: session=mine`, every hop sends `session=mine`, and a

@@ -1,6 +1,6 @@
 //! End-to-end checks that cookies set mid-redirect reach the next hop.
 //!
-//! The jar itself is unit-tested in `src/cookies.rs`; these tests prove the
+//! `ChainCookies` itself is unit-tested in `src/cookies.rs`; these tests prove the
 //! wiring, i.e. that a real request through the client picks the cookie off
 //! a 302 and puts it on the wire for the hop that follows.
 
@@ -58,6 +58,49 @@ fn spawn_server(set_cookie: &'static str) -> (u16, mpsc::Receiver<Vec<String>>) 
                      Content-Length: 0\r\nConnection: close\r\n\r\n",
                     set_cookie
                 )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+            };
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (port, rx)
+}
+
+/// Like `spawn_server`, but the redirect carries `count` cookies of
+/// `value_len` bytes each. Stays under hyper's 100-header default so the
+/// response itself parses fine: the point is what we do with what it sets.
+fn spawn_cookie_flood(count: usize, value_len: usize) -> (u16, mpsc::Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let lines = read_request(&mut stream);
+            let target = lines
+                .first()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            let _ = tx.send(lines);
+
+            let response = if target.ends_with("/start") {
+                let mut head = String::from("HTTP/1.1 302 Found\r\nLocation: /end\r\n");
+                for i in 0..count {
+                    head.push_str(&format!(
+                        "Set-Cookie: c{}={}; Path=/\r\n",
+                        i,
+                        "A".repeat(value_len)
+                    ));
+                }
+                head.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+                head
             } else {
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
             };
@@ -176,4 +219,23 @@ async fn caller_cookie_survives_when_the_chain_adds_nothing() {
     })
     .await;
     assert_eq!(second_hop_cookie(&rx).as_deref(), Some("mine=1"));
+}
+
+#[tokio::test]
+async fn a_cookie_flood_cannot_grow_the_next_hop_without_bound() {
+    // 90 cookies of 2KB is a legal response, and with no ceiling on what a
+    // chain keeps, it made the next hop carry a 184,848 byte `Cookie`
+    // header, with every further hop free to add more. The byte budget is
+    // what keeps that bounded, and 8KB is about where servers stop accepting
+    // a header line anyway.
+    let (port, rx) = spawn_cookie_flood(90, 2048);
+    run(port, |_| {}).await;
+    let sent = second_hop_cookie(&rx).expect("second hop should still get cookies");
+    assert!(
+        sent.len() <= 8192,
+        "second hop carried {} bytes of Cookie header",
+        sent.len()
+    );
+    // Bounded, not empty: what the chain set first still goes out.
+    assert!(sent.starts_with("c0="));
 }
