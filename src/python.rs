@@ -548,11 +548,12 @@ impl PyResponse {
     /// Why `content` is not decoded content, when it isn't.
     ///
     /// `None` on any ordinary response, including one with no
-    /// `Content-Encoding`. A string means a declared coding could not be
-    /// undone, and says how far decoding got: `content` is either exactly
-    /// what the server sent, or a stack only partly undone. The response is
-    /// worth keeping either way, but code that hashes, matches or diffs
-    /// bodies should check this rather than treat encoded bytes as content.
+    /// `Content-Encoding`. A string means `content` is not what the header
+    /// said it was, and says how far decoding got: exactly what the server
+    /// sent, a stack only partly undone, or a stream that decoded partway
+    /// and then reported damage or an early end. The response is worth
+    /// keeping either way, but code that hashes, matches or diffs bodies
+    /// should check this rather than treat those bytes as content.
     #[getter]
     fn decode_error(&self) -> Option<String> {
         self.inner.decode_error.clone()
@@ -1393,6 +1394,8 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     redirect_cookies: Option<bool>,
     #[pyo3(get, set)]
+    alpn_protocols: Option<Vec<String>>,
+    #[pyo3(get, set)]
     verify_certs: Option<bool>,
     #[pyo3(get, set)]
     proxy: Option<String>,
@@ -1443,6 +1446,7 @@ impl PyBatchConfig {
         raw_path=None,
         request_target=None,
         resolve_ip=None,
+        alpn_protocols=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1467,6 +1471,7 @@ impl PyBatchConfig {
         raw_path: Option<bool>,
         request_target: Option<String>,
         resolve_ip: Option<String>,
+        alpn_protocols: Option<Vec<String>>,
     ) -> Self {
         PyBatchConfig {
             url,
@@ -1490,6 +1495,7 @@ impl PyBatchConfig {
             raw_path,
             request_target,
             resolve_ip,
+            alpn_protocols,
         }
     }
 }
@@ -1518,6 +1524,7 @@ impl Clone for PyBatchConfig {
             raw_path: self.raw_path,
             request_target: self.request_target.clone(),
             resolve_ip: self.resolve_ip.clone(),
+            alpn_protocols: self.alpn_protocols.clone(),
         })
     }
 }
@@ -1549,7 +1556,7 @@ impl PyBatchConfig {
             raw_path: self.raw_path,
             request_target: self.request_target,
             resolve_ip: self.resolve_ip,
-            alpn_protocols: None,
+            alpn_protocols: self.alpn_protocols,
             verbosity: 0,
         })
     }

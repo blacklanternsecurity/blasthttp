@@ -1337,7 +1337,18 @@ fn build_request(
                 && name.eq_ignore_ascii_case("cookie")
             {
                 merged_cookies = true;
-                builder = builder.header(name.as_str(), format!("{}; {}", value, extra));
+                // Join on exactly one `; `. A caller's header often ends with
+                // a stray separator, and pasting onto it leaves an empty pair
+                // in the middle of the list, which strict parsers treat as
+                // the end of the header: the chain's cookies would be dropped
+                // by the target while the log here said they were sent.
+                let caller = value.trim().trim_end_matches([';', ' ']);
+                let merged = if caller.is_empty() {
+                    extra.to_string()
+                } else {
+                    format!("{}; {}", caller, extra)
+                };
+                builder = builder.header(name.as_str(), merged);
                 continue;
             }
             builder = builder.header(name.as_str(), value.as_str());
@@ -1950,18 +1961,33 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
         return Decoded::content(data.to_vec());
     };
 
+    // Set when a layer produced output without decoding cleanly. The bytes
+    // are worth keeping and are not content, so this travels out with them.
+    let mut incomplete: Option<String> = None;
+
     let mut out = match decode_one(outermost, data, max_size) {
-        Ok(out) => out,
+        Inflated::Whole(out) => out,
+        Inflated::Partial(out, why) => {
+            incomplete = Some(why);
+            out
+        }
         // Nothing came off at all, so the bytes are what arrived.
-        Err(reason) => return Decoded::raw(data, reason),
+        Inflated::Failed(reason) => return Decoded::raw(data, reason),
     };
     let mut peeled = 1;
 
     for codec in remaining {
         match decode_one(codec, &out, max_size) {
-            Ok(next) => {
+            Inflated::Whole(next) => {
                 out = next;
                 peeled += 1;
+            }
+            Inflated::Partial(next, why) => {
+                out = next;
+                peeled += 1;
+                // Keep the outermost complaint: it's the one that describes
+                // the bytes as they arrived.
+                incomplete.get_or_insert(why);
             }
             // A layer underneath one that did come off won't inflate. Keep
             // the deepest peel rather than reverting to the original bytes,
@@ -1972,7 +1998,7 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
             // gives `gzip, gzip` over a singly-compressed body. What is in
             // hand there is the body. Still flagged, since the other
             // possibility is a layer genuinely left on.
-            Err(reason) => {
+            Inflated::Failed(reason) => {
                 return Decoded::partial(
                     out,
                     format!(
@@ -1983,7 +2009,11 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
             }
         }
     }
-    Decoded::content(out)
+
+    match incomplete {
+        Some(reason) => Decoded::partial(out, reason),
+        None => Decoded::content(out),
+    }
 }
 
 /// The outcome of `decompress`: bytes for the caller, plus whether they are
@@ -1995,12 +2025,17 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
 /// mistake one kind for the other, which is what `decode_error` is for.
 struct Decoded {
     body: Vec<u8>,
-    /// `None` when `body` is content: every declared coding came off (though
-    /// it may be short, if a stream broke or a cap cut it).
+    /// `None` when `body` is content: every declared coding came off, and
+    /// each decoder read its stream through to a clean end.
     ///
-    /// `Some(reason)` when it isn't, which covers two shapes. Either nothing
-    /// came off and `body` is exactly what arrived, or some layers came off
-    /// and `body` is as far in as we got. The reason distinguishes them.
+    /// `Some(reason)` when it isn't, which covers three shapes. Nothing came
+    /// off, and `body` is exactly what arrived. Some layers came off and
+    /// `body` is as far in as we got. Or a layer produced output and then
+    /// reported that the stream was cut or damaged, so `body` is a prefix, or
+    /// bytes that don't match what was compressed. The reason says which.
+    ///
+    /// That last one is the case worth being careful about, since the bytes
+    /// look like an ordinary body and aren't one.
     decode_error: Option<String>,
 }
 
@@ -2059,14 +2094,14 @@ impl Codec {
     }
 }
 
-/// Undo a single coding. The error is a reason string rather than a
-/// `ClientError` because nothing here is fatal to a response: see `Decoded`.
-fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
+/// Undo a single coding. Nothing here is fatal to a response, so the failure
+/// case is a reason string rather than a `ClientError`: see `Decoded`.
+fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Inflated {
     match codec {
         Codec::Gzip => read_bounded(flate2::read::GzDecoder::new(data), max_size, codec),
         Codec::Deflate => decode_deflate(data, max_size),
         Codec::Brotli => read_bounded(brotli::Decompressor::new(data, 4096), max_size, codec),
-        Codec::Identity => Ok(data.to_vec()),
+        Codec::Identity => Inflated::Whole(data.to_vec()),
     }
 }
 
@@ -2084,8 +2119,8 @@ fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Result<Vec<u8>, Str
 /// a multiple of 31. A raw stream can satisfy that by coincidence, so the
 /// flavor the header points at is tried first and the other one is the
 /// fallback.
-fn decode_deflate(data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
-    let attempt = |zlib: bool| -> Result<Vec<u8>, String> {
+fn decode_deflate(data: &[u8], max_size: usize) -> Inflated {
+    let attempt = |zlib: bool| -> Inflated {
         if zlib {
             read_bounded(
                 flate2::read::ZlibDecoder::new(data),
@@ -2103,13 +2138,16 @@ fn decode_deflate(data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
 
     let zlib_first = has_zlib_header(data);
     match attempt(zlib_first) {
-        Ok(out) if !out.is_empty() => Ok(out),
-        // Whatever the header suggested didn't inflate. Report its failure
-        // rather than the fallback's, since it's the likelier diagnosis.
-        expected => match attempt(!zlib_first) {
-            Ok(out) if !out.is_empty() => Ok(out),
-            _ => expected,
+        // Any output settles it. The two flavors don't cross-decode: handed
+        // the other one's stream, a decoder rejects the header outright and
+        // produces nothing, so output means this was the right flavor even
+        // when the stream then turns out to be cut or damaged.
+        Inflated::Failed(expected) => match attempt(!zlib_first) {
+            // Nothing either way, so report what the header pointed at.
+            Inflated::Failed(_) => Inflated::Failed(expected),
+            fallback => fallback,
         },
+        settled => settled,
     }
 }
 
@@ -2125,15 +2163,40 @@ fn has_zlib_header(data: &[u8]) -> bool {
     }
 }
 
+/// What one decoding attempt produced.
+enum Inflated {
+    /// The stream ended where it said it would, and checked out.
+    Whole(Vec<u8>),
+    /// Output, but the decoder and the stream disagreed on the way: bytes cut
+    /// off partway, a corrupt block, a checksum that doesn't match. Carries
+    /// what the decoder said.
+    Partial(Vec<u8>, String),
+    /// Nothing inflated at all.
+    Failed(String),
+}
+
 /// Run a decoder, keeping at most `max_size` bytes of output.
-fn read_bounded<R: Read>(reader: R, max_size: usize, codec: Codec) -> Result<Vec<u8>, String> {
+///
+/// Hitting `max_size` is not an error: `take` simply ends the stream, so the
+/// output cap reads as a clean finish. An error here means the input ran out
+/// early or didn't decode, which is worth telling apart from a body that
+/// decoded whole even when bytes did come out of it.
+fn read_bounded<R: Read>(reader: R, max_size: usize, codec: Codec) -> Inflated {
     let mut buf = Vec::new();
     match reader.take(max_size as u64).read_to_end(&mut buf) {
-        Ok(_) => Ok(buf),
-        // `read_to_end` keeps the bytes it managed to read before the error,
-        // so a truncated stream still leaves usable content in `buf`.
-        Err(_) if !buf.is_empty() => Ok(buf),
-        Err(e) => Err(format!("{} decompression failed: {}", codec.name(), e)),
+        Ok(_) => Inflated::Whole(buf),
+        Err(e) if buf.is_empty() => {
+            Inflated::Failed(format!("{} decompression failed: {}", codec.name(), e))
+        }
+        // `read_to_end` keeps what it managed to read before the error, and
+        // that prefix is usually worth having. It is not content, though: the
+        // usual causes are our own cap cutting the compressed bytes mid-stream
+        // and a body that was damaged or tampered with, and only the second
+        // one silently changes what the caller is looking at.
+        Err(e) => Inflated::Partial(
+            buf,
+            format!("{} stream did not decode cleanly: {}", codec.name(), e),
+        ),
     }
 }
 
@@ -2284,6 +2347,33 @@ mod tests {
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0], "first.host");
         assert_eq!(hosts[1], "second.host");
+    }
+
+    #[test]
+    fn test_chain_cookies_merge_into_a_well_formed_header() {
+        // A trailing `;` is the normal shape of a `Cookie` header copied out
+        // of a browser or a proxy, and joining onto it blindly produced
+        // `a=1;; chain=9`. Strict parsers give up at the empty pair, so the
+        // chain's cookies were dropped by the target while the debug log
+        // said they went out.
+        let uri: http::Uri = "http://example.com/".parse().unwrap();
+        for caller in ["a=1", "a=1;", "a=1; ", "a=1 ;  "] {
+            let mut config = RequestConfig::new("http://example.com/".to_string());
+            config.headers = Some(vec![("Cookie".to_string(), caller.to_string())]);
+            let req = build_request(&uri, &config, false, false, Some("chain=9")).unwrap();
+            assert_eq!(
+                req.headers().get("cookie").unwrap(),
+                "a=1; chain=9",
+                "caller header {:?}",
+                caller
+            );
+        }
+
+        // An empty `Cookie` header is the same as not having one.
+        let mut config = RequestConfig::new("http://example.com/".to_string());
+        config.headers = Some(vec![("Cookie".to_string(), String::new())]);
+        let req = build_request(&uri, &config, false, false, Some("chain=9")).unwrap();
+        assert_eq!(req.headers().get("cookie").unwrap(), "chain=9");
     }
 
     #[test]
@@ -2457,24 +2547,55 @@ mod tests {
         // end mid-stream, so the rest was never going to arrive. Keep
         // whatever inflated rather than dropping the whole response.
         //
-        // gzip and deflate emit as they go, so a cut stream still leaves
-        // a usable prefix. brotli is block-based and is covered
-        // separately below.
+        // Flagged, though, when the format can tell. gzip ends with a CRC32
+        // and a length, so a cut stream leaves a trailer that never arrives
+        // and the decoder says so.
+        let big = SAMPLE.repeat(400);
+        let compressed = gzip_bytes(&big);
+        let cut = &compressed[..compressed.len() / 2];
+        let (out, reason) = undecoded("gzip", cut, NO_LIMIT);
+        assert!(!out.is_empty(), "recovered nothing");
+        assert!(
+            big.starts_with(&out),
+            "partial output should prefix the original"
+        );
+        assert!(
+            reason.contains("did not decode cleanly"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_a_cut_deflate_stream_cannot_be_told_from_a_short_one() {
+        // The limit of the flag, pinned so its absence doesn't get read as a
+        // guarantee. Both deflate flavors just stop: inflate reports the
+        // prefix as a clean read, and nothing at this layer can tell that
+        // from a body that really was that short. Damage mid-stream is still
+        // caught, since that produces an invalid block rather than a tidy
+        // ending, and gzip catches truncation via its trailer.
         let big = SAMPLE.repeat(400);
         for (encoding, compressed) in [
-            ("gzip", gzip_bytes(&big)),
             ("deflate", deflate_bytes(&big)),
             ("deflate", zlib_bytes(&big)),
         ] {
             let cut = &compressed[..compressed.len() / 2];
             let out = decoded(encoding, cut, NO_LIMIT);
-            assert!(!out.is_empty(), "{} recovered nothing", encoding);
-            assert!(
-                big.starts_with(&out),
-                "{} partial output should prefix the original",
-                encoding
-            );
+            assert!(!out.is_empty());
+            assert!(big.starts_with(&out));
+            assert!(out.len() < big.len());
         }
+    }
+
+    #[test]
+    fn test_output_cap_alone_is_not_a_decode_failure() {
+        // The output cap ends the stream rather than breaking it, so a body
+        // trimmed to `max_size` is still content. Worth pinning: if this
+        // started reporting, every large compressed body on a capped request
+        // would come back flagged.
+        let zeros = vec![0u8; 200_000];
+        let out = decoded("gzip", &gzip_bytes(&zeros), 4096);
+        assert_eq!(out.len(), 4096);
     }
 
     #[test]
@@ -2526,6 +2647,45 @@ mod tests {
         assert_eq!(body, b"this is not gzip");
         assert!(
             reason.contains("decompression failed"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_decompress_flags_a_corrupt_stream() {
+        // One bit flipped mid-stream still inflates a prefix, and the
+        // decoder says so. Handing those bytes back as content means
+        // anything that hashes, matches or diffs them is working on garbage
+        // with nothing to tell it apart from a real body.
+        let big = SAMPLE.repeat(400);
+        let mut gz = gzip_bytes(&big);
+        let mid = gz.len() / 2;
+        gz[mid] ^= 0x01;
+
+        let (body, reason) = undecoded("gzip", &gz, NO_LIMIT);
+        assert!(!body.is_empty(), "test setup: expected a partial inflate");
+        assert_ne!(body, big, "test setup: expected corrupted output");
+        assert!(
+            reason.contains("gzip"),
+            "reason should name the codec: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_decompress_flags_a_bad_checksum() {
+        // gzip carries a CRC32, which is the only thing that catches a body
+        // that inflated cleanly but isn't what was compressed. The bytes here
+        // are fine, and the stream still says it was tampered with.
+        let mut gz = gzip_bytes(SAMPLE);
+        let n = gz.len();
+        gz[n - 8] ^= 0x01;
+
+        let (body, reason) = undecoded("gzip", &gz, NO_LIMIT);
+        assert_eq!(body, SAMPLE);
+        assert!(
+            reason.contains("checksum") || reason.contains("gzip"),
             "unexpected reason: {}",
             reason
         );

@@ -409,6 +409,45 @@ async def test_request_target_over_http1_is_unaffected(client, tls_server_factor
     assert "request_target cannot be sent" not in str(excinfo.value)
 
 
+async def test_batch_config_honors_alpn_protocols(client, selfsigned_cert):
+    """`BatchConfig` takes the same parameters as `request()`, and the batch
+    API is the main scanning surface, so the documented escape hatch for a
+    server that only answers over HTTP/1.1 has to be reachable from it."""
+    cert, key = selfsigned_cert
+    negotiated = []
+
+    async def handle(reader, writer):
+        ssl_obj = writer.get_extra_info("ssl_object")
+        negotiated.append(ssl_obj.selected_alpn_protocol() if ssl_obj else None)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    ctx = _server_ctx(cert, key, ["h2", "http/1.1"])
+    srv = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+    port = srv.sockets[0].getsockname()[1]
+    try:
+        config = blasthttp.BatchConfig(
+            f"https://127.0.0.1:{port}/",
+            timeout=10,
+            verify_certs=False,
+            alpn_protocols=["http/1.1"],
+        )
+        # The server hangs up after the handshake, so the request fails. The
+        # ALPN outcome is the point.
+        await client.request_batch([config], concurrency=1)
+        assert negotiated, "server saw no connection"
+        assert set(negotiated) == {"http/1.1"}
+    finally:
+        srv.close()
+        try:
+            await srv.wait_closed()
+        except Exception:
+            pass
+
+
 async def test_alpn_negotiated_is_none_for_plain_http():
     """Plain HTTP → no TLS → no ALPN. Using the existing local TCP
     echo fixture path rather than the TLS factory."""
