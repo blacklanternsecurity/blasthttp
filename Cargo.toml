@@ -46,6 +46,13 @@ http = "1"
 flate2 = "1"
 brotli = "8"
 
+# Public Suffix List — decides where a cookie's `Domain` stops being allowed
+# to widen. Without it `Domain=com` or `Domain=github.io` is accepted and the
+# cookie crosses to an unrelated host. The list is compiled in, so this costs
+# no network and no runtime lookup; dependabot keeps the version, and with it
+# the list, current.
+psl = "2.1.224"
+
 # Hashing — response fingerprinting (matches BBOT's hash format)
 murmur3 = "0.5"
 

@@ -769,11 +769,12 @@ async fn dispatch_request(
     uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
+    redirect_cookies: Option<&str>,
 ) -> Result<SingleResponse, ClientError> {
     // The pooled high-level client populates Host / :authority from the URI
     // itself, so we don't add a Host header here. Adding it would cause
     // duplicate :authority + host in the HTTP/2 HPACK block.
-    let request = build_request(uri, config, false, false)?;
+    let request = build_request(uri, config, false, false, redirect_cookies)?;
     let v = config.verbosity;
 
     debug_record(log, v, 1, "   Request headers:");
@@ -1124,10 +1125,10 @@ async fn dispatch_direct(
     // :authority and :path, and a Host header of our own would duplicate
     // :authority in the HPACK block.
     let request = if h2 {
-        build_request(&request_uri, config, false, false)?
+        build_request(&request_uri, config, false, false, None)?
     } else {
         let use_origin_form = config.request_target.is_none();
-        build_request(&request_uri, config, use_origin_form, true)?
+        build_request(&request_uri, config, use_origin_form, true, None)?
     };
 
     debug_record(log, v, 1, "   Request headers:");
@@ -1191,6 +1192,7 @@ async fn dispatch_forward_proxy(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
+    redirect_cookies: Option<&str>,
 ) -> Result<SingleResponse, ClientError> {
     let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
         ClientError::invalid_url(format!("invalid proxy URL: {}", e))
@@ -1228,7 +1230,7 @@ async fn dispatch_forward_proxy(
 
     // Build request with absolute-form URI (SendRequest does NOT normalize it).
     // The low-level http1 sender doesn't auto-populate Host, so add it manually.
-    let request = build_request(target_uri, config, false, true)?;
+    let request = build_request(target_uri, config, false, true, redirect_cookies)?;
     let v = config.verbosity;
 
     debug_record(log, v, 1, "   Request headers:");
@@ -1255,6 +1257,11 @@ fn build_request(
     config: &RequestConfig,
     origin_form: bool,
     manual_host_header: bool,
+    // Cookies picked up from earlier hops of this redirect chain, already
+    // filtered down to the ones that apply to `uri` and to names the caller
+    // didn't set themselves. Merged into the caller's own `Cookie` header
+    // when there is one, so we never send two.
+    redirect_cookies: Option<&str>,
 ) -> Result<hyper::Request<FullBody>, ClientError> {
     // For direct connections (dispatch_direct), use origin-form (path + query only)
     // in the request-line per RFC 7230 §5.3.1. For pooled/client connections,
@@ -1312,10 +1319,34 @@ fn build_request(
         builder = builder.header("Accept-Encoding", "gzip, deflate, br");
     }
 
+    // Emit the caller's headers, folding any redirect-chain cookies into the
+    // first `Cookie` header they supplied. If they supplied none, the
+    // chain's cookies go out as their own header after the caller's.
+    //
+    // The chain's list can't contain a name the caller set, because
+    // `ChainCookies` refuses to store one, so this concatenation never
+    // produces the same
+    // name twice. That matters: duplicate names are read inconsistently
+    // across servers (some take the first, some the last), so a request
+    // carrying both would behave differently depending on the target.
+    let mut merged_cookies = false;
     if let Some(ref custom_headers) = config.headers {
         for (name, value) in custom_headers {
+            if let Some(extra) = redirect_cookies
+                && !merged_cookies
+                && name.eq_ignore_ascii_case("cookie")
+            {
+                merged_cookies = true;
+                builder = builder.header(name.as_str(), format!("{}; {}", value, extra));
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_str());
         }
+    }
+    if let Some(extra) = redirect_cookies
+        && !merged_cookies
+    {
+        builder = builder.header("Cookie", extra);
     }
 
     let body_bytes = config.body.clone().unwrap_or_default();
@@ -1666,6 +1697,21 @@ impl HyperClient {
         let mut redirect_chain: Vec<RedirectHop> = Vec::new();
         let mut hops = 0u32;
 
+        // Cookies picked up as we walk this chain. Created here and dropped
+        // when the request returns, so two concurrent requests can never see
+        // each other's cookies and a request's result depends only on its own
+        // inputs. `hop_cookies` is the `Cookie` header for the hop we're about
+        // to make, recomputed per hop because each one may be a different host.
+        // The caller's own cookies are recorded up front so the chain can
+        // never touch them: whatever they put in a `Cookie` header is what
+        // every hop sends.
+        let mut chain_cookies = config.should_forward_redirect_cookies().then(|| {
+            crate::cookies::ChainCookies::with_caller_cookies(crate::cookies::caller_cookie_names(
+                config.headers.as_deref().unwrap_or(&[]),
+            ))
+        });
+        let mut hop_cookies: Option<String> = None;
+
         loop {
             // Decide the connection mode for the *current* target host on every
             // hop, not just the first. A redirect can send the request to a
@@ -1695,9 +1741,16 @@ impl HyperClient {
             };
 
             let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
-                dispatch_forward_proxy(proxy_url, &uri, config, log).await?
+                dispatch_forward_proxy(proxy_url, &uri, config, log, hop_cookies.as_deref()).await?
             } else {
-                dispatch_request(&cached.as_ref().unwrap().inner, &uri, config, log).await?
+                dispatch_request(
+                    &cached.as_ref().unwrap().inner,
+                    &uri,
+                    config,
+                    log,
+                    hop_cookies.as_deref(),
+                )
+                .await?
             };
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
@@ -1740,6 +1793,42 @@ impl HyperClient {
                     status: resp.status,
                     peer_ip: hop_peer_ip,
                 });
+
+                // Take this hop's `Set-Cookie` headers, then work out which of
+                // everything collected so far applies to where we're going.
+                // The domain / path / Secure rules are what stop a cookie from
+                // following a redirect onto a host it doesn't belong to.
+                if let Some(chain) = chain_cookies.as_mut() {
+                    let rejected = chain.store(&resp.headers, &uri);
+                    if !rejected.caller_owned.is_empty() {
+                        debug_record(
+                            log,
+                            v,
+                            1,
+                            &format!(
+                                "   Kept the caller's own cookie(s) over a Set-Cookie for: {}",
+                                rejected.caller_owned.join(", ")
+                            ),
+                        );
+                    }
+                    // Say so rather than quietly holding fewer cookies than
+                    // the chain set: a cap nobody can see reads as coverage.
+                    if !rejected.over_limit.is_empty() {
+                        debug_record(
+                            log,
+                            v,
+                            1,
+                            &format!(
+                                "   Cookie limit reached, dropped: {}",
+                                rejected.over_limit.join(", ")
+                            ),
+                        );
+                    }
+                    hop_cookies = chain.header_for(&next_uri);
+                    if let Some(ref c) = hop_cookies {
+                        debug_record(log, v, 1, &format!("   Sending cookies: {}", c));
+                    }
+                }
 
                 uri = next_uri;
                 continue;
@@ -2140,7 +2229,7 @@ mod tests {
     fn test_build_request_auto_host_from_uri() {
         let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
         let config = RequestConfig::new("http://example.com:8080/path".to_string());
-        let req = build_request(&uri, &config, true, true).unwrap();
+        let req = build_request(&uri, &config, true, true, None).unwrap();
         assert_eq!(req.headers().get("host").unwrap(), "example.com:8080");
     }
 
@@ -2152,7 +2241,7 @@ mod tests {
         // HTTP/2 HPACK block, which some origin servers reject.
         let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
         let config = RequestConfig::new("http://example.com:8080/path".to_string());
-        let req = build_request(&uri, &config, false, false).unwrap();
+        let req = build_request(&uri, &config, false, false, None).unwrap();
         assert!(req.headers().get("host").is_none());
     }
 
@@ -2161,7 +2250,7 @@ mod tests {
         let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
         let mut config = RequestConfig::new("http://example.com:8080/path".to_string());
         config.headers = Some(vec![("Host".to_string(), "custom.host".to_string())]);
-        let req = build_request(&uri, &config, true, true).unwrap();
+        let req = build_request(&uri, &config, true, true, None).unwrap();
         // Should only have the custom Host, not auto-derived
         let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
         assert_eq!(hosts.len(), 1);
@@ -2176,7 +2265,7 @@ mod tests {
         let uri: http::Uri = "http://example.com:8080/path".parse().unwrap();
         let mut config = RequestConfig::new("http://example.com:8080/path".to_string());
         config.headers = Some(vec![("Host".to_string(), "custom.host".to_string())]);
-        let req = build_request(&uri, &config, false, false).unwrap();
+        let req = build_request(&uri, &config, false, false, None).unwrap();
         let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0], "custom.host");
@@ -2190,7 +2279,7 @@ mod tests {
             ("Host".to_string(), "first.host".to_string()),
             ("Host".to_string(), "second.host".to_string()),
         ]);
-        let req = build_request(&uri, &config, true, true).unwrap();
+        let req = build_request(&uri, &config, true, true, None).unwrap();
         let hosts: Vec<_> = req.headers().get_all("host").iter().collect();
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0], "first.host");
@@ -2201,7 +2290,7 @@ mod tests {
     fn test_build_request_origin_form_strips_authority() {
         let uri: http::Uri = "http://example.com:8080/path?q=1".parse().unwrap();
         let config = RequestConfig::new("http://example.com:8080/path?q=1".to_string());
-        let req = build_request(&uri, &config, true, true).unwrap();
+        let req = build_request(&uri, &config, true, true, None).unwrap();
         assert_eq!(req.uri(), "/path?q=1");
     }
 
@@ -2209,7 +2298,7 @@ mod tests {
     fn test_build_request_absolute_form_preserves_uri() {
         let uri: http::Uri = "http://example.com:8080/path?q=1".parse().unwrap();
         let config = RequestConfig::new("http://example.com:8080/path?q=1".to_string());
-        let req = build_request(&uri, &config, false, false).unwrap();
+        let req = build_request(&uri, &config, false, false, None).unwrap();
         assert_eq!(req.uri().to_string(), "http://example.com:8080/path?q=1");
     }
 
@@ -2219,7 +2308,7 @@ mod tests {
         // Simulate: origin_form=false (as dispatch_direct does when request_target is Some)
         let uri: http::Uri = "http://evil.com/admin".parse().unwrap();
         let config = RequestConfig::new("http://example.com/".to_string());
-        let req = build_request(&uri, &config, false, true).unwrap();
+        let req = build_request(&uri, &config, false, true, None).unwrap();
         assert_eq!(req.uri().to_string(), "http://evil.com/admin");
     }
 

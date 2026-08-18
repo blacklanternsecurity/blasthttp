@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Cookies set on a redirect hop are applied to the hops that follow it, the way a browser does. What a chain collects lives for that one request, so nothing carries between requests
+- What a chain will hold is capped (4096 bytes per cookie, 50 cookies, 8KB total), so a response that sets hundreds of large cookies can't grow every later hop's `Cookie` header without bound
+- A `Domain` attribute is checked against the Public Suffix List, so `Domain=com`, `Domain=co.uk` or `Domain=github.io` can't be used to carry a cookie onto an unrelated host, and a cookie may only widen within one registrable domain
+- A cookie set in the request's own `Cookie` header always wins: every hop sends it, and a `Set-Cookie` naming it is ignored rather than replacing it, deleting it, or being sent alongside it
+- `redirect_cookies=False` (or `--no-redirect-cookies`) reverts to the previous behavior
+
 ## 0.10.0
 
 - Fix responses being discarded when `Content-Encoding` is declared on an empty body (bodyless redirects, `HEAD`, `304`)
