@@ -172,23 +172,36 @@ impl ChainCookies {
                 continue;
             }
             // §5.3 step 11: a new cookie replaces one with the same
-            // name/domain/path rather than adding a duplicate. Done before
-            // the budget check so a reset frees what the old value held.
-            self.cookies.retain(|c| {
-                !(c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path)
+            // name/domain/path rather than adding a duplicate. Find it now,
+            // but leave it in place: whether the replacement is allowed to
+            // land depends on the room the old value frees, and if it isn't
+            // allowed then dropping the incumbent would mean a refusal costs
+            // the caller a cookie they already had.
+            let replacing = self.cookies.iter().position(|c| {
+                c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path
             });
             if expired {
+                if let Some(i) = replacing {
+                    self.cookies.remove(i);
+                }
                 continue;
             }
+            let freed = replacing
+                .map(|i| entry_size(&self.cookies[i].name, &self.cookies[i].value))
+                .unwrap_or(0);
+            let held = self.cookies.len() - usize::from(replacing.is_some());
             // Whoever gets there first keeps the room. A chain's own early
             // cookies are the ones a login flow needs, so the sensible thing
             // to drop is whatever a later hop piles on top, not what we
             // already hold.
-            if self.cookies.len() >= MAX_COOKIES
-                || self.bytes() + entry_size(&cookie.name, &cookie.value) > MAX_CHAIN_BYTES
+            if held >= MAX_COOKIES
+                || self.bytes() - freed + entry_size(&cookie.name, &cookie.value) > MAX_CHAIN_BYTES
             {
                 Rejected::note(&mut rejected.over_limit, &cookie.name);
                 continue;
+            }
+            if let Some(i) = replacing {
+                self.cookies.remove(i);
             }
             self.cookies.push(cookie);
         }
@@ -274,7 +287,17 @@ pub fn caller_cookie_names(headers: &[(String, String)]) -> Vec<String> {
 
 /// Lowercase a host and strip a single trailing dot so `Example.COM.` and
 /// `example.com` compare equal.
+///
+/// Also unwraps the brackets `Uri::host()` puts around an IPv6 literal. They
+/// aren't part of the name, and leaving them on breaks every check downstream
+/// that expects one: `[::1]` doesn't parse as an address, so the guard saying
+/// an address only matches itself never fires, and the domain rules end up
+/// running on a string with a `]` in it.
 fn canonical_host(host: &str) -> String {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -517,11 +540,33 @@ fn parse_http_date(s: &str) -> Option<i64> {
 
     let (day, month, year) = (day?, month?, year?);
     let (h, m, sec) = time.unwrap_or((0, 0, 0));
+
+    // Everything above came off the wire, so none of it is trustworthy as
+    // arithmetic input. RFC 6265 5.1.1 says to give up on a time field out of
+    // range, which also keeps the multiplications below in bounds.
+    if !(0..=23).contains(&h) || !(0..=59).contains(&m) || !(0..=60).contains(&sec) {
+        return None;
+    }
+    // Same section: a year below 1601 isn't a date, so give up rather than
+    // guess. There is no ceiling in the spec, but a year large enough to
+    // overflow the seconds calculation means the same thing as the largest
+    // one that doesn't, namely that this cookie is not expiring, so clamp
+    // instead of panicking in a debug build or wrapping to a past date in a
+    // release one.
+    if year < 1601 {
+        return None;
+    }
+    let year = year.min(9999);
+
     Some(days_from_civil(year, month, day) * 86400 + h * 3600 + m * 60 + sec)
 }
 
 /// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
 /// `days_from_civil`). Avoids pulling in a date crate for one calculation.
+///
+/// Callers must bound `y` first: this multiplies out, so an unbounded year
+/// straight from a header overflows. `parse_http_date` clamps to the RFC's
+/// 1601 floor and a 9999 ceiling.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -715,6 +760,36 @@ mod tests {
         );
         // Host-only, so it doesn't reach a subdomain of it.
         assert_eq!(chain.header_for(&uri("http://sub.localhost/")), None);
+    }
+
+    #[test]
+    fn ipv6_literal_host_cannot_widen_via_domain() {
+        // `Uri::host()` hands back an IPv6 literal in brackets, so the guard
+        // that says an address only ever matches itself never fired: the
+        // bracketed string doesn't parse as an address, and the domain rules
+        // then ran on a name with a `]` in it. `Domain=3.4]` covers
+        // `[::ffff:1.2.3.4]` on a dot boundary, and covered every other
+        // literal ending the same way.
+        let mut chain = ChainCookies::new();
+        set(
+            &mut chain,
+            "http://[::ffff:1.2.3.4]/x",
+            &["stolen=attacker_value; Domain=3.4]; Path=/"],
+        );
+        assert_eq!(
+            chain.header_for(&uri("http://[::ffff:9.9.3.4]/admin")),
+            None,
+            "cookie walked from one IPv6 literal to another"
+        );
+
+        // The address still gets its own cookies, host-only.
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "http://[::1]/x", &["mine=1"]);
+        assert_eq!(
+            chain.header_for(&uri("http://[::1]/other")).as_deref(),
+            Some("mine=1")
+        );
+        assert_eq!(chain.header_for(&uri("http://[::2]/other")), None);
     }
 
     #[test]
@@ -1041,6 +1116,110 @@ mod tests {
         }
         let header = chain.header_for(&uri("http://example.com/")).unwrap();
         assert_eq!(header.len(), entry_size("session", &value) - 2);
+    }
+
+    #[test]
+    fn absurd_expires_values_do_not_panic() {
+        // `Expires` is attacker-controlled text off the wire, and the year
+        // and time fields were parsed straight into i64 and multiplied out.
+        // A year of 3e11 overflows the seconds calculation, which aborts a
+        // debug build and wraps in release.
+        let mut chain = ChainCookies::new();
+        chain.store(
+            &[
+                (
+                    "Set-Cookie".to_string(),
+                    "a=1; Expires=Thu, 01 Jan 300000000000 00:00:00 GMT".to_string(),
+                ),
+                (
+                    "Set-Cookie".to_string(),
+                    "b=2; Expires=Mon, 01 Jan 2020 9223372036854775807:00:00".to_string(),
+                ),
+                (
+                    "Set-Cookie".to_string(),
+                    format!("c=3; Expires=Mon, 01 Jan {} 00:00:00 GMT", i64::MAX),
+                ),
+                (
+                    "Set-Cookie".to_string(),
+                    "d=4; Expires=Mon, 01 Jan 1000 00:00:00 GMT".to_string(),
+                ),
+            ],
+            &uri("http://example.com/"),
+        );
+
+        // A year past what a date can mean is a promise the cookie outlives
+        // the request, so it stays. A time field out of range, or a year
+        // below the RFC's 1601 floor, is not a date at all and RFC 6265 5.1.1
+        // says to give up on it, which leaves those cookies with the
+        // no-expiry default. So all four survive, and none of them take the
+        // process down on the way.
+        let header = chain.header_for(&uri("http://example.com/")).unwrap();
+        for name in ["a=1", "b=2", "c=3", "d=4"] {
+            assert!(header.contains(name), "{} missing from {}", name, header);
+        }
+    }
+
+    #[test]
+    fn a_refused_replacement_leaves_the_old_cookie_alone() {
+        // The §5.3-step-11 eviction used to run before the budget check, so
+        // refusing an oversized replacement still cost you the cookie it was
+        // replacing. On a site whose cookies come to about 8KB, re-issuing a
+        // bigger session cookie mid-redirect left the rest of the chain with
+        // no session at all, which is a silent auth failure in exactly the
+        // flow this feature exists for.
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "http://example.com/", &["session=abc123"]);
+        let filler: Vec<String> = (0..9)
+            .map(|i| format!("f{}={}", i, "x".repeat(900)))
+            .collect();
+        set(
+            &mut chain,
+            "http://example.com/",
+            &filler.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        assert!(
+            chain
+                .header_for(&uri("http://example.com/"))
+                .unwrap()
+                .contains("session=abc123")
+        );
+
+        let rejected = chain.store(
+            &[(
+                "Set-Cookie".to_string(),
+                format!("session={}", "B".repeat(1500)),
+            )],
+            &uri("http://example.com/"),
+        );
+
+        assert_eq!(rejected.over_limit, vec!["session".to_string()]);
+        assert!(
+            chain
+                .header_for(&uri("http://example.com/"))
+                .unwrap()
+                .contains("session=abc123"),
+            "the incumbent was dropped for a replacement that never landed"
+        );
+    }
+
+    #[test]
+    fn a_replacement_that_fits_reuses_the_old_cookie_s_room() {
+        // The other half: a same-name reset has to be measured against the
+        // budget with the value it replaces taken out, or a site that
+        // re-issues one large cookie every hop fills the chain up.
+        let mut chain = ChainCookies::new();
+        for _ in 0..20 {
+            let rejected = chain.store(
+                &[(
+                    "Set-Cookie".to_string(),
+                    format!("session={}", "B".repeat(4000)),
+                )],
+                &uri("http://example.com/"),
+            );
+            assert!(rejected.over_limit.is_empty(), "{:?}", rejected.over_limit);
+        }
+        let header = chain.header_for(&uri("http://example.com/")).unwrap();
+        assert_eq!(header.len(), entry_size("session", &"B".repeat(4000)) - 2);
     }
 
     #[test]

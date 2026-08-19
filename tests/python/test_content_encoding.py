@@ -281,7 +281,8 @@ async def test_decode_error_is_none_when_there_is_no_encoding(client, server):
 
 async def test_max_body_size_truncating_a_compressed_stream(client, server):
     """`max_body_size` cuts the compressed bytes, so the stream ends
-    mid-way. Keep what inflated instead of discarding the response."""
+    mid-way. Keep what inflated instead of discarding the response, and
+    say that it isn't whole."""
     cap = 10_000
     r = await client.request(f"{server}/incompressible", timeout=20, follow_redirects=False, max_body_size=cap)
     assert r.status_code == 200
@@ -290,6 +291,10 @@ async def test_max_body_size_truncating_a_compressed_stream(client, server):
     assert 0 < len(r.content) <= cap
     assert len(r.content) < len(INCOMPRESSIBLE)
     assert INCOMPRESSIBLE.startswith(r.content)
+    # The bytes read like an ordinary body and aren't one, so the flag has
+    # to carry that. Without this assertion the test passes either way.
+    assert r.decode_error is not None
+    assert "did not decode cleanly" in r.decode_error
 
 
 async def test_max_body_size_too_small_to_inflate_anything(client, server):
