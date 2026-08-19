@@ -2036,6 +2036,15 @@ struct Decoded {
     ///
     /// That last one is the case worth being careful about, since the bytes
     /// look like an ordinary body and aren't one.
+    ///
+    /// A body cut by `max_body` lands here too when the cap ends the wire
+    /// read before the decoder is done, which happens on bodies that barely
+    /// compress. The same cap bounds both the bytes read and the bytes kept,
+    /// so which limit trips first depends on the body's entropy: a highly
+    /// compressible body fills the output cap and reads clean, a
+    /// near-incompressible one runs out of input and is flagged. Flagged is
+    /// the deliberate choice, since a truncated prefix is what a middlebox
+    /// cutting a response also produces.
     decode_error: Option<String>,
 }
 
@@ -2567,13 +2576,21 @@ mod tests {
     }
 
     #[test]
-    fn test_a_cut_deflate_stream_cannot_be_told_from_a_short_one() {
+    fn test_our_decoder_reads_a_cut_deflate_stream_as_a_short_one() {
         // The limit of the flag, pinned so its absence doesn't get read as a
-        // guarantee. Both deflate flavors just stop: inflate reports the
-        // prefix as a clean read, and nothing at this layer can tell that
-        // from a body that really was that short. Damage mid-stream is still
-        // caught, since that produces an invalid block rather than a tidy
-        // ending, and gzip catches truncation via its trailer.
+        // guarantee. This is a property of the decoder, not of the format.
+        // zlib (RFC 1950 §2.2) does carry an integrity trailer, a 4-byte
+        // adler32, but `flate2`'s `ZlibDecoder` doesn't require it to be
+        // present, so a truncated stream reads as a clean short one:
+        //
+        //   zlib, full                  Ok,  135000 bytes, matches
+        //   zlib, trailer stripped (-4) Ok,  135000 bytes, matches
+        //   zlib, adler32 corrupted     Err("corrupt deflate stream")
+        //
+        // Raw deflate (RFC 1951) has no trailer at all, so the same read is
+        // the only one available to it. Damage mid-stream is still caught in
+        // both flavors, since that produces an invalid block rather than a
+        // tidy ending, and gzip catches truncation via its trailer.
         let big = SAMPLE.repeat(400);
         for (encoding, compressed) in [
             ("deflate", deflate_bytes(&big)),
@@ -2588,14 +2605,80 @@ mod tests {
     }
 
     #[test]
+    fn test_a_corrupted_zlib_trailer_is_flagged() {
+        // The other side of the test above: zlib's adler32 is checked when it
+        // is present, so damage to it is caught even though truncation past
+        // it is not. Without this, the pair above reads as "deflate has no
+        // integrity check", which is a property of neither flavor.
+        //
+        // Whether the flag arrives as a failed or partial decode depends on
+        // how much output cleared the decoder's buffer before the trailer was
+        // reached, so this asserts that it is flagged and what the decoder
+        // blamed, not which of the two shapes it took.
+        let big = SAMPLE.repeat(400);
+        let mut compressed = zlib_bytes(&big);
+        let last = compressed.len() - 1;
+        compressed[last] ^= 0xff;
+        let (_, reason) = undecoded("deflate", &compressed, NO_LIMIT);
+        assert!(
+            reason.contains("corrupt deflate stream"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[test]
     fn test_output_cap_alone_is_not_a_decode_failure() {
         // The output cap ends the stream rather than breaking it, so a body
         // trimmed to `max_size` is still content. Worth pinning: if this
         // started reporting, every large compressed body on a capped request
         // would come back flagged.
+        //
+        // This holds only when the output cap is what ends the read. It is
+        // reached first here because the fixture is ~200:1 compressible, so
+        // 4096 bytes of output come off long before the compressed bytes run
+        // out. See `test_capped_incompressible_body_is_flagged` for the case
+        // where the same cap cuts the wire instead.
         let zeros = vec![0u8; 200_000];
         let out = decoded("gzip", &gzip_bytes(&zeros), 4096);
         assert_eq!(out.len(), 4096);
+    }
+
+    #[test]
+    fn test_capped_incompressible_body_is_flagged() {
+        // The other side of the cap: whether a capped body is flagged depends
+        // on the body's entropy, because `max_body` bounds both the wire read
+        // and the decoder output. On a barely-compressible body the wire is
+        // cut first, the decoder runs out of input mid-stream, and that is
+        // indistinguishable from truncation by a middlebox:
+        //
+        //   gzip, ~200:1 compressible, cap 50k   Ok,  out=50000
+        //   gzip, incompressible,      cap 50k   Err("unexpected end of file")
+        //
+        // Flagged is the deliberate choice. A caller filtering on
+        // `decode_error is None` drops these, which is the safe direction:
+        // the alternative hands back a prefix that reads as a whole body.
+        let mut incompressible = Vec::with_capacity(200_000);
+        let mut state: u64 = 0x1234_5678;
+        for _ in 0..200_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            incompressible.push((state >> 33) as u8);
+        }
+        let compressed = gzip_bytes(&incompressible);
+        let cap = 50_000;
+        let (out, reason) = undecoded("gzip", &compressed[..cap], cap);
+        assert!(!out.is_empty(), "recovered nothing");
+        assert!(
+            incompressible.starts_with(&out),
+            "partial output should prefix the original"
+        );
+        assert!(
+            reason.contains("did not decode cleanly"),
+            "unexpected reason: {}",
+            reason
+        );
     }
 
     #[test]
