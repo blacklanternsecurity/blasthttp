@@ -109,6 +109,7 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `--rate-limit` | Requests per second (batch mode) | unlimited |
 | `-L, --follow-redirects` | Follow redirects | off |
 | `--max-redirects` | Max redirect hops | `10` |
+| `--no-redirect-cookies` | Don't apply cookies a redirect sets to later hops | off |
 | `-t, --timeout` | Request timeout (seconds) | `10` |
 | `--max-body-size` | Max response body (bytes) | 10 MB |
 | `--verify` | Enable TLS cert validation | off |
@@ -184,10 +185,15 @@ asyncio.run(main())
 | `elapsed_ms` / `elapsed` | `int` / `timedelta` | total request time |
 | `request` | `Request` | original `request.url` and `request.method` |
 | `debug_log` | `list[str]` | internal debug/timing lines |
+| `decode_error` | `str \| None` | why `content` is not decoded content; `None` on any ordinary response |
 | `json()` | callable | `json.loads(self.text)` |
 | `raise_for_status()` | callable | raises `HTTPStatusError` on 4xx/5xx |
 
 `body`, `raw_headers`, `cookies`, and `hash` are lazy — first access computes, subsequent accesses are free. Hashing a 10 MB body is real work; batch jobs that filter on `status` and never look at the body don't pay for it.
+
+A response whose body won't decode is still returned: the status line and headers arrived cleanly, and losing the response looks the same to the caller as an unreachable host. When that happens `decode_error` says why, and how far decoding got. It's also set when a stream decodes partway and then reports damage or an early end, since those bytes read like an ordinary body and aren't one. With nothing undone, `content` is exactly what the server sent. With a stack of codings only partly undone, `content` is as far in as decoding reached, which is usually the body, since a header that overstates the codings (a proxy re-adding `Content-Encoding: gzip` in front of a backend that already set it) is more common than a body really encoded that many times. Anything that hashes, matches, or diffs bodies should check it, since encoded bytes are otherwise indistinguishable from content.
+
+`decode_error` is also set when `max_body` cuts a compressed body short. The cap bounds both what is read off the wire and what the decoder keeps, so which limit trips first depends on how well the body compresses: a highly compressible body fills the output cap and comes back as clean content, while a near-incompressible one has its wire bytes cut mid-stream and is flagged. That is deliberate, since a truncated prefix is exactly what a middlebox cutting a response produces. Code filtering on `decode_error is None` will drop capped incompressible bodies it would otherwise have kept.
 
 `headers` is a `Headers` instance (case-insensitive view), not a list of tuples. Iterate with `.items()` to get `(name, value)` pairs preserving original case and duplicate names (e.g. multiple `Set-Cookie`). `Headers` is registered with `collections.abc.MutableMapping`, so libraries that special-case mappings (`DeepDiff`, `dataclasses`, etc.) recognize it.
 
@@ -229,6 +235,7 @@ All parameters except `url` are optional:
 | `timeout` | `int` | Request timeout in seconds |
 | `follow_redirects` | `bool` | Follow redirects |
 | `max_redirects` | `int` | Max redirect hops |
+| `redirect_cookies` | `bool` | Apply cookies a redirect sets to later hops (default `True`) |
 | `verify_certs` | `bool` | Enable TLS cert validation (default `False`) |
 | `proxy` | `str` | HTTP/SOCKS proxy URL |
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
@@ -238,11 +245,14 @@ All parameters except `url` are optional:
 | `retries` | `int` | Number of retries on failure |
 | `retry_wait_min_ms` | `int` | Minimum backoff between retries (ms) |
 | `retry_wait_max_ms` | `int` | Maximum backoff between retries (ms) |
-| `max_body_size` | `int` | Max response body bytes to download |
+| `max_body_size` | `int` | Max response body bytes to read; stops the read, not just what's kept |
 | `request_target` | `str` | Override the HTTP request-line URI |
 | `resolve_ip` | `str` | Connect to this IP (DNS pinning / `curl --resolve`) |
+| `alpn_protocols` | `list[str]` | ALPN list to offer; the request is spoken over whatever the server picks |
 
 `BatchConfig` accepts the same parameters (pass them as constructor kwargs).
+
+`alpn_protocols` defaults differ by path, because the offer is part of the client's TLS fingerprint and changing it changes how existing callers look on the wire. Ordinary pooled requests offer `["h2", "http/1.1"]`; requests with `resolve_ip` or `request_target` set bypass the pool and offer `["http/1.1"]` alone. Pass `["http/1.1"]` to keep a request off HTTP/2, or `["h2"]` to force it. `request_target` can't be combined with an HTTP/2 offer, since h2 carries the target in `:path` rather than a request-line — use `raw_connect` with `blasthttp.h2` for that.
 
 ### Multipart file uploads
 
@@ -312,6 +322,40 @@ response = await client.request(
     request_target="http://internal.server/admin",
 )
 ```
+
+### Cookies across redirects
+
+When `follow_redirects` is on, a cookie set by one hop is sent on the hops that follow it, the same way a browser does. That's what makes a login or bot-check page work: it hands you a cookie along with the redirect, and the cookie has to be on the next request to count for anything. Without this you'd loop or land back on the same page.
+
+This is **not a session**, and there's no cookie storage behind it. What a chain collects is created when the request starts and dropped when it returns, so nothing carries into the next request and no two requests can see each other's cookies. A batch of 500 URLs runs 500 independent chains, which keeps every result reproducible on its own.
+
+What a chain will hold is capped, since a response can set as many cookies as it likes and every later hop would carry all of them: 4096 bytes per cookie and 50 cookies, which is what RFC 6265 asks a client to support and roughly what browsers allow, and 8KB across the whole chain, which is about where servers stop accepting a header line. Past those, later cookies are dropped and the ones already held are kept, with a line in the debug log saying what went.
+
+Which cookie goes to which hop follows the usual rules (RFC 6265): a cookie with no `Domain` goes back only to the exact host that set it, a `Domain` that doesn't cover the host that sent it is thrown out, `Path` has to match, and `Secure` cookies never go over plain HTTP.
+
+`Domain` also gets checked against the Public Suffix List, because the rules above don't cover it on their own: `Domain=com` does cover the host that set it, so it passes every other check, and then covers every other `.com` the chain visits. A cookie may only widen within one registrable domain, so `auth.example.com` can hand one to `app.example.com`, while `Domain=com`, `Domain=co.uk`, `Domain=github.io` and `Domain=s3.amazonaws.com` are refused. That is what stops a redirect walking a cookie the chain picked up onto an unrelated host. Headers you supply yourself are a different matter: those are sent as given on every hop, including after a redirect to another host, because a header you set is a header we send.
+
+Pass `redirect_cookies=False` (or `--no-redirect-cookies` on the CLI) to turn it off and send only your own headers on every hop.
+
+```python
+# On by default.
+r = await client.request("https://example.com/login", method="POST",
+                         body="user=x&pass=y", follow_redirects=True)
+
+# Off: every hop gets only the headers you supplied.
+r = await client.request("https://example.com/login", follow_redirects=True,
+                         redirect_cookies=False)
+```
+
+**A cookie you set yourself always wins.** If your request carries `Cookie: session=mine`, every hop of that chain sends `session=mine`. A `Set-Cookie` naming a cookie you set is ignored: it can't replace your value, an expiry on it can't delete your value, and the two never go out together as a duplicate pair. Sites reset cookies mid-redirect routinely, and servers disagree about which value to read when a name appears twice (some take the first, some the last), so the only rule that behaves the same everywhere is that what you wrote is what lands on the wire. Cookies the chain sets under *other* names are merged into your `Cookie` header, yours first.
+
+```python
+# Every hop sends session=mine, whatever the site tries to set.
+r = await client.request("https://example.com/start", follow_redirects=True,
+                         headers=[("Cookie", "session=mine")])
+```
+
+Run with `-v` to see it happen: the debug log records both the cookies each hop is given and any `Set-Cookie` that lost to one of yours.
 
 ### Proxy exclusions (`no_proxy`)
 

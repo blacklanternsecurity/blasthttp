@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long, default_value = "10")]
     max_redirects: u32,
 
+    /// Don't apply cookies a redirect sets to the hops that follow it
+    #[arg(long)]
+    no_redirect_cookies: bool,
+
     /// Request timeout in seconds
     #[arg(short, long)]
     timeout: Option<u64>,
@@ -111,6 +115,7 @@ fn build_config(cli: &Cli, url: String) -> RequestConfig {
     config.verify_certs = Some(cli.verify);
     config.follow_redirects = Some(cli.follow_redirects);
     config.max_redirects = Some(cli.max_redirects);
+    config.redirect_cookies = Some(!cli.no_redirect_cookies);
     config.timeout_seconds = cli.timeout;
     config.max_body_size = cli.max_body_size;
     config.proxy = cli.proxy.clone();

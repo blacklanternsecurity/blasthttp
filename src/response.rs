@@ -32,6 +32,28 @@ pub struct Response {
     /// Debug messages collected during the request (for Python-side inspection)
     #[serde(skip_serializing)]
     pub debug_log: Vec<String>,
+    /// Why `body_bytes` is not decoded content, when it isn't.
+    ///
+    /// `None` on any ordinary response, including one with no
+    /// `Content-Encoding` at all. `Some(reason)` means the body is not what
+    /// the header said it was, and the reason says how far decoding got.
+    ///
+    /// With nothing undone, `body_bytes` is exactly what arrived: an
+    /// unsupported coding, or a body that doesn't match what it claims. With
+    /// a stack only partly undone, it is as far in as decoding reached, which
+    /// is usually the body, since a header that overstates the codings is
+    /// more common than a body encoded that many times. And with a stream
+    /// that decoded partway and then reported damage or an early end,
+    /// `body_bytes` is that prefix. The last case is the one to be careful
+    /// with: those bytes read like an ordinary body and aren't one.
+    ///
+    /// A response is worth keeping either way, since the status line and
+    /// headers arrived cleanly and losing the response looks the same as an
+    /// unreachable host. But anything that hashes, matches or diffs bodies
+    /// has to be able to tell encoded bytes from content, which is what this
+    /// is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_error: Option<String>,
 
     // ── Lazy-computed caches ──────────────────────────────────────
     // Each is filled on first access of the corresponding accessor
@@ -57,7 +79,7 @@ impl Serialize for Response {
     /// callers that just want lazy memory behavior should access
     /// fields directly instead of serializing.
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut out = s.serialize_struct("Response", 12)?;
+        let mut out = s.serialize_struct("Response", 13)?;
         out.serialize_field("url", &self.url)?;
         out.serialize_field("status", &self.status)?;
         out.serialize_field("headers", &self.headers)?;
@@ -79,6 +101,11 @@ impl Serialize for Response {
         }
         out.serialize_field("request_url", &self.request_url)?;
         out.serialize_field("request_method", &self.request_method)?;
+        if let Some(ref e) = self.decode_error {
+            out.serialize_field("decode_error", e)?;
+        } else {
+            out.skip_field("decode_error")?;
+        }
         out.end()
     }
 }
@@ -101,6 +128,7 @@ impl Clone for Response {
             request_url: self.request_url.clone(),
             request_method: self.request_method.clone(),
             debug_log: self.debug_log.clone(),
+            decode_error: self.decode_error.clone(),
             body_cache: OnceLock::new(),
             raw_headers_cache: OnceLock::new(),
             cookies_cache: OnceLock::new(),

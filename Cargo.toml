@@ -1,9 +1,11 @@
 [package]
 name = "blasthttp"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
 license = "GPL-3.0"
+# CI-only pin. Shipping it would override the toolchain of anyone building from the sdist.
+exclude = ["rust-toolchain.toml"]
 
 [lib]
 # When building as a Python module, we need a cdylib (shared library).
@@ -43,6 +45,13 @@ http = "1"
 # Decompression
 flate2 = "1"
 brotli = "8"
+
+# Public Suffix List — decides where a cookie's `Domain` stops being allowed
+# to widen. Without it `Domain=com` or `Domain=github.io` is accepted and the
+# cookie crosses to an unrelated host. The list is compiled in, so this costs
+# no network and no runtime lookup; dependabot keeps the version, and with it
+# the list, current.
+psl = "2.1.224"
 
 # Hashing — response fingerprinting (matches BBOT's hash format)
 murmur3 = "0.5"

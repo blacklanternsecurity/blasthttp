@@ -477,6 +477,7 @@ impl PyResponse {
             request_url,
             request_method,
             debug_log: Vec::new(),
+            decode_error: None,
             body_cache: OnceLock::new(),
             raw_headers_cache: OnceLock::new(),
             cookies_cache: OnceLock::new(),
@@ -542,6 +543,20 @@ impl PyResponse {
     #[getter]
     fn content(&self) -> &[u8] {
         &self.inner.body_bytes
+    }
+
+    /// Why `content` is not decoded content, when it isn't.
+    ///
+    /// `None` on any ordinary response, including one with no
+    /// `Content-Encoding`. A string means `content` is not what the header
+    /// said it was, and says how far decoding got: exactly what the server
+    /// sent, a stack only partly undone, or a stream that decoded partway
+    /// and then reported damage or an early end. The response is worth
+    /// keeping either way, but code that hashes, matches or diffs bodies
+    /// should check this rather than treat those bytes as content.
+    #[getter]
+    fn decode_error(&self) -> Option<String> {
+        self.inner.decode_error.clone()
     }
 
     /// The originally-requested URL and method (httpx-style
@@ -860,6 +875,37 @@ impl BlastHTTP {
     /// body is built as a `multipart/form-data` payload and the
     /// `Content-Type` header is set automatically (unless the caller
     /// supplied one). `files` takes precedence over `body`.
+    ///
+    /// `redirect_cookies` (default `True`) applies a cookie set by one
+    /// redirect hop to the hops after it, the way a browser does, which
+    /// is what lets a login or bot-check page resolve. What the chain
+    /// collects lives for that request only, so nothing carries into the
+    /// next one. This is not a session: there is no cookie storage behind
+    /// it and no state shared between requests.
+    ///
+    /// A cookie you send yourself always wins. If `headers` carries
+    /// `Cookie: session=mine`, every hop sends `session=mine`, and a
+    /// `Set-Cookie` for `session` is ignored rather than replacing it,
+    /// deleting it, or going out beside it as a second value.
+    ///
+    /// `alpn_protocols` overrides what gets offered during the TLS
+    /// handshake, and the request is then spoken over whatever the
+    /// server picks from that list. Pass `["http/1.1"]` to keep a
+    /// request off HTTP/2, which is what you want for a server that
+    /// only answers correctly over HTTP/1.1, or `["h2"]` to force
+    /// HTTP/2.
+    ///
+    /// The default differs by path, because the offer is part of the
+    /// client's TLS fingerprint and changing it changes how every
+    /// existing caller looks on the wire. Ordinary pooled requests
+    /// offer `["h2", "http/1.1"]`. Requests with `resolve_ip` or
+    /// `request_target` set bypass the pool and offer `["http/1.1"]`
+    /// alone.
+    ///
+    /// `request_target` cannot be combined with an HTTP/2 offer: h2
+    /// carries the target in `:path`, which is built from the URI, so
+    /// there is no request-line to control. Use `raw_connect` with
+    /// `blasthttp.h2` to write pseudo-headers directly.
     #[pyo3(signature = (
         url,
         method=None,
@@ -869,6 +915,7 @@ impl BlastHTTP {
         timeout=None,
         follow_redirects=None,
         max_redirects=None,
+        redirect_cookies=None,
         verify_certs=None,
         proxy=None,
         no_proxy=None,
@@ -882,6 +929,7 @@ impl BlastHTTP {
         raw_path=None,
         request_target=None,
         resolve_ip=None,
+        alpn_protocols=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn request<'py>(
@@ -895,6 +943,7 @@ impl BlastHTTP {
         timeout: Option<u64>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
+        redirect_cookies: Option<bool>,
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
@@ -908,6 +957,7 @@ impl BlastHTTP {
         raw_path: Option<bool>,
         request_target: Option<String>,
         resolve_ip: Option<String>,
+        alpn_protocols: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (body_bytes, headers) = apply_body_and_files(body, files, headers)?;
         let config = RequestConfig {
@@ -919,6 +969,7 @@ impl BlastHTTP {
             max_body_size,
             follow_redirects,
             max_redirects,
+            redirect_cookies,
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
@@ -931,7 +982,7 @@ impl BlastHTTP {
             raw_path,
             request_target,
             resolve_ip,
-            alpn_protocols: None,
+            alpn_protocols,
             verbosity: 0,
         };
 
@@ -1085,6 +1136,7 @@ impl BlastHTTP {
         no_proxy=None,
         headers=None,
         retries=None,
+        redirect_cookies=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn download<'py>(
@@ -1099,6 +1151,7 @@ impl BlastHTTP {
         no_proxy: Option<Vec<String>>,
         headers: Option<Vec<(String, String)>>,
         retries: Option<u32>,
+        redirect_cookies: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let config = RequestConfig {
             url,
@@ -1109,6 +1162,7 @@ impl BlastHTTP {
             max_body_size: max_size,
             follow_redirects: Some(true),
             max_redirects: Some(10),
+            redirect_cookies,
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
@@ -1338,6 +1392,10 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     max_redirects: Option<u32>,
     #[pyo3(get, set)]
+    redirect_cookies: Option<bool>,
+    #[pyo3(get, set)]
+    alpn_protocols: Option<Vec<String>>,
+    #[pyo3(get, set)]
     verify_certs: Option<bool>,
     #[pyo3(get, set)]
     proxy: Option<String>,
@@ -1375,6 +1433,7 @@ impl PyBatchConfig {
         timeout=None,
         follow_redirects=None,
         max_redirects=None,
+        redirect_cookies=None,
         verify_certs=None,
         proxy=None,
         no_proxy=None,
@@ -1387,6 +1446,7 @@ impl PyBatchConfig {
         raw_path=None,
         request_target=None,
         resolve_ip=None,
+        alpn_protocols=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1398,6 +1458,7 @@ impl PyBatchConfig {
         timeout: Option<u64>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
+        redirect_cookies: Option<bool>,
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
@@ -1410,6 +1471,7 @@ impl PyBatchConfig {
         raw_path: Option<bool>,
         request_target: Option<String>,
         resolve_ip: Option<String>,
+        alpn_protocols: Option<Vec<String>>,
     ) -> Self {
         PyBatchConfig {
             url,
@@ -1420,6 +1482,7 @@ impl PyBatchConfig {
             timeout,
             follow_redirects,
             max_redirects,
+            redirect_cookies,
             verify_certs,
             proxy,
             no_proxy,
@@ -1432,6 +1495,7 @@ impl PyBatchConfig {
             raw_path,
             request_target,
             resolve_ip,
+            alpn_protocols,
         }
     }
 }
@@ -1447,6 +1511,7 @@ impl Clone for PyBatchConfig {
             timeout: self.timeout,
             follow_redirects: self.follow_redirects,
             max_redirects: self.max_redirects,
+            redirect_cookies: self.redirect_cookies,
             verify_certs: self.verify_certs,
             proxy: self.proxy.clone(),
             no_proxy: self.no_proxy.clone(),
@@ -1459,6 +1524,7 @@ impl Clone for PyBatchConfig {
             raw_path: self.raw_path,
             request_target: self.request_target.clone(),
             resolve_ip: self.resolve_ip.clone(),
+            alpn_protocols: self.alpn_protocols.clone(),
         })
     }
 }
@@ -1477,6 +1543,7 @@ impl PyBatchConfig {
             max_body_size: None,
             follow_redirects: self.follow_redirects,
             max_redirects: self.max_redirects,
+            redirect_cookies: self.redirect_cookies,
             verify_certs: self.verify_certs,
             proxy: self.proxy,
             no_proxy: self.no_proxy.unwrap_or_default(),
@@ -1489,7 +1556,7 @@ impl PyBatchConfig {
             raw_path: self.raw_path,
             request_target: self.request_target,
             resolve_ip: self.resolve_ip,
-            alpn_protocols: None,
+            alpn_protocols: self.alpn_protocols,
             verbosity: 0,
         })
     }
