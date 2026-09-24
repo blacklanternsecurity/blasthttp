@@ -1532,12 +1532,33 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
+/// Give an absolute URL with no path (`https://host?q=1`) the path `/`, as
+/// curl and browsers do. hyper builds the HTTP/2 `:path` straight from the
+/// URI's path-and-query, so without this it sends `?q=1` and servers answer
+/// 400.
+fn normalize_empty_path(uri: http::Uri) -> http::Uri {
+    // `Uri::path()` already reports "/" for an empty path, so look at the raw
+    // path-and-query, which is what hyper puts on the wire.
+    let raw = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("");
+    if uri.authority().is_none() || raw.starts_with('/') {
+        return uri;
+    }
+    let mut parts = uri.clone().into_parts();
+    match format!("/{}", raw).parse() {
+        Ok(pq) => {
+            parts.path_and_query = Some(pq);
+            http::Uri::from_parts(parts).unwrap_or(uri)
+        }
+        Err(_) => uri,
+    }
+}
+
 fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, ClientError> {
     let sanitized = sanitize_uri(location);
     if let Ok(uri) = sanitized.parse::<http::Uri>()
         && uri.scheme().is_some()
     {
-        return Ok(uri);
+        return Ok(normalize_empty_path(uri));
     }
 
     let scheme = current.scheme_str().unwrap_or("https");
@@ -1549,9 +1570,12 @@ fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, Cl
     })?;
 
     let absolute = format!("{}://{}{}", scheme, authority, sanitized);
-    absolute.parse().map_err(|e: http::uri::InvalidUri| {
-        ClientError::invalid_url(format!("invalid redirect URL '{}': {}", absolute, e))
-    })
+    absolute
+        .parse()
+        .map(normalize_empty_path)
+        .map_err(|e: http::uri::InvalidUri| {
+            ClientError::invalid_url(format!("invalid redirect URL '{}': {}", absolute, e))
+        })
 }
 
 // ── HttpClient implementation ─────────────────────────────────────
@@ -1645,9 +1669,9 @@ impl HyperClient {
         let start = Instant::now();
 
         let sanitized_url = sanitize_uri(&config.url);
-        let mut uri: http::Uri = sanitized_url.parse().map_err(|e: http::uri::InvalidUri| {
-            ClientError::invalid_url(format!("invalid URL: {}", e))
-        })?;
+        let mut uri: http::Uri = sanitized_url.parse().map(normalize_empty_path).map_err(
+            |e: http::uri::InvalidUri| ClientError::invalid_url(format!("invalid URL: {}", e)),
+        )?;
 
         debug_record(log, v, 1, &format!("-> {} {}", config.method(), uri));
         if let Some(proxy) = config.effective_proxy(uri.host().unwrap_or("")) {
