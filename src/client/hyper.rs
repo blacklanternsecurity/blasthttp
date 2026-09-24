@@ -1454,6 +1454,24 @@ async fn parse_response(
     } else {
         let decoded = decompress(&content_encoding, &raw_bytes, max_body);
         match decoded.decode_error {
+            // Neither deflate flavor ends in a trailer the decoder insists
+            // on, so a deflate stream cut short by the cap can read as a
+            // clean finish. The read stopping at the cap is enough to know
+            // the body isn't all there.
+            None if cut_by_cap => {
+                let cause = "body hit the max_body cap mid-stream".to_string();
+                debug_record(
+                    log,
+                    v,
+                    1,
+                    &format!(
+                        "   Body not fully decoded, {} bytes: {}",
+                        decoded.body.len(),
+                        cause
+                    ),
+                );
+                (decoded.body, Some(cause))
+            }
             None => {
                 debug_record(
                     log,
@@ -1926,6 +1944,10 @@ impl HyperClient {
 /// `encoding` is the whole header value, which is an ordered list of the
 /// codings applied to the body, so undoing it means walking them in reverse.
 /// The caller lowercases it.
+/// The most `Content-Encoding` layers `decompress` will undo. See the note
+/// where it's applied.
+const MAX_CONTENT_CODINGS: usize = 3;
+
 fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
     if data.is_empty() {
         return Decoded::content(Vec::new());
@@ -1955,7 +1977,11 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
     }
 
     let declared = codecs.len();
-    let mut remaining = codecs.into_iter().rev();
+    // Each layer's output is capped at `max_size`, but the number of layers
+    // comes from the header, and nested deflate can make every one of them a
+    // near full-size pass with nothing to interrupt it. Real servers stack
+    // two at most (the `gzip, gzip` case below), so stop at a few.
+    let mut remaining = codecs.into_iter().rev().take(MAX_CONTENT_CODINGS);
     let Some(outermost) = remaining.next() else {
         // Nothing but `identity`.
         return Decoded::content(data.to_vec());
@@ -2008,6 +2034,15 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
                 );
             }
         }
+    }
+
+    if declared > peeled {
+        // Same rule as above: an outer layer's complaint says more about the
+        // bytes that arrived, so it wins if there is one.
+        incomplete.get_or_insert(format!(
+            "{} of {} content-encoding layers came off: stopped at the limit of {}",
+            peeled, declared, MAX_CONTENT_CODINGS
+        ));
     }
 
     match incomplete {
@@ -2887,6 +2922,32 @@ mod tests {
         // did come off, but never applied.
         let (body, _) = undecoded("br, gzip", &gz, NO_LIMIT);
         assert_eq!(body, SAMPLE);
+    }
+
+    #[test]
+    fn test_decompress_stops_after_three_layers() {
+        // The layer count comes from the header, so it can't be allowed to
+        // decide how many full decode passes a response costs. Past three,
+        // what came off so far is kept and flagged.
+        let mut body = SAMPLE.to_vec();
+        for _ in 0..5 {
+            body = gzip_bytes(&body);
+        }
+        let two_left = gzip_bytes(&gzip_bytes(SAMPLE));
+        let (out, reason) = undecoded("gzip, gzip, gzip, gzip, gzip", &body, NO_LIMIT);
+        assert_eq!(out, two_left);
+        assert!(
+            reason.starts_with("3 of 5 content-encoding layers came off"),
+            "reason should say how far it got: {}",
+            reason
+        );
+
+        // Three is still decoded in full.
+        let mut three = SAMPLE.to_vec();
+        for _ in 0..3 {
+            three = gzip_bytes(&three);
+        }
+        assert_eq!(decoded("gzip, gzip, gzip", &three, NO_LIMIT), SAMPLE);
     }
 
     #[test]
