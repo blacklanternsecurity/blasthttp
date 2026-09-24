@@ -165,12 +165,6 @@ impl ChainCookies {
                 Rejected::note(&mut rejected.caller_owned, &cookie.name);
                 continue;
             }
-            // One oversized cookie is refused on its own, before it can eat
-            // the whole chain's budget.
-            if entry_size(&cookie.name, &cookie.value) > MAX_COOKIE_BYTES {
-                Rejected::note(&mut rejected.over_limit, &cookie.name);
-                continue;
-            }
             // §5.3 step 11: a new cookie replaces one with the same
             // name/domain/path rather than adding a duplicate. Find it now,
             // but leave it in place: whether the replacement is allowed to
@@ -180,10 +174,20 @@ impl ChainCookies {
             let replacing = self.cookies.iter().position(|c| {
                 c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path
             });
+            // A deletion stores nothing, so the size limits don't apply to
+            // it. It has to come before the size check: some sites log out
+            // by sending the full session value back with `Max-Age=0`, and
+            // refusing that would keep the old session cookie going out.
             if expired {
                 if let Some(i) = replacing {
                     self.cookies.remove(i);
                 }
+                continue;
+            }
+            // One oversized cookie is refused on its own, before it can eat
+            // the whole chain's budget.
+            if entry_size(&cookie.name, &cookie.value) > MAX_COOKIE_BYTES {
+                Rejected::note(&mut rejected.over_limit, &cookie.name);
                 continue;
             }
             let freed = replacing
@@ -200,10 +204,13 @@ impl ChainCookies {
                 Rejected::note(&mut rejected.over_limit, &cookie.name);
                 continue;
             }
-            if let Some(i) = replacing {
-                self.cookies.remove(i);
+            // The replacement takes the old cookie's slot, which keeps its
+            // creation-time (§5.3 step 11.3). `header_for` relies on the
+            // order here being creation order for its tiebreak.
+            match replacing {
+                Some(i) => self.cookies[i] = cookie,
+                None => self.cookies.push(cookie),
             }
-            self.cookies.push(cookie);
         }
         rejected
     }
@@ -1061,6 +1068,46 @@ mod tests {
         );
         assert!(rejected.over_limit.is_empty());
         assert!(chain.header_for(&uri("http://example.com/")).is_some());
+    }
+
+    #[test]
+    fn oversized_deletion_is_still_honored() {
+        // Some sites log out by sending the whole session value back with
+        // `Max-Age=0`, so a deletion can be over the size limit.
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://example.com/", &["s=realsessionvalue"]);
+        let big = format!("s={}; Max-Age=0", "x".repeat(5000));
+        set(&mut chain, "https://example.com/", &[&big]);
+        assert!(chain.header_for(&uri("https://example.com/")).is_none());
+    }
+
+    #[test]
+    fn replacing_a_cookie_keeps_its_place_in_line() {
+        let mut chain = ChainCookies::new();
+        set(&mut chain, "https://example.com/", &["a=1", "b=1"]);
+        set(&mut chain, "https://example.com/", &["a=2"]);
+        assert_eq!(
+            chain.header_for(&uri("https://example.com/")),
+            Some("a=2; b=1".to_string())
+        );
+    }
+
+    #[test]
+    fn replacing_one_of_two_same_name_cookies_keeps_their_order() {
+        // One name held host-only and domain-wide. The host-only one was set
+        // first, so it has to stay first after the site reissues it, or a
+        // server that reads the first occurrence gets the stale value.
+        let mut chain = ChainCookies::new();
+        set(
+            &mut chain,
+            "https://www.example.com/",
+            &["s=hostonly1", "s=domainwide; Domain=example.com"],
+        );
+        set(&mut chain, "https://www.example.com/", &["s=hostonly2"]);
+        assert_eq!(
+            chain.header_for(&uri("https://www.example.com/")),
+            Some("s=hostonly2; s=domainwide".to_string())
+        );
     }
 
     #[test]
