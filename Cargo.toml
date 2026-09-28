@@ -3,7 +3,7 @@ name = "blasthttp"
 version = "0.10.0"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 # CI-only pin. Shipping it would override the toolchain of anyone building from the sdist.
 exclude = ["rust-toolchain.toml"]
 
