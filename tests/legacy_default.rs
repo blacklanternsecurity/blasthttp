@@ -170,6 +170,40 @@ async fn test_null_cipher_reachable_when_asked_for() {
 // ── Legacy protocol versions, no client configuration ─────────────
 
 #[tokio::test]
+async fn test_sslv3_reachable_by_default() {
+    assert_reachable_with_version("SSLv3", SslVersion::SSL3).await;
+}
+
+#[tokio::test]
+async fn test_sslv3_reachable_when_pinned_explicitly() {
+    // The version can also be named, which had no spelling at all before:
+    // `parse_tls_version` only knew 1.0 through 1.3, so SSLv3 was
+    // unrequestable regardless of what the build supported.
+    let server = TlsTestServer::start(TlsServerConfig {
+        min_tls_version: Some(SslVersion::SSL3),
+        max_tls_version: Some(SslVersion::SSL3),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = default_config(&server.url());
+    config.min_tls_version = Some("3.0".to_string());
+    config.max_tls_version = Some("3.0".to_string());
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_ok(),
+        "explicitly pinned SSLv3 should connect: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_tls10_reachable_by_default() {
     assert_reachable_with_version("TLS 1.0", SslVersion::TLS1).await;
 }

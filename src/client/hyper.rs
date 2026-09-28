@@ -257,12 +257,13 @@ fn encode_alpn_protocols(protos: &[String]) -> Result<Vec<u8>, ClientError> {
 
 fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
     match s.to_lowercase().as_str() {
+        "3.0" | "ssl3" | "sslv3" | "ssl3.0" => Ok(openssl::ssl::SslVersion::SSL3),
         "1.0" | "tls1.0" | "tlsv1.0" => Ok(openssl::ssl::SslVersion::TLS1),
         "1.1" | "tls1.1" | "tlsv1.1" => Ok(openssl::ssl::SslVersion::TLS1_1),
         "1.2" | "tls1.2" | "tlsv1.2" => Ok(openssl::ssl::SslVersion::TLS1_2),
         "1.3" | "tls1.3" | "tlsv1.3" => Ok(openssl::ssl::SslVersion::TLS1_3),
         _ => Err(ClientError::other(format!(
-            "unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)",
+            "unknown TLS version '{}' (use 3.0 for SSLv3, or 1.0, 1.1, 1.2, 1.3)",
             s
         ))),
     }
@@ -359,6 +360,13 @@ impl OpenSslConnector {
         // Security level 0: allow all ciphers including RC4, DES, export.
         // This is an offensive-first tool — we need to connect to anything.
         builder.set_security_level(0);
+
+        // `SslConnector::builder` sets NO_SSLV3 for us. Clear it, or a server
+        // that speaks nothing newer stays unreachable even when the caller
+        // asks for SSLv3 by name. Clearing the option only permits the
+        // protocol; which versions actually get offered is still decided by
+        // the min/max proto version below.
+        builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
 
         if !config.should_verify_certs() {
             builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
@@ -991,6 +999,9 @@ pub(crate) async fn connect_stream(
             .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
     ssl_builder.set_security_level(0);
+    // Same reason as the pooled path: openssl-rs sets NO_SSLV3 and an SSLv3
+    // server is unreachable until it is cleared.
+    ssl_builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
 
     if !config.should_verify_certs() {
         ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);

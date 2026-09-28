@@ -99,12 +99,14 @@ fn build_acceptor(config: &TlsServerConfig) -> SslAcceptor {
     // Clear ALL version restrictions and options
     builder.set_min_proto_version(None).unwrap();
     builder.set_max_proto_version(None).unwrap();
-    // Remove any SSL options that might disable specific TLS versions
+    // Remove any SSL options that might disable specific protocol versions,
+    // SSLv3 included, so a test can pin the server to it.
     builder.clear_options(
         SslOptions::NO_TLSV1_3
             | SslOptions::NO_TLSV1_2
             | SslOptions::NO_TLSV1_1
-            | SslOptions::NO_TLSV1,
+            | SslOptions::NO_TLSV1
+            | SslOptions::NO_SSLV3,
     );
     // Accept all ciphers by default
     builder
