@@ -58,6 +58,26 @@ fn sanitize_uri(url: &str) -> String {
     out
 }
 
+/// Cipher list used when the caller doesn't name one.
+///
+/// This has to be set explicitly. `SslConnector::builder` installs its own
+/// list first, `DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`,
+/// and `set_security_level(0)` does NOT undo it. The security level governs
+/// how weak a cipher may be; the cipher list governs which ones are offered at
+/// all. Leaving the list alone means RC4, DES, 3DES and SEED never reach the
+/// wire whatever the security level says, so a server speaking only one of
+/// them is unreachable, which is the whole reason this project builds its own
+/// OpenSSL.
+///
+/// `ALL` is every suite the build provides except the eNULL (no encryption)
+/// ones. It does include the aNULL suites, which skip authentication: those
+/// are worth reaching for a scanner, and this client already defaults to not
+/// verifying certificates, so they give up nothing that was being enforced.
+/// Null *encryption* stays opt-in through `cipher_string`, because negotiating
+/// it by default would hand back a connection that looks like TLS and encrypts
+/// nothing.
+const DEFAULT_CIPHER_LIST: &str = "ALL";
+
 // Load the OpenSSL legacy provider once (for RC4, DES, etc.).
 // The provider is statically compiled into libcrypto via `no-module` build flag.
 // `Once` ensures this runs exactly once even across threads.
@@ -346,11 +366,13 @@ impl OpenSslConnector {
             load_system_ca_certs(&mut builder)?;
         }
 
-        if let Some(ref ciphers) = config.cipher_string {
-            builder.set_cipher_list(ciphers).map_err(|e| {
-                ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
-            })?;
-        }
+        let ciphers = config
+            .cipher_string
+            .as_deref()
+            .unwrap_or(DEFAULT_CIPHER_LIST);
+        builder
+            .set_cipher_list(ciphers)
+            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
 
         if let Some(ref min_ver) = config.min_tls_version {
             let version = parse_tls_version(min_ver)?;
@@ -975,11 +997,13 @@ pub(crate) async fn connect_stream(
     } else {
         load_system_ca_certs(&mut ssl_builder)?;
     }
-    if let Some(ref ciphers) = config.cipher_string {
-        ssl_builder
-            .set_cipher_list(ciphers)
-            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
-    }
+    let ciphers = config
+        .cipher_string
+        .as_deref()
+        .unwrap_or(DEFAULT_CIPHER_LIST);
+    ssl_builder
+        .set_cipher_list(ciphers)
+        .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
     if let Some(ref min_ver) = config.min_tls_version {
         let version = parse_tls_version(min_ver)?;
         ssl_builder

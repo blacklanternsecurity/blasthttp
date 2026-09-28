@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.1
+
+- Legacy ciphers are offered by default, which is what the custom OpenSSL build has always been for. A server speaking only RC4, RC4-MD5, 3DES, SEED, Camellia or anonymous DH is now reachable without passing `cipher_string` yourself. Previously `SslConnector::builder` installed its own list (`DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`) and nothing replaced it, so those suites never reached the wire and such a server was unreachable at any setting. `set_security_level(0)` did not help: the security level governs how weak a negotiated cipher may be, not which ones are offered
+- Null-encryption suites are the deliberate exception. They stay reachable through an explicit `cipher_string` but are never offered by default, since negotiating one by accident returns a connection that looks like TLS and encrypts nothing
+- The default applies on both TLS paths, the pooled client and the `resolve_ip` / `request_target` / `raw_connect` path, which build their SSL contexts separately
+- This widens the ClientHello from 31 cipher suites to 105, which changes the client's TLS fingerprint. Anything matching on JA3/JA4 will see a different value than it did on 0.10.0
+- README no longer claims export ciphers and SSLv3 work. OpenSSL removed export ciphers in 1.1.0, and SSLv3 ends up disabled in our build despite `enable-ssl3` being passed, so neither has ever been reachable
+
 ## 0.10.0
 
 - Cookies set on a redirect hop are applied to the hops that follow it, the way a browser does. What a chain collects lives for that one request, so nothing carries between requests
