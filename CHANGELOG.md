@@ -47,6 +47,27 @@ the ladder falling back to `compatibility` on the second handshake.
   default offers nothing that exists in SSLv3
 - `BLASTHTTP_BISECT=tls,headers,http2` disables profile layers independently,
   for finding out which one a detector is reacting to
+- `raw_connect`, and requests using `resolve_ip` or `request_target`, widen
+  their cipher offer and retry on a handshake the peer could not negotiate,
+  the same as an ordinary request. These bypass the pooled client, so they
+  bypassed the ladder too, and when the default narrowed from 105 suites to 11
+  they quietly lost the legacy reach the custom OpenSSL build exists to give
+  them. They stop at that rung: the other one reacts to a refusal by changing
+  what the client claims to be, and these are the callers who asked for exact
+  control over one request
+- `download()` takes `profile`, `cipher_string`, `min_tls_version`,
+  `max_tls_version` and `redirect_cookies`. It hardcoded no profile with no
+  way to pass one, so a file behind a host that only answers a browser was
+  unreachable through `download` while the same URL through `request` was fine
+- `blasthttp.mock` forwards every kwarg to the real client on a passthrough
+  request. It named six and dropped the rest, so a URL excluded from mocking
+  was dialled with different TLS, a different profile and no timeout from what
+  the caller asked for
+- A request that names a profile no longer writes it into the per-host memory.
+  Reads already skipped the memory when the caller pinned something; writes
+  did not, so one deliberate `profile="chrome"` request turned every later
+  request to that host into a browser claim, and made the outcome depend on
+  the order two unrelated requests ran in
 
 ## 0.10.1
 

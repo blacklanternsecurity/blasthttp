@@ -669,9 +669,12 @@ impl PyBlasthttpMock {
     }
 
     /// Dispatch a single request through the mock. Mirrors the
-    /// `BlastHTTP.request` shape — most kwargs (timeout, verify_certs,
-    /// retries, etc.) are accepted but ignored, since they don't apply
-    /// to a mock.
+    /// `BlastHTTP.request` shape. Kwargs the mock has no use for (timeout,
+    /// verify_certs, profile, retries and the rest) are accepted and ignored
+    /// when the URL is intercepted, since nothing is dialled. When the URL is
+    /// excluded and the call goes to the real client they are forwarded
+    /// verbatim, because then they describe a connection that actually
+    /// happens.
     #[pyo3(signature = (
         url,
         method=None,
@@ -705,6 +708,7 @@ impl PyBlasthttpMock {
                 files,
                 follow_redirects,
                 max_redirects,
+                _kwargs,
             );
         }
 
@@ -951,6 +955,7 @@ impl PyBlasthttpMock {
         files: Option<Bound<'py, PyAny>>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
+        rest: Option<Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let Some(ref client) = self.real_client else {
             return Err(PyRuntimeError::new_err(format!(
@@ -958,6 +963,18 @@ impl PyBlasthttpMock {
             )));
         };
         let kwargs = PyDict::new(py);
+        // Everything the mock does not name itself goes through untouched.
+        // A mocked URL can ignore `timeout`, `profile` or `verify_certs`
+        // because nothing is dialled, but a passed-through one is a real
+        // request and dropping them here would quietly give it different
+        // TLS, a different profile and no timeout from what the caller
+        // asked for. Set first, so the named arguments below win on the
+        // (impossible from Python, but cheap to guarantee) chance of overlap.
+        if let Some(ref extra) = rest {
+            for (k, val) in extra.iter() {
+                kwargs.set_item(k, val)?;
+            }
+        }
         if let Some(m) = method {
             kwargs.set_item("method", m)?;
         }

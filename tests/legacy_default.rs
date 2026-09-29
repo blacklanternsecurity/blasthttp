@@ -302,3 +302,193 @@ async fn test_a_cold_burst_rediscovers_per_request() {
 
     server.shutdown().await;
 }
+
+// ── The same promise on the direct and raw paths ──────────────────
+//
+// `resolve_ip`, `request_target` and `raw_connect` do not go through the
+// pooled client, so they did not go through the ladder either. That was fine
+// while the default offered every cipher OpenSSL has; once it narrowed to
+// eleven, these callers quietly lost the legacy reach the custom build exists
+// to give them. A virtualhost sweep is exactly where an old appliance turns
+// up, and exactly where it would have gone unseen.
+
+#[tokio::test]
+async fn test_resolve_ip_reaches_a_legacy_server() {
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("RC4-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = default_config(&server.url());
+    config.resolve_ip = Some("127.0.0.1".to_string());
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_ok(),
+        "resolve_ip should reach an RC4-only server the same way the pooled \
+         path does: {:?}",
+        result.as_ref().err()
+    );
+    let resp = result.unwrap();
+    assert_eq!(resp.status, 200);
+
+    // And it should say how it got there. Two rungs: the default could not
+    // negotiate, the wider one could.
+    let profiles: Vec<&str> = resp.attempts.iter().map(|a| a.profile.as_str()).collect();
+    assert_eq!(
+        profiles,
+        vec!["modern", "compatibility"],
+        "expected the report to show the widening, got {profiles:?}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_request_target_reaches_a_legacy_server() {
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("RC4-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = default_config(&server.url());
+    config.request_target = Some("/".to_string());
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_ok(),
+        "request_target takes the same un-pooled path and needs the same \
+         reach: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_raw_connect_reaches_a_legacy_server() {
+    // A raw connection has no response to classify, so only the cipher half
+    // of the ladder can apply to it. That half is the half it needs: byte-
+    // level work against an old appliance starts with reaching the appliance.
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("RC4-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let url = server.url();
+    let config = default_config(&url);
+    let result = blasthttp::client::raw::RawConnection::connect(&url, &config).await;
+
+    assert!(
+        result.is_ok(),
+        "raw_connect should reach an RC4-only server with no cipher_string: \
+         {:?}",
+        result.as_ref().err()
+    );
+
+    // Write a request and read the answer, rather than stopping at "the
+    // handshake returned Ok". A connection that cannot carry bytes is not a
+    // connection, and the harness serves each connection on its own accept
+    // loop iteration, so leaving one open with nothing written parks the
+    // server in a read that never returns and the shutdown below deadlocks.
+    let conn = result.unwrap();
+    conn.send_bytes(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write over the RC4 connection");
+    let data = conn
+        .read_raw(4096, Some(5000))
+        .await
+        .expect("read back over the RC4 connection");
+    assert!(
+        data.starts_with(b"HTTP/1.1 200"),
+        "expected a response over the raw connection, got {:?}",
+        String::from_utf8_lossy(&data[..data.len().min(80)])
+    );
+    let _ = conn.close().await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_the_direct_path_does_not_widen_past_a_pin() {
+    // The counterpart, and the more important one on this path. These are the
+    // callers who asked for exact control, so a named cipher string has to be
+    // the last word: widening past it would put suites on the wire the caller
+    // deliberately left off, and a TLS enumeration sweep would report every
+    // server as speaking everything.
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("RC4-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = default_config(&server.url());
+    config.resolve_ip = Some("127.0.0.1".to_string());
+    config.cipher_string = Some("AES128-SHA".to_string());
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_err(),
+        "a pinned cipher string that the server does not speak must fail \
+         rather than be widened behind the caller's back"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_a_pinned_request_does_not_teach_the_host_memory() {
+    // The memory is a cache of what the ladder worked out, so a request that
+    // never laddered has nothing to contribute to it.
+    //
+    // Found by a mock test rather than reasoning: a passthrough request with
+    // profile="chrome" was followed by one with no profile, and the second
+    // sent Chrome's headers. One deliberate browser request had silently
+    // converted the host for the rest of the client's life. That is the worst
+    // direction for it to drift in, because claiming to be a browser is what
+    // invites a detector to check the claim, and it made the outcome depend
+    // on the order two unrelated requests ran in.
+    let server = TlsTestServer::start(TlsServerConfig {
+        min_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let client = HyperClient::new();
+
+    let mut pinned = default_config(&server.url());
+    pinned.profile = Some("chrome".to_string());
+    let first = client.send(&pinned).await.expect("pinned request");
+    assert_eq!(
+        first.attempts.first().map(|a| a.profile.as_str()),
+        Some("chrome131"),
+        "the pinned request should have used what it named"
+    );
+
+    let second = client
+        .send(&default_config(&server.url()))
+        .await
+        .expect("unpinned request");
+    assert_eq!(
+        second.attempts.first().map(|a| a.profile.as_str()),
+        Some("modern"),
+        "an unpinned request should start at the default, not inherit the \
+         profile a previous pinned request named"
+    );
+
+    server.shutdown().await;
+}

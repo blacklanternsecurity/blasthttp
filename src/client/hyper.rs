@@ -1175,15 +1175,114 @@ fn describe_tls_failure(failure: &TlsFailure) -> String {
     }
 }
 
+/// A connection that was established, and what it took to establish it.
+pub(crate) struct Connected {
+    pub stream: Box<dyn IoReadWrite + Send + Unpin>,
+    pub cert_info: Option<CertInfo>,
+    pub alpn: Option<String>,
+    pub peer_ip: Option<IpAddr>,
+    /// The profile the handshake finally succeeded under, which is not
+    /// necessarily the one asked for. `dispatch_direct` builds its request
+    /// from this so the headers cannot drift away from the TLS underneath
+    /// them, which is the failure mode a half-applied profile produces.
+    pub profile: &'static crate::profile::ConnectionProfile,
+    pub attempts: Vec<crate::report::Attempt>,
+}
+
 /// Opens a fresh TCP connection (optionally to a resolved IP instead of DNS)
 /// and performs TLS if HTTPS (with SNI set to the original hostname).
-/// Returns the connected stream and any certificate info collected during
-/// the TLS handshake.
 ///
 /// Shared setup used by `dispatch_direct` (one-shot hyper requests over an
 /// un-pooled socket) and by callers that need a long-lived, unframed handle
 /// to a TCP or TLS stream.
+///
+/// Widens the offer and tries again when a handshake fails in a way that says
+/// the peer could not negotiate, which is the same breadth rung the pooled
+/// path climbs. Reaching a server too old for the default is the reason this
+/// library carries its own OpenSSL, and without this these callers lost it
+/// when the default narrowed: a virtualhost sweep across an estate with one
+/// legacy appliance in it would simply not see the appliance.
+///
+/// It stops there. The pooled ladder has a second rung that reacts to a
+/// *refusal* by changing what the client claims to be, and that one would be
+/// wrong here. `resolve_ip` and `request_target` exist for probes whose point
+/// is how one exact request is answered, so re-sending a probe dressed
+/// differently answers a question nobody asked, doubles the requests, and
+/// muddies the result. A raw connection has no response to classify at all.
 pub(crate) async fn connect_stream(
+    target_uri: &http::Uri,
+    config: &RequestConfig,
+    log: &DebugLog,
+) -> Result<Connected, ClientError> {
+    let mut rung = config.resolved_profile();
+    let mut tried: Vec<&'static str> = Vec::new();
+    let mut attempts: Vec<crate::report::Attempt> = Vec::new();
+
+    loop {
+        tried.push(rung.name);
+        let rung_config = config.with_profile(rung.name);
+
+        match connect_once(target_uri, &rung_config, log).await {
+            Ok((stream, cert_info, alpn, peer_ip)) => {
+                return Ok(Connected {
+                    stream,
+                    cert_info,
+                    alpn,
+                    peer_ip,
+                    profile: rung,
+                    attempts,
+                });
+            }
+            Err(e) => {
+                attempts.push(crate::report::Attempt::new(
+                    rung.name,
+                    crate::report::AttemptOutcome::HandshakeFailed {
+                        reason: e.message.clone(),
+                    },
+                ));
+
+                // A pinned config ends where the caller put it. Naming a
+                // cipher string, a TLS version or a profile means they meant
+                // it, and on this path more than any other: these are the
+                // callers who asked for exact control.
+                let widen = !config.tls_is_pinned()
+                    && tried.len() < crate::profile::MAX_RUNGS
+                    && e.tls_failure
+                        .as_ref()
+                        .is_some_and(|f| f.suggests_wider_offer());
+
+                match widen
+                    .then(|| {
+                        crate::profile::next_rung(rung, RungFailure::CouldNotNegotiate, &tried)
+                    })
+                    .flatten()
+                {
+                    Some(next) => {
+                        debug_record(
+                            log,
+                            config.verbosity,
+                            1,
+                            &format!(
+                                "   handshake failed under '{}', widening to '{}'",
+                                rung.name, next.name
+                            ),
+                        );
+                        rung = next;
+                    }
+                    None => {
+                        let mut e = e;
+                        e.attempts = attempts;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One connection attempt under one profile. The retrying lives in
+/// `connect_stream`; this just does as it is told.
+async fn connect_once(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
@@ -1443,11 +1542,27 @@ async fn dispatch_direct(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
-) -> Result<(SingleResponse, Option<CertInfo>, Option<IpAddr>), ClientError> {
+) -> Result<
+    (
+        SingleResponse,
+        Option<CertInfo>,
+        Option<IpAddr>,
+        Vec<crate::report::Attempt>,
+    ),
+    ClientError,
+> {
     let v = config.verbosity;
-    let (stream, cert_info, alpn, peer_ip) = connect_stream(target_uri, config, log).await?;
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let h2 = alpn.as_deref() == Some("h2");
+    let conn = connect_stream(target_uri, config, log).await?;
+    let (cert_info, peer_ip) = (conn.cert_info, conn.peer_ip);
+
+    // Build the request under whatever profile the handshake settled on, not
+    // whatever was asked for. If `connect_stream` widened to `compatibility`
+    // to reach an old server, the headers have to widen with it, or the
+    // request states something the connection underneath it contradicts.
+    let config = &config.with_profile(conn.profile.name);
+
+    let io = hyper_util::rt::TokioIo::new(conn.stream);
+    let h2 = conn.alpn.as_deref() == Some("h2");
 
     // HTTP/2 carries the target in `:path`, which hyper derives from the
     // request URI, so there is no request-line for `request_target` to
@@ -1530,7 +1645,23 @@ async fn dispatch_direct(
     })?;
 
     let resp = parse_response(hyper_response, config, log).await?;
-    Ok((resp, cert_info, peer_ip))
+
+    // `conn.attempts` holds the handshakes that failed on the way here. The
+    // one that worked is this response, and it can only be classified now
+    // that there is a body, so it is recorded here rather than in
+    // `connect_stream`, which never sees one.
+    let mut attempts = conn.attempts;
+    attempts.push(crate::report::Attempt::from_outcome(
+        conn.profile.name,
+        resp.status,
+        &crate::antibot::classify(&crate::antibot::ResponseFacts {
+            status: resp.status,
+            headers: &resp.headers,
+            body: &String::from_utf8_lossy(&resp.body_bytes),
+        }),
+    ));
+
+    Ok((resp, cert_info, peer_ip, attempts))
 }
 
 /// The two one-shot senders `dispatch_direct` can end up holding, picked by
@@ -2153,11 +2284,25 @@ impl HyperClient {
     /// hypothesis and could be the host having a bad minute; a success is
     /// evidence. Recording failures would let one flake pin a host to a worse
     /// profile for the rest of a scan.
+    ///
+    /// A pinned request records nothing, which matches `starting_profile`
+    /// refusing to read the memory when pinned. The memory is a cache of what
+    /// the ladder found out, and a caller naming a profile is not the ladder
+    /// finding anything out. Recording it would mean one deliberate
+    /// `profile="chrome"` request quietly turned every later request to that
+    /// host into a browser claim, which is the change most likely to make
+    /// things worse: PerimeterX passes an honest client and refuses a
+    /// half-convincing browser. It would also make the result depend on the
+    /// order two independent requests happened to run in.
     fn remember_profile(
         &self,
+        config: &RequestConfig,
         uri: &http::Uri,
         profile: &'static crate::profile::ConnectionProfile,
     ) {
+        if config.tls_is_pinned() {
+            return;
+        }
         if let Some(key) = peer_slot_key(uri)
             && let Ok(mut map) = self.host_profiles.lock()
         {
@@ -2205,7 +2350,7 @@ impl HyperClient {
         // Bypasses the cached connection pool — opens a fresh TCP connection.
         if config.resolve_ip.is_some() || config.request_target.is_some() {
             let redirect_chain: Vec<RedirectHop> = Vec::new();
-            let (resp, cert_info, peer_ip) = dispatch_direct(&uri, config, log).await?;
+            let (resp, cert_info, peer_ip, attempts) = dispatch_direct(&uri, config, log).await?;
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
@@ -2219,10 +2364,7 @@ impl HyperClient {
                 status: resp.status,
                 headers: resp.headers,
                 body_bytes: resp.body_bytes,
-                // This path never ladders: it is the resolve_ip /
-                // request_target branch, which dispatches once and follows no
-                // redirects.
-                attempts: Vec::new(),
+                attempts,
                 elapsed_ms,
                 redirect_chain,
                 cert_info,
@@ -2307,7 +2449,7 @@ impl HyperClient {
                             // success. A failure is a hypothesis; this is
                             // evidence.
                             if outcome.got_through() {
-                                self.remember_profile(&uri, rung);
+                                self.remember_profile(config, &uri, rung);
                             }
                             break (resp, cached);
                         }

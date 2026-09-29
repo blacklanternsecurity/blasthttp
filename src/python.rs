@@ -1280,6 +1280,10 @@ impl BlastHTTP {
     /// Download a URL directly to a local file.
     /// Returns the file path on success.
     /// max_size: maximum bytes to download (None = no limit, uses default 10MB)
+    ///
+    /// Takes the same connection knobs as `request`. Without them the profile
+    /// ladder runs as usual, so a download from a host that needs legacy TLS
+    /// or a browser profile reaches it the same way an ordinary request does.
     #[pyo3(signature = (
         url,
         path,
@@ -1291,6 +1295,10 @@ impl BlastHTTP {
         headers=None,
         retries=None,
         redirect_cookies=None,
+        profile=None,
+        cipher_string=None,
+        min_tls_version=None,
+        max_tls_version=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn download<'py>(
@@ -1306,6 +1314,10 @@ impl BlastHTTP {
         headers: Option<Vec<(String, String)>>,
         retries: Option<u32>,
         redirect_cookies: Option<bool>,
+        profile: Option<String>,
+        cipher_string: Option<String>,
+        min_tls_version: Option<String>,
+        max_tls_version: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let config = RequestConfig {
             url,
@@ -1320,10 +1332,10 @@ impl BlastHTTP {
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
-            profile: None,
-            cipher_string: None,
-            min_tls_version: None,
-            max_tls_version: None,
+            profile,
+            cipher_string,
+            min_tls_version,
+            max_tls_version,
             retries,
             retry_wait_min_ms: None,
             retry_wait_max_ms: None,

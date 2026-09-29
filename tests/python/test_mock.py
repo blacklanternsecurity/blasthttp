@@ -388,3 +388,57 @@ async def test_passthrough_to_real_client():
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_forwards_the_kwargs_it_ignores():
+    """A mocked URL can ignore `profile` because nothing is dialled. A
+    passed-through one cannot: it is a real connection, and dropping the
+    kwarg silently gives it different TLS and different headers from what
+    the caller asked for. BBOT runs its whole local-target suite through
+    this path, so a dropped kwarg there is a test that passes while
+    exercising the wrong thing."""
+
+    async def handler(reader, writer):
+        received = []
+        await reader.readuntil(b"\r\n")
+        while (line := await reader.readuntil(b"\r\n")) != b"\r\n":
+            received.append(line.decode("latin1").rstrip("\r\n"))
+        body = "\n".join(received).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Length: "
+            + str(len(body)).encode()
+            + b"\r\n\r\n"
+            + body
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    addr = server.sockets[0].getsockname()
+    base = f"http://{addr[0]}:{addr[1]}/"
+    try:
+        real = blasthttp.BlastHTTP()
+        mock = BlasthttpMock(real_client=real, should_mock_fn=lambda host: host != "127.0.0.1")
+
+        r = await mock.request(base, profile="chrome")
+        assert "Mozilla/5.0" in r.text, f"profile was dropped on the way through: {r.text}"
+
+        # And the default still arrives as itself, so the test above is
+        # measuring the kwarg rather than a client that always sends Chrome.
+        r2 = await mock.request(base)
+        assert "blasthttp/" in r2.text
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_rejects_a_kwarg_the_real_client_does_not_take():
+    """The flip side of forwarding. An intercepted URL swallows anything,
+    which is right when nothing is dialled, but on the way through the real
+    client's signature is the one that counts and a typo should be audible."""
+    real = blasthttp.BlastHTTP()
+    mock = BlasthttpMock(real_client=real, should_mock_fn=lambda host: host != "127.0.0.1")
+    with pytest.raises(TypeError):
+        await mock.request("http://127.0.0.1:1/", not_a_real_kwarg=1)

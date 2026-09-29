@@ -36,13 +36,12 @@ impl RawConnection {
             ClientError::invalid_url(format!("invalid URL '{}': {}", uri_str, e))
         })?;
         let log = new_debug_log();
-        let (stream, cert_info, negotiated_alpn, peer_ip) =
-            connect_stream(&uri, config, &log).await?;
+        let conn = connect_stream(&uri, config, &log).await?;
         Ok(Self {
-            stream: Arc::new(Mutex::new(Some(stream))),
-            cert_info,
-            negotiated_alpn,
-            peer_ip,
+            stream: Arc::new(Mutex::new(Some(conn.stream))),
+            cert_info: conn.cert_info,
+            negotiated_alpn: conn.alpn,
+            peer_ip: conn.peer_ip,
         })
     }
 

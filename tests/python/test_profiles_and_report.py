@@ -228,3 +228,31 @@ async def test_batch_results_carry_the_report(server, client):
         "needs_browser",
         "cloudflare",
     )
+
+
+# ── download ─────────────────────────────────────────────────────
+
+
+async def test_download_takes_a_profile(server, client, tmp_path):
+    """`download` used to hardcode no profile with no way to pass one, so a
+    file behind a host that only answers a browser was unreachable through it
+    while the identical URL through `request` was fine."""
+    dest = tmp_path / "headers.txt"
+    await client.download(f"{server}/echo-headers", str(dest), profile="chrome")
+    assert "Mozilla/5.0" in dest.read_text()
+
+
+async def test_download_defaults_to_the_honest_profile(server, client, tmp_path):
+    """Which makes the test above about the argument rather than about a
+    client that always claims to be Chrome."""
+    dest = tmp_path / "headers.txt"
+    await client.download(f"{server}/echo-headers", str(dest))
+    text = dest.read_text()
+    assert "blasthttp/" in text
+    assert "Mozilla/5.0" not in text
+
+
+async def test_download_rejects_an_unknown_profile(server, client, tmp_path):
+    with pytest.raises(Exception) as exc:
+        await client.download(f"{server}/", str(tmp_path / "x"), profile="chrmoe")
+    assert "chrmoe" in str(exc.value).lower()
