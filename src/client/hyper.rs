@@ -101,9 +101,8 @@ fn add_browser_extensions(
     //     let idx = Ssl::cached_ex_index::<CustomExtAddState<T>>();
     //
     // so every custom extension returning `Vec<u8>` shares one slot and
-    // overwrites the others. Registering three that way sends exactly one,
-    // whichever wrote last, and the rest hand OpenSSL a pointer into a buffer
-    // that has already moved. Distinct newtypes give each its own slot.
+    // overwrites the others. Registering three that way sends exactly one.
+    // Distinct newtypes give each its own slot.
     macro_rules! payload_type {
         ($name:ident) => {
             struct $name(Vec<u8>);
@@ -114,38 +113,31 @@ fn add_browser_extensions(
             }
         };
     }
-    payload_type!(StatusRequest);
     payload_type!(SignedCertTimestamp);
-    payload_type!(CertCompression);
-    payload_type!(Alps);
-    payload_type!(EchGrease);
 
-    // Only the ClientHello. Sending these anywhere else would be wrong and,
-    // for ALPS, would confuse a server that actually implements it.
-    let ctx = ExtensionContext::CLIENT_HELLO;
+    // The ClientHello for sending, plus the places a server may answer.
+    // Registering CLIENT_HELLO alone makes OpenSSL reject a reply that arrives
+    // in a context with no handler, which breaks the handshake outright rather
+    // than merely looking wrong.
+    let ctx = ExtensionContext::CLIENT_HELLO
+        | ExtensionContext::TLS1_3_SERVER_HELLO
+        | ExtensionContext::TLS1_3_ENCRYPTED_EXTENSIONS
+        | ExtensionContext::TLS1_2_SERVER_HELLO;
 
     // Which codepoints OpenSSL will cede, probed rather than assumed:
     //
-    //   0x0005 status_request        refused, OpenSSL owns it
-    //   0x0012 signed_cert_timestamp accepted
-    //   0x001b compress_certificate  refused, OpenSSL owns it
-    //   0x4469 application_settings  accepted
+    //   0x0005 status_request         refused for custom use, OpenSSL owns it
+    //   0x0012 signed_cert_timestamp  accepted
+    //   0x001b compress_certificate   refused, OpenSSL owns it
+    //   0x4469 application_settings   accepted
     //   0xfe0d encrypted_client_hello accepted
-    //   0xff01 renegotiation_info    refused, OpenSSL owns it
+    //   0xff01 renegotiation_info     refused, OpenSSL owns it
     //
-    // The refusals are attempted anyway and ignored: they are cheap, they
-    // would start working if the build gained the relevant support, and none
-    // is worth failing a request over. Closing those three is what needs a
+    // status_request is set per-connection instead, in the one place OpenSSL's
+    // own API for it works. renegotiation_info and the SCSV are handled by a
     // patch to our OpenSSL build.
 
-    // status_request (0x0005): OCSP, then two empty lists. Five bytes, the
-    // same as Chrome.
-    let _ = builder.add_custom_ext(
-        0x0005,
-        ctx,
-        |_ssl, _ctx, _cert| Ok(Some(StatusRequest(vec![0x01, 0x00, 0x00, 0x00, 0x00]))),
-        |_ssl, _ctx, _data, _cert| Ok(()),
-    );
+    // status_request (0x0005) is handled per-connection; see the connector.
 
     // signed_certificate_timestamp (0x0012): empty, as a client sends it.
     let _ = builder.add_custom_ext(
@@ -155,50 +147,35 @@ fn add_browser_extensions(
         |_ssl, _ctx, _data, _cert| Ok(()),
     );
 
-    // compress_certificate (0x001b): one algorithm, brotli.
-    let _ = builder.add_custom_ext(
-        0x001b,
-        ctx,
-        |_ssl, _ctx, _cert| Ok(Some(CertCompression(vec![0x02, 0x00, 0x02]))),
-        |_ssl, _ctx, _data, _cert| Ok(()),
-    );
-
-    // application_settings, ALPS (0x4469). Chrome 124 through 131 use this
-    // codepoint; 133 and later moved to 0x44cd. The body is an ALPN-shaped
-    // list holding just h2.
-    builder
-        .add_custom_ext(
-            0x4469,
-            ctx,
-            |_ssl, _ctx, _cert| Ok(Some(Alps(vec![0x00, 0x03, 0x02, b'h', b'2']))),
-            |_ssl, _ctx, _data, _cert| Ok(()),
-        )
-        .map_err(|e| ClientError::tls(format!("failed to add ALPS extension: {}", e)))?;
-
-    // encrypted_client_hello (0xfe0d). Chrome sends a GREASE ECH: a decoy
-    // shaped like the real thing that decrypts to nothing. OpenSSL 3.3.2 has
-    // no ECH at all, so this is hand-built. Nothing reads it, and its only job
-    // is to occupy the codepoint, but it is shaped correctly so that a server
-    // which does parse ECH sees something well-formed.
-    builder
-        .add_custom_ext(
-            0xfe0d,
-            ctx,
-            |_ssl, _ctx, _cert| {
-                let mut body = Vec::with_capacity(140);
-                body.push(0x00); // ClientHelloOuter
-                body.push(0x00); // HKDF-SHA256
-                body.extend_from_slice(&[0x00, 0x01]); // AES-128-GCM
-                body.extend_from_slice(&[0x00, 0x00]); // config id
-                body.extend_from_slice(&[0x00, 0x20]); // 32-byte enc
-                body.extend_from_slice(&[0x42; 32]);
-                body.extend_from_slice(&[0x00, 0x60]); // 96-byte payload
-                body.extend_from_slice(&[0x17; 96]);
-                Ok(Some(EchGrease(body)))
-            },
-            |_ssl, _ctx, _data, _cert| Ok(()),
-        )
-        .map_err(|e| ClientError::tls(format!("failed to add ECH extension: {}", e)))?;
+    // ── Three Chrome extensions deliberately NOT sent ─────────────
+    //
+    // Chrome sends application_settings (0x4469), encrypted_client_hello
+    // (0xfe0d) and compress_certificate (0x001b). We send none of them, which
+    // costs three extensions against Chrome's JA4. Each was tried and each
+    // broke real sites, because advertising a protocol feature is a promise to
+    // implement it and a server that takes you up on it gets a client that
+    // cannot follow through.
+    //
+    //   ALPS (0x4469): google.com negotiates it and then expects the ALPS
+    //     settings exchange inside HTTP/2. We do not implement that, so the
+    //     handshake completes and the request then fails. Needs the HTTP/2
+    //     work before it can be sent honestly.
+    //
+    //   ECH (0xfe0d): Chrome sends a GREASE ECH, a decoy shaped precisely
+    //     enough to pass a real parser. A hand-built imitation is not, and
+    //     reddit.com rejects it at the handshake. Registering the server-reply
+    //     contexts fixed cloudflare.com but not reddit.com, so the payload
+    //     itself is the problem. Needs real ECH, which arrived in OpenSSL 3.5.
+    //
+    //   compress_certificate (0x001b): our OpenSSL is built with
+    //     OPENSSL_NO_COMP_ALG, so it cannot decompress a certificate. Enabling
+    //     it means a compression library in the build, and the wheels
+    //     cross-compile to six targets.
+    //
+    // The measurement that matters: without all three, akamai.com went from a
+    // hard 403 to 200 with a real session. Exact JA4 parity turned out not to
+    // be the bar. Plausibility was enough there, and a client that connects is
+    // worth more than one that matches a hash and cannot.
 
     Ok(())
 }
@@ -1563,11 +1540,34 @@ fn build_request(
         builder = builder.header("Host", authority.as_str());
     }
 
-    if !has_custom_ua {
-        builder = builder.header("User-Agent", "blasthttp/0.1.0");
-    }
-    if !has_custom_ae {
-        builder = builder.header("Accept-Encoding", "gzip, deflate, br");
+    // With a profile active, send its full header set in the browser's order
+    // rather than this client's two defaults.
+    //
+    // This has to travel with the TLS half or it makes matters worse. Browser
+    // headers over a non-browser handshake state something checkably false,
+    // and a contradiction is easier to act on than unfamiliarity: udemy.com
+    // answers an honest curl with 200 and the same client wearing only a
+    // Chrome User-Agent with 403.
+    //
+    // A caller's own header still wins over the profile's, since naming one
+    // explicitly means it.
+    if let Some(p) = config.resolved_profile() {
+        for (name, value) in p.headers {
+            let already_set = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+            if !already_set {
+                builder = builder.header(*name, *value);
+            }
+        }
+    } else {
+        if !has_custom_ua {
+            builder = builder.header(
+                "User-Agent",
+                concat!("blasthttp/", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        if !has_custom_ae {
+            builder = builder.header("Accept-Encoding", "gzip, deflate, br");
+        }
     }
 
     // Emit the caller's headers, folding any redirect-chain cookies into the

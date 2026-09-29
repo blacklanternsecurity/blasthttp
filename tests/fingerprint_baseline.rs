@@ -208,26 +208,91 @@ async fn capture_profile_hello(profile: &str) -> CapturedHello {
 }
 
 #[tokio::test]
-async fn test_chrome_profile_progress() {
-    // Not a pass/fail gate yet. Prints the distance to Chrome 131 so the
-    // remaining gap is visible while it is being closed.
+async fn test_chrome_profile_ja4_is_pinned() {
     let hello = capture_profile_hello("chrome").await;
     let got = support::ja4::ja4(&hello);
 
-    // Chrome 131 and 124, confirmed against tls.peet.ws.
-    const TARGET: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+    // Chrome 131 and 124, confirmed against tls.peet.ws, is
+    // t13d1516h2_8daaf6152771_02713d6af862.
+    //
+    // The cipher segment matches it exactly. The extension count does not, and
+    // is not meant to: three of Chrome's extensions are deliberately not sent
+    // because advertising them broke real sites. See add_browser_extensions()
+    // for which and why.
+    //
+    // Worth recording next to the pin, because it is the finding that shaped
+    // the whole approach: this non-matching JA4 is enough to turn akamai.com
+    // from a hard 403 into a 200 with a real session. Exact parity was not the
+    // bar. A client that connects beats one that matches a hash and cannot.
+    const EXPECTED: &str = "t13d1513h2_8daaf6152771_1eb89897b454";
 
-    println!("\n  target: {}", TARGET);
-    println!("  actual: {}", got);
-    println!("  raw   : {}", support::ja4::ja4_raw(&hello));
+    assert_eq!(
+        got,
+        EXPECTED,
+        "Chrome profile JA4 moved.\n  raw: {}",
+        support::ja4::ja4_raw(&hello),
+    );
+}
 
-    let want: Vec<&str> = TARGET.split('_').collect();
-    let have: Vec<&str> = got.split('_').collect();
-    for (label, w, h) in [
-        ("header", want[0], have[0]),
-        ("ciphers", want[1], have[1]),
-        ("exts+sigalgs", want[2], have[2]),
-    ] {
-        println!("  {:13} {}", label, if w == h { "match" } else { "differ" });
+#[tokio::test]
+async fn test_chrome_profile_cipher_list_matches_chrome_exactly() {
+    // The cipher segment is the one part that does match Chrome, and it only
+    // does because of the OpenSSL patch: stock OpenSSL appends
+    // TLS_EMPTY_RENEGOTIATION_INFO_SCSV to the list, which no browser sends,
+    // and that one extra suite changed the hash. Guarded separately so a
+    // regression there is unmistakable.
+    let hello = capture_profile_hello("chrome").await;
+    let got = support::ja4::ja4(&hello);
+    let cipher_hash = got.split('_').nth(1).unwrap_or_default();
+
+    assert_eq!(
+        cipher_hash, "8daaf6152771",
+        "cipher list no longer matches Chrome 131"
+    );
+    assert!(
+        !hello.ciphers.contains(&0x00ff),
+        "the renegotiation SCSV is back in the cipher list: {:04x?}",
+        hello.ciphers
+    );
+}
+
+#[tokio::test]
+async fn test_chrome_profile_sends_renegotiation_info() {
+    // The other half of the same patch. OpenSSL sends the SCSV precisely when
+    // it is not sending this extension, so these two tests fail together.
+    let hello = capture_profile_hello("chrome").await;
+    assert!(
+        hello.extensions.contains(&0xff01),
+        "renegotiation_info missing, so the OpenSSL patch is not in this build"
+    );
+}
+
+#[tokio::test]
+async fn test_chrome_profile_drops_non_browser_extensions() {
+    // padding and encrypt_then_mac are OpenSSL habits no browser has.
+    let hello = capture_profile_hello("chrome").await;
+    for (ext, name) in [(0x0015u16, "padding"), (0x0016, "encrypt_then_mac")] {
+        assert!(
+            !hello.extensions.contains(&ext),
+            "{} ({:#06x}) should not be sent under a browser profile",
+            name,
+            ext
+        );
     }
+}
+
+#[tokio::test]
+async fn test_compat_path_keeps_the_scsv() {
+    // The patch is conditioned on the TLS floor so the compatibility path is
+    // byte-identical to stock OpenSSL. Without a profile we should still send
+    // the SCSV and still not send renegotiation_info.
+    let hello = capture_default_hello().await;
+    assert!(
+        hello.ciphers.contains(&0x00ff),
+        "compatibility path lost the SCSV, so the patch is too broad"
+    );
+    assert!(
+        !hello.extensions.contains(&0xff01),
+        "compatibility path gained renegotiation_info, so the patch is too broad"
+    );
 }

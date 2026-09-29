@@ -21,16 +21,28 @@ use support::antibot::{Outcome, ResponseFacts, classify};
 use support::tls_server::{TlsServerConfig, TlsTestServer};
 
 fn config(url: &str) -> RequestConfig {
+    config_with(url, None)
+}
+
+fn config_with(url: &str, profile: Option<&str>) -> RequestConfig {
     let mut c = RequestConfig::new(url.to_string());
     c.verify_certs = Some(false);
     c.timeout_seconds = Some(30);
     c.follow_redirects = Some(true);
+    c.profile = profile.map(|p| p.to_string());
     c
 }
 
 async fn fetch(url: &str) -> Option<(u16, Vec<(String, String)>, String)> {
+    fetch_with(url, None).await
+}
+
+async fn fetch_with(
+    url: &str,
+    profile: Option<&str>,
+) -> Option<(u16, Vec<(String, String)>, String)> {
     let client = HyperClient::new();
-    match client.send(&config(url)).await {
+    match client.send(&config_with(url, profile)).await {
         Ok(r) => {
             let body = r.body().to_string();
             Some((r.status, r.headers.clone(), body))
@@ -207,43 +219,64 @@ async fn live_block_scorecard() {
         ),
     ];
 
-    println!();
-    let (mut passive_through, mut passive_total) = (0, 0);
-    let mut control_failed = false;
-
-    for (tier, label, url) in targets {
-        let outcome = match fetch(url).await {
+    // Each target twice: once plain, once impersonating. The delta between
+    // the two columns is the only number that says whether this work does
+    // anything, and running them in one pass keeps the comparison honest
+    // about time of day, network path and whatever the site is doing today.
+    async fn outcome_of(url: &str, profile: Option<&str>) -> Outcome {
+        match fetch_with(url, profile).await {
             Some((status, headers, body)) => classify(&ResponseFacts {
                 status,
                 headers: &headers,
                 body: &body,
             }),
             None => Outcome::Error,
-        };
+        }
+    }
+
+    println!(
+        "  {:9} {:30} {:24} profile=chrome",
+        "tier", "target", "plain"
+    );
+    let (mut passive_plain, mut passive_profiled, mut passive_total) = (0, 0, 0);
+    let mut control_failed = false;
+
+    for (tier, label, url) in targets {
+        let plain = outcome_of(url, None).await;
+        let profiled = outcome_of(url, Some("chrome")).await;
 
         let tag = match tier {
             Tier::Control => {
-                if !outcome.got_through() {
+                if !plain.got_through() {
                     control_failed = true;
                 }
                 "control"
             }
             Tier::Passive => {
                 passive_total += 1;
-                if outcome.got_through() {
-                    passive_through += 1;
+                if plain.got_through() {
+                    passive_plain += 1;
+                }
+                if profiled.got_through() {
+                    passive_profiled += 1;
                 }
                 "passive"
             }
             Tier::Javascript => "js",
         };
-        println!("  [{:7}] {:30} {:?}", tag, label, outcome);
+        println!(
+            "  [{:7}] {:30} {:24} {:?}",
+            tag,
+            label,
+            format!("{:?}", plain),
+            profiled
+        );
     }
 
     println!();
     println!(
-        "  passive-fingerprint tier: {}/{} reached",
-        passive_through, passive_total
+        "  passive-fingerprint tier: {}/{} plain, {}/{} with profile",
+        passive_plain, passive_total, passive_profiled, passive_total
     );
     println!("  javascript tier: not scored, unreachable without a browser");
     println!("  controls: not scored");

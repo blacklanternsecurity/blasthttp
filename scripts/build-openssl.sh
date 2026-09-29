@@ -24,6 +24,7 @@ SOURCE_DIR="${VENDOR_DIR}/openssl-${OPENSSL_VERSION}"
 INSTALL_DIR="${VENDOR_DIR}/install"
 TARBALL="${VENDOR_DIR}/openssl-${OPENSSL_VERSION}.tar.gz"
 MARKER="${INSTALL_DIR}/.blasthttp-built"
+PATCH_DIR="${SCRIPT_DIR}/openssl-patches"
 
 # The features that make this build different from a stock OpenSSL.
 #
@@ -73,7 +74,13 @@ esac
 # a rebuild just as much as one whose target changed, and keying on the target
 # alone means a flag change is silently ignored until someone deletes the
 # install directory by hand.
-BUILD_RECIPE="${TARGET:-native}|${OPENSSL_VERSION}|${FEATURE_FLAGS[*]}"
+# Patches are part of the recipe too: editing one has to invalidate the cached
+# build exactly as changing a flag does, or the change silently does nothing.
+PATCH_HASH="none"
+if [ -d "$PATCH_DIR" ] && compgen -G "$PATCH_DIR/*.patch" > /dev/null; then
+    PATCH_HASH=$(cat "$PATCH_DIR"/*.patch | sha256sum | cut -c1-16)
+fi
+BUILD_RECIPE="${TARGET:-native}|${OPENSSL_VERSION}|${FEATURE_FLAGS[*]}|patches=${PATCH_HASH}"
 
 # Skip only if the cached build was made the same way
 if [ -f "$MARKER" ]; then
@@ -119,6 +126,25 @@ if [ -d "$SOURCE_DIR" ]; then
 fi
 echo "Extracting..."
 tar xzf "$TARBALL" -C "$VENDOR_DIR"
+
+# --- Apply our patches ---
+#
+# Applied to a freshly extracted tree every time, so the patches never stack
+# and a failure is always a real conflict rather than a second application.
+# Every patch is required: a silent skip would produce a build that looks fine
+# and behaves differently, which is the failure mode that hid the SSLv3
+# problem for months.
+if [ -d "$PATCH_DIR" ]; then
+    for patch in "$PATCH_DIR"/*.patch; do
+        [ -e "$patch" ] || continue
+        echo "Applying $(basename "$patch")"
+        if ! patch -p1 -d "$SOURCE_DIR" -s < "$patch"; then
+            echo "ERROR: failed to apply $(basename "$patch")" >&2
+            echo "The patch probably needs rebasing onto OpenSSL ${OPENSSL_VERSION}." >&2
+            exit 1
+        fi
+    done
+fi
 
 # --- Find cross-compiler if needed ---
 find_cross_cc() {
