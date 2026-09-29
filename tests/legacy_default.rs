@@ -12,13 +12,13 @@
 // protocol version, then makes a real request through the ordinary client
 // path.
 
-mod tls_server;
+mod support;
 
 use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
 use blasthttp::config::RequestConfig;
 use openssl::ssl::SslVersion;
-use tls_server::{TlsServerConfig, TlsTestServer};
+use support::tls_server::{TlsServerConfig, TlsTestServer};
 
 /// A client config with NO TLS tuning of any kind.
 ///

@@ -70,3 +70,12 @@ pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runti
 [dev-dependencies]
 # TLS test server — uses our custom OpenSSL to serve with weak ciphers
 tokio-test = "0.4"
+
+# Raw SSL_client_hello_get* bindings, for reading back the ClientHello we sent.
+# The safe `openssl` wrapper exposes ciphers and versions but not the extension
+# list, and the extension list is most of a fingerprint. Both of these are
+# already in the tree as transitive dependencies of `openssl`, so they pull
+# nothing new in; `foreign-types-shared` is only here for the `as_ptr()` that
+# hands those bindings an `SSL *`.
+openssl-sys = "0.9"
+foreign-types-shared = "0.1"
