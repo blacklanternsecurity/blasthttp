@@ -1,22 +1,21 @@
-// Classifying what a bot-management product did to a request.
-//
-// A scan needs to tell three things apart that all look like "a response":
-// the origin answered, a protection product answered instead, or the product
-// answered *and* handed us a session. Without that, an operator sees a wall of
-// 403s and cannot tell a blocked host from a dead one, which is the false
-// negative this whole effort exists to fix.
-//
-// Two rules learned the hard way, both from a first pass that got them wrong:
-//
-// 1. Never match a vendor's name in the body. `datadome.co`, `imperva.com` and
-//    `kasada.io` all scored as challenges purely from their own marketing
-//    copy. Everything here keys on headers, cookies, status, or a body string
-//    that cannot occur in ordinary prose.
-//
-// 2. Always classify a known-good reference client in the same pass. A block
-//    and a site that simply changed look identical from one sample.
-
-#![allow(dead_code)]
+//! Working out what a bot-management product did to a request.
+//!
+//! A scan has to tell three things apart that all arrive looking like a
+//! response: the origin answered, a protection product answered instead, or
+//! the product answered and handed us a session anyway. Collapsing those is
+//! what turns a protected host into an apparently dead one, which is the
+//! false negative this exists to prevent.
+//!
+//! Two rules, both learned by getting them wrong:
+//!
+//! 1. Never match a vendor's name in the body. `datadome.co`, `imperva.com`
+//!    and `kasada.io` all scored as challenges purely from their own marketing
+//!    copy. Everything here keys on headers, cookies, status, or a body string
+//!    that cannot occur in ordinary prose.
+//!
+//! 2. A response that merely *references* a vendor's script is not a challenge
+//!    page. Every page on a protected site carries the loader; only a page
+//!    shaped like an interception is a block.
 
 use std::fmt;
 

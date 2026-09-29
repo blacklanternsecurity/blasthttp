@@ -147,6 +147,24 @@ impl Response {
 
     /// Body decoded as UTF-8 (lossy — invalid sequences become U+FFFD).
     /// Computed on first access and cached.
+    /// What, if anything, a bot-management product did to this request.
+    ///
+    /// Computed from the response rather than stored, so it stays correct if a
+    /// caller builds a `Response` by hand. Cheap: the classifier reads headers,
+    /// cookies, status and at most the first 64 KB of the body.
+    ///
+    /// The distinction worth acting on is `Challenge`. A blocked request might
+    /// succeed with different connection settings; a challenge will not,
+    /// because answering it means executing the page's JavaScript. That is the
+    /// signal to hand the URL to a real browser instead of retrying.
+    pub fn protection(&self) -> crate::antibot::Outcome {
+        crate::antibot::classify(&crate::antibot::ResponseFacts {
+            status: self.status,
+            headers: &self.headers,
+            body: self.body(),
+        })
+    }
+
     pub fn body(&self) -> &str {
         self.body_cache
             .get_or_init(|| match std::str::from_utf8(&self.body_bytes) {
@@ -450,5 +468,72 @@ mod tests {
         ];
         let cookies = parse_set_cookies(&headers);
         assert!(cookies.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+    use crate::antibot::{Outcome, Vendor};
+
+    fn response_with(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
+        Response {
+            url: "https://example.com/".to_string(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body_bytes: body.as_bytes().to_vec(),
+            elapsed_ms: 1,
+            redirect_chain: Vec::new(),
+            cert_info: None,
+            peer_ip: None,
+            request_url: "https://example.com/".to_string(),
+            request_method: "GET".to_string(),
+            debug_log: Vec::new(),
+            decode_error: None,
+            body_cache: OnceLock::new(),
+            raw_headers_cache: OnceLock::new(),
+            cookies_cache: OnceLock::new(),
+            hash_cache: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn test_response_classifies_itself() {
+        // The classifier is only useful if a caller can reach it from the
+        // response it already has. This is the path BBOT takes.
+        //
+        // Headers are the ones www.akamai.com actually returns, which notably
+        // include no `server` header at all.
+        let blocked = response_with(
+            403,
+            &[
+                ("akamai-grn", "0.6d551702.1790644996.315f62a4"),
+                ("content-type", "text/html"),
+            ],
+            "<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD></HTML>",
+        );
+        assert_eq!(blocked.protection(), Outcome::Blocked(Vendor::Akamai));
+    }
+
+    #[test]
+    fn test_challenge_is_distinguishable_from_a_block() {
+        // The distinction the whole escalation path rests on: a block might
+        // succeed with different settings, a challenge never will.
+        let challenge = response_with(
+            403,
+            &[("cf-mitigated", "challenge"), ("server", "cloudflare")],
+            "<html>Just a moment...</html>",
+        );
+        assert_eq!(
+            challenge.protection(),
+            Outcome::Challenge(Vendor::Cloudflare)
+        );
+
+        let ordinary = response_with(200, &[("server", "nginx")], "<html>hello</html>");
+        assert_eq!(ordinary.protection(), Outcome::Ok);
+        assert!(ordinary.protection().got_through());
     }
 }

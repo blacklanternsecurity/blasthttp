@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant;
 
+use crate::antibot as blasthttp_antibot;
 use crate::batch::{self, BatchResult, RateLimiter};
 use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
@@ -705,6 +706,39 @@ impl PyResponse {
 
     /// Debug messages collected during the request.
     /// Always populated — Python side can log/display as needed.
+    /// What a bot-management product did to this request, if anything.
+    ///
+    /// Returns a tuple of `(outcome, vendor)`, both lowercase strings:
+    ///
+    ///   outcome  ok | present | challenge | blocked | error
+    ///   vendor   cloudflare | akamai | datadome | perimeterx | imperva |
+    ///            f5 | kasada | unknown | "-" when nothing was detected
+    ///
+    /// `present` means a product is in front of the host and let us through,
+    /// usually having issued a session cookie. That is a more useful answer
+    /// than a bare 200: it says we passed something that was actively looking.
+    ///
+    /// `challenge` is the one to branch on. A blocked request might succeed
+    /// with different settings; a challenge will not, because answering it
+    /// means running the page's JavaScript. It is the signal to hand the URL
+    /// to a real browser rather than retry.
+    #[getter]
+    fn protection(&self) -> (String, String) {
+        let outcome = self.inner.protection();
+        let name = match &outcome {
+            blasthttp_antibot::Outcome::Ok => "ok",
+            blasthttp_antibot::Outcome::Present(_) => "present",
+            blasthttp_antibot::Outcome::Challenge(_) => "challenge",
+            blasthttp_antibot::Outcome::Blocked(_) => "blocked",
+            blasthttp_antibot::Outcome::Error => "error",
+        };
+        let vendor = outcome
+            .vendor()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        (name.to_string(), vendor)
+    }
+
     #[getter]
     fn debug_log(&self) -> Vec<String> {
         self.inner.debug_log.clone()

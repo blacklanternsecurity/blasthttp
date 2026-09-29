@@ -7,9 +7,7 @@
 // pair is the clearest single measurement of the problem this effort exists to
 // fix, so it is worth having as a regression fixture.
 
-mod support;
-
-use support::antibot::{Outcome, ResponseFacts, Vendor, classify};
+use blasthttp::antibot::{Outcome, ResponseFacts, Vendor, classify};
 
 fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs

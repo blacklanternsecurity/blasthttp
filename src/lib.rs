@@ -1,3 +1,4 @@
+pub mod antibot;
 pub mod batch;
 pub mod client;
 pub mod config;

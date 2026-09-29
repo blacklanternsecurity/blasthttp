@@ -14,10 +14,10 @@
 
 mod support;
 
+use blasthttp::antibot::{Outcome, ResponseFacts, classify};
 use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
 use blasthttp::config::RequestConfig;
-use support::antibot::{Outcome, ResponseFacts, classify};
 use support::tls_server::{TlsServerConfig, TlsTestServer};
 
 fn config(url: &str) -> RequestConfig {
