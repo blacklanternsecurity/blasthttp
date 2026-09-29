@@ -126,6 +126,32 @@ fn test_grease_does_not_change_ja4() {
 }
 
 #[test]
+fn test_counts_cap_at_99() {
+    // The JA4 header is fixed width: one character of protocol, two of
+    // version, one of SNI, two of cipher count, two of extension count, two of
+    // ALPN. A three-digit count would make it unparseable, so the spec caps
+    // both counts at 99.
+    //
+    // This is not academic for us. Our legacy cipher list is 105 suites, so we
+    // sit past the cap, and `tls.peet.ws` renders that as `105` where we
+    // render `99`. Their hashes and ours agree exactly, so the underlying
+    // reading is identical and only the count field diverges. We follow the
+    // spec, because the whole purpose here is comparing against browser JA4s
+    // and every browser is far below the cap. Once a stealth profile ships at
+    // 15 suites the divergence disappears on its own.
+    let mut absurd = chrome_150();
+    absurd.ciphers = (1u16..=150).collect();
+    absurd.extensions = (1u16..=150).collect();
+
+    let header = support::ja4::ja4(&absurd);
+    let header = header.split('_').next().unwrap();
+
+    assert_eq!(&header[4..6], "99", "cipher count should cap at 99");
+    assert_eq!(&header[6..8], "99", "extension count should cap at 99");
+    assert_eq!(header.len(), 10, "header must stay 10 characters wide");
+}
+
+#[test]
 fn test_sig_alg_order_does_change_ja4() {
     // Signature algorithms are the one list JA4 leaves in the order sent, so
     // a profile that gets the values right and the order wrong still fails to

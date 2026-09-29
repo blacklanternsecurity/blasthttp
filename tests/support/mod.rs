@@ -10,5 +10,6 @@
 
 #![allow(dead_code)]
 
+pub mod antibot;
 pub mod ja4;
 pub mod tls_server;
