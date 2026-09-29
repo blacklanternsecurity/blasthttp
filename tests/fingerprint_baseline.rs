@@ -180,3 +180,54 @@ async fn test_no_browser_only_extensions_yet() {
         );
     }
 }
+
+// ── Chrome profile ────────────────────────────────────────────────
+
+/// Capture a hello made with a named profile, addressed by hostname so SNI is
+/// sent and the result is comparable with a browser's.
+async fn capture_profile_hello(profile: &str) -> CapturedHello {
+    let server = TlsTestServer::start(TlsServerConfig::default()).await;
+    let url = format!("https://localhost:{}/", server.addr.port());
+
+    let mut config = RequestConfig::new(url);
+    config.verify_certs = Some(false);
+    config.timeout_seconds = Some(5);
+    config.profile = Some(profile.to_string());
+
+    let client = HyperClient::new();
+    let _ = client.send(&config).await;
+
+    let hello = server
+        .hello
+        .lock()
+        .expect("hello slot poisoned")
+        .clone()
+        .expect("server recorded no ClientHello");
+    server.shutdown().await;
+    hello
+}
+
+#[tokio::test]
+async fn test_chrome_profile_progress() {
+    // Not a pass/fail gate yet. Prints the distance to Chrome 131 so the
+    // remaining gap is visible while it is being closed.
+    let hello = capture_profile_hello("chrome").await;
+    let got = support::ja4::ja4(&hello);
+
+    // Chrome 131 and 124, confirmed against tls.peet.ws.
+    const TARGET: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+
+    println!("\n  target: {}", TARGET);
+    println!("  actual: {}", got);
+    println!("  raw   : {}", support::ja4::ja4_raw(&hello));
+
+    let want: Vec<&str> = TARGET.split('_').collect();
+    let have: Vec<&str> = got.split('_').collect();
+    for (label, w, h) in [
+        ("header", want[0], have[0]),
+        ("ciphers", want[1], have[1]),
+        ("exts+sigalgs", want[2], have[2]),
+    ] {
+        println!("  {:13} {}", label, if w == h { "match" } else { "differ" });
+    }
+}

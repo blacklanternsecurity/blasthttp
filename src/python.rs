@@ -919,6 +919,7 @@ impl BlastHTTP {
         verify_certs=None,
         proxy=None,
         no_proxy=None,
+        profile=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
@@ -947,6 +948,7 @@ impl BlastHTTP {
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
+        profile: Option<String>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
@@ -973,6 +975,7 @@ impl BlastHTTP {
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
+            profile,
             cipher_string,
             min_tls_version,
             max_tls_version,
@@ -1166,6 +1169,7 @@ impl BlastHTTP {
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
+            profile: None,
             cipher_string: None,
             min_tls_version: None,
             max_tls_version: None,
@@ -1218,6 +1222,7 @@ impl BlastHTTP {
     #[pyo3(signature = (
         url,
         verify_certs=None,
+        profile=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
@@ -1233,6 +1238,7 @@ impl BlastHTTP {
         py: Python<'py>,
         url: String,
         verify_certs: Option<bool>,
+        profile: Option<String>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
@@ -1244,6 +1250,7 @@ impl BlastHTTP {
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut config = RequestConfig::new(url.clone());
         config.verify_certs = verify_certs;
+        config.profile = profile;
         config.cipher_string = cipher_string;
         config.min_tls_version = min_tls_version;
         config.max_tls_version = max_tls_version;
@@ -1402,6 +1409,8 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     no_proxy: Option<Vec<String>>,
     #[pyo3(get, set)]
+    profile: Option<String>,
+    #[pyo3(get, set)]
     cipher_string: Option<String>,
     #[pyo3(get, set)]
     min_tls_version: Option<String>,
@@ -1437,6 +1446,7 @@ impl PyBatchConfig {
         verify_certs=None,
         proxy=None,
         no_proxy=None,
+        profile=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
@@ -1462,6 +1472,7 @@ impl PyBatchConfig {
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
+        profile: Option<String>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
@@ -1486,6 +1497,7 @@ impl PyBatchConfig {
             verify_certs,
             proxy,
             no_proxy,
+            profile,
             cipher_string,
             min_tls_version,
             max_tls_version,
@@ -1515,6 +1527,7 @@ impl Clone for PyBatchConfig {
             verify_certs: self.verify_certs,
             proxy: self.proxy.clone(),
             no_proxy: self.no_proxy.clone(),
+            profile: self.profile.clone(),
             cipher_string: self.cipher_string.clone(),
             min_tls_version: self.min_tls_version.clone(),
             max_tls_version: self.max_tls_version.clone(),
@@ -1547,6 +1560,7 @@ impl PyBatchConfig {
             verify_certs: self.verify_certs,
             proxy: self.proxy,
             no_proxy: self.no_proxy.unwrap_or_default(),
+            profile: self.profile,
             cipher_string: self.cipher_string,
             min_tls_version: self.min_tls_version,
             max_tls_version: self.max_tls_version,

@@ -124,10 +124,16 @@ fn generate_self_signed(config: &TlsServerConfig) -> (PKey<openssl::pkey::Privat
 
 // ── ClientHello capture ───────────────────────────────────────────
 //
-// `SSL_CTX_set_client_hello_cb` fires after the hello is parsed and before a
-// cipher is chosen, which is the only point where the full offer is still
-// visible. The safe `openssl` wrapper covers ciphers and versions but has no
-// accessor for the extension list, so those go through openssl-sys.
+// Parsed straight off the wire rather than through OpenSSL's
+// `SSL_CTX_set_client_hello_cb`. That callback looks like the obvious tool and
+// quietly under-reports: `SSL_client_hello_get1_extensions_present` only
+// returns extensions the *server's* OpenSSL has a definition for, so anything
+// it has not heard of is invisible. Since the extensions worth testing are
+// precisely the ones OpenSSL does not implement, ALPS and ECH among them, that
+// made the harness blind to the thing it exists to measure.
+//
+// Reading the bytes has two further benefits we need later: extension order
+// survives, and so does GREASE. Both are invisible through the callback.
 
 /// Split a big-endian `u16` array, as TLS encodes cipher and extension lists.
 fn be_u16s(bytes: &[u8]) -> Vec<u16> {
@@ -137,102 +143,138 @@ fn be_u16s(bytes: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-/// Read one extension's body, or `None` when the client didn't send it.
-fn extension_body(ssl: &mut openssl::ssl::SslRef, ext_type: u16) -> Option<Vec<u8>> {
-    use foreign_types_shared::ForeignTypeRef;
-    let mut out: *const std::ffi::c_uchar = std::ptr::null();
-    let mut outlen: usize = 0;
-    let found = unsafe {
-        openssl_sys::SSL_client_hello_get0_ext(
-            ssl.as_ptr(),
-            ext_type as std::ffi::c_uint,
-            &mut out,
-            &mut outlen,
-        )
-    };
-    if found != 1 || out.is_null() {
-        return None;
-    }
-    Some(unsafe { std::slice::from_raw_parts(out, outlen) }.to_vec())
+/// A cursor that refuses to run off the end, so a malformed or truncated hello
+/// returns what was understood instead of panicking inside a test server.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
 }
 
-/// A TLS vector whose length prefix is two bytes, which is how
-/// `supported_groups` and `signature_algorithms` wrap their contents.
-fn u16_vector_body(body: &[u8]) -> Vec<u16> {
-    if body.len() < 2 {
-        return Vec::new();
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Reader { buf, pos: 0 }
     }
-    let len = u16::from_be_bytes([body[0], body[1]]) as usize;
-    be_u16s(&body[2..(2 + len).min(body.len())])
-}
-
-fn parse_alpn(body: &[u8]) -> Vec<String> {
-    // Two-byte list length, then repeated one-byte-length-prefixed names.
-    if body.len() < 2 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut i = 2;
-    while i < body.len() {
-        let n = body[i] as usize;
-        i += 1;
-        if i + n > body.len() {
-            break;
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        if end > self.buf.len() {
+            return None;
         }
-        out.push(String::from_utf8_lossy(&body[i..i + n]).into_owned());
-        i += n;
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Some(out)
     }
-    out
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        self.take(2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+    }
+    /// A TLS vector with a one- or two-byte length prefix.
+    fn vec8(&mut self) -> Option<&'a [u8]> {
+        let n = self.u8()? as usize;
+        self.take(n)
+    }
+    fn vec16(&mut self) -> Option<&'a [u8]> {
+        let n = self.u16()? as usize;
+        self.take(n)
+    }
 }
 
-fn capture_hello(ssl: &mut openssl::ssl::SslRef) -> CapturedHello {
-    use foreign_types_shared::ForeignTypeRef;
+/// Parse a ClientHello out of one or more TLS records.
+///
+/// Returns `None` for anything that is not a well-formed handshake, which in a
+/// test means the client failed before saying anything useful.
+pub fn parse_client_hello(raw: &[u8]) -> Option<CapturedHello> {
+    // Reassemble the handshake across records. A hello carrying a real
+    // key_share and an ECH extension runs past 1400 bytes and is routinely
+    // split, so reading only the first record would truncate it.
+    let mut handshake = Vec::new();
+    let mut r = Reader::new(raw);
+    while r.pos < raw.len() {
+        let content_type = r.u8()?;
+        let _record_version = r.u16()?;
+        let fragment = r.vec16()?;
+        if content_type != 0x16 {
+            return None; // not a handshake record
+        }
+        handshake.extend_from_slice(fragment);
+    }
+
+    let mut h = Reader::new(&handshake);
+    if h.u8()? != 0x01 {
+        return None; // not a ClientHello
+    }
+    let len = {
+        let b = h.take(3)?;
+        ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize
+    };
+    let body = h.take(len)?;
+
+    let mut b = Reader::new(body);
+    let legacy_version = b.u16()?;
+    b.take(32)?; // random
+    b.vec8()?; // session id
+    let ciphers = be_u16s(b.vec16()?);
+    b.vec8()?; // compression methods
 
     let mut captured = CapturedHello {
-        legacy_version: unsafe {
-            openssl_sys::SSL_client_hello_get0_legacy_version(ssl.as_ptr()) as u16
-        },
-        ciphers: ssl.client_hello_ciphers().map(be_u16s).unwrap_or_default(),
+        legacy_version,
+        ciphers,
         ..Default::default()
     };
 
-    // Extension types, in the order the client sent them. The array is
-    // allocated by OpenSSL and is ours to free.
-    let mut types: *mut std::ffi::c_int = std::ptr::null_mut();
-    let mut count: usize = 0;
-    let ok = unsafe {
-        openssl_sys::SSL_client_hello_get1_extensions_present(ssl.as_ptr(), &mut types, &mut count)
+    // Extensions are optional in the grammar, though nothing modern omits them.
+    let Some(ext_block) = b.vec16() else {
+        return Some(captured);
     };
-    if ok == 1 && !types.is_null() {
-        captured.extensions = unsafe { std::slice::from_raw_parts(types, count) }
-            .iter()
-            .map(|t| *t as u16)
-            .collect();
-        unsafe { openssl_sys::OPENSSL_free(types as *mut std::ffi::c_void) };
-    }
 
-    captured.has_sni = captured.extensions.contains(&0x0000);
-    if let Some(b) = extension_body(ssl, 0x000a) {
-        captured.groups = u16_vector_body(&b);
-    }
-    if let Some(b) = extension_body(ssl, 0x000d) {
-        captured.sig_algs = u16_vector_body(&b);
-    }
-    if let Some(b) = extension_body(ssl, 0x0010) {
-        captured.alpn = parse_alpn(&b);
-    }
-    if let Some(b) = extension_body(ssl, 0x002b) {
-        // supported_versions uses a ONE-byte length prefix, unlike the others.
-        if !b.is_empty() {
-            let len = b[0] as usize;
-            captured.supported_versions = be_u16s(&b[1..(1 + len).min(b.len())]);
+    let mut e = Reader::new(ext_block);
+    while e.pos < ext_block.len() {
+        let Some(ext_type) = e.u16() else { break };
+        let Some(data) = e.vec16() else { break };
+        captured.extensions.push(ext_type);
+
+        let mut d = Reader::new(data);
+        match ext_type {
+            0x0000 => captured.has_sni = true,
+            0x000a => {
+                if let Some(v) = d.vec16() {
+                    captured.groups = be_u16s(v);
+                }
+            }
+            0x000d => {
+                if let Some(v) = d.vec16() {
+                    captured.sig_algs = be_u16s(v);
+                }
+            }
+            0x0010 => {
+                if let Some(list) = d.vec16() {
+                    let mut l = Reader::new(list);
+                    while l.pos < list.len() {
+                        match l.vec8() {
+                            Some(name) => captured
+                                .alpn
+                                .push(String::from_utf8_lossy(name).into_owned()),
+                            None => break,
+                        }
+                    }
+                }
+            }
+            // supported_versions is the odd one out: a one-byte length prefix
+            // where the others use two.
+            0x002b => {
+                if let Some(v) = d.vec8() {
+                    captured.supported_versions = be_u16s(v);
+                }
+            }
+            _ => {}
         }
     }
 
-    captured
+    Some(captured)
 }
 
-fn build_acceptor(config: &TlsServerConfig, hello: HelloSlot) -> SslAcceptor {
+fn build_acceptor(config: &TlsServerConfig) -> SslAcceptor {
     // Load the legacy provider so the server can use weak ciphers too
     load_legacy_provider();
 
@@ -262,15 +304,6 @@ fn build_acceptor(config: &TlsServerConfig, hello: HelloSlot) -> SslAcceptor {
             "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
         )
         .unwrap();
-
-    // Record the client's offer before a cipher is picked.
-    builder.set_client_hello_callback(move |ssl, _alert| {
-        let captured = capture_hello(ssl);
-        if let Ok(mut slot) = hello.lock() {
-            *slot = Some(captured);
-        }
-        Ok(openssl::ssl::ClientHelloResponse::SUCCESS)
-    });
 
     let (pkey, cert) = generate_self_signed(config);
     builder.set_private_key(&pkey).unwrap();
@@ -308,7 +341,7 @@ fn load_legacy_provider() {
 impl TlsTestServer {
     pub async fn start(config: TlsServerConfig) -> Self {
         let hello: HelloSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let acceptor = build_acceptor(&config, hello.clone());
+        let acceptor = build_acceptor(&config);
 
         // Bind to random port on localhost
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -316,6 +349,7 @@ impl TlsTestServer {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        let hello_slot = hello.clone();
         let handle = tokio::spawn(async move {
             let response = format!(
                 "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -327,6 +361,19 @@ impl TlsTestServer {
             tokio::select! {
                 result = listener.accept() => {
                     if let Ok((tcp_stream, _)) = result {
+                        // Read the ClientHello off the wire and parse it before
+                        // TLS touches it, then hand the same bytes to the
+                        // handshake. Peeking rather than consuming keeps the
+                        // stream intact, so no replay buffer is needed and the
+                        // handshake proceeds exactly as it would have.
+                        let mut peek = vec![0u8; 8192];
+                        if let Ok(n) = tcp_stream.peek(&mut peek).await
+                            && let Some(parsed) = parse_client_hello(&peek[..n])
+                            && let Ok(mut slot) = hello_slot.lock()
+                        {
+                            *slot = Some(parsed);
+                        }
+
                         // Async TLS handshake via tokio-openssl
                         let ssl = openssl::ssl::Ssl::new(acceptor.context()).unwrap();
                         let mut tls_stream = match tokio_openssl::SslStream::new(ssl, tcp_stream) {

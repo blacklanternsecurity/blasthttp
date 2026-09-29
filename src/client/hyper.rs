@@ -78,6 +78,235 @@ fn sanitize_uri(url: &str) -> String {
 /// nothing.
 const DEFAULT_CIPHER_LIST: &str = "ALL";
 
+/// Add the extensions a browser sends that OpenSSL does not send on its own.
+///
+/// JA4 hashes the list of extension *types*, not their contents, so presence
+/// is what the fingerprint turns on. Payload fidelity still matters to
+/// anything reading the raw hello, and where a payload is cheap to get right
+/// it is written out properly rather than left empty.
+///
+/// `SSL_CTX_add_custom_ext` refuses any extension OpenSSL handles itself, so
+/// this only covers the ones it has never heard of. `status_request` is set
+/// through its own API for that reason, and `renegotiation_info` cannot be
+/// done from out here at all.
+fn add_browser_extensions(
+    builder: &mut openssl::ssl::SslConnectorBuilder,
+) -> Result<(), ClientError> {
+    use openssl::ssl::ExtensionContext;
+
+    // Each extension's payload needs its OWN type, and this is not a style
+    // choice. The `openssl` crate stashes the bytes an add-callback returns in
+    // per-connection ex_data keyed on the payload type:
+    //
+    //     let idx = Ssl::cached_ex_index::<CustomExtAddState<T>>();
+    //
+    // so every custom extension returning `Vec<u8>` shares one slot and
+    // overwrites the others. Registering three that way sends exactly one,
+    // whichever wrote last, and the rest hand OpenSSL a pointer into a buffer
+    // that has already moved. Distinct newtypes give each its own slot.
+    macro_rules! payload_type {
+        ($name:ident) => {
+            struct $name(Vec<u8>);
+            impl AsRef<[u8]> for $name {
+                fn as_ref(&self) -> &[u8] {
+                    &self.0
+                }
+            }
+        };
+    }
+    payload_type!(StatusRequest);
+    payload_type!(SignedCertTimestamp);
+    payload_type!(CertCompression);
+    payload_type!(Alps);
+    payload_type!(EchGrease);
+
+    // Only the ClientHello. Sending these anywhere else would be wrong and,
+    // for ALPS, would confuse a server that actually implements it.
+    let ctx = ExtensionContext::CLIENT_HELLO;
+
+    // Which codepoints OpenSSL will cede, probed rather than assumed:
+    //
+    //   0x0005 status_request        refused, OpenSSL owns it
+    //   0x0012 signed_cert_timestamp accepted
+    //   0x001b compress_certificate  refused, OpenSSL owns it
+    //   0x4469 application_settings  accepted
+    //   0xfe0d encrypted_client_hello accepted
+    //   0xff01 renegotiation_info    refused, OpenSSL owns it
+    //
+    // The refusals are attempted anyway and ignored: they are cheap, they
+    // would start working if the build gained the relevant support, and none
+    // is worth failing a request over. Closing those three is what needs a
+    // patch to our OpenSSL build.
+
+    // status_request (0x0005): OCSP, then two empty lists. Five bytes, the
+    // same as Chrome.
+    let _ = builder.add_custom_ext(
+        0x0005,
+        ctx,
+        |_ssl, _ctx, _cert| Ok(Some(StatusRequest(vec![0x01, 0x00, 0x00, 0x00, 0x00]))),
+        |_ssl, _ctx, _data, _cert| Ok(()),
+    );
+
+    // signed_certificate_timestamp (0x0012): empty, as a client sends it.
+    let _ = builder.add_custom_ext(
+        0x0012,
+        ctx,
+        |_ssl, _ctx, _cert| Ok(Some(SignedCertTimestamp(Vec::new()))),
+        |_ssl, _ctx, _data, _cert| Ok(()),
+    );
+
+    // compress_certificate (0x001b): one algorithm, brotli.
+    let _ = builder.add_custom_ext(
+        0x001b,
+        ctx,
+        |_ssl, _ctx, _cert| Ok(Some(CertCompression(vec![0x02, 0x00, 0x02]))),
+        |_ssl, _ctx, _data, _cert| Ok(()),
+    );
+
+    // application_settings, ALPS (0x4469). Chrome 124 through 131 use this
+    // codepoint; 133 and later moved to 0x44cd. The body is an ALPN-shaped
+    // list holding just h2.
+    builder
+        .add_custom_ext(
+            0x4469,
+            ctx,
+            |_ssl, _ctx, _cert| Ok(Some(Alps(vec![0x00, 0x03, 0x02, b'h', b'2']))),
+            |_ssl, _ctx, _data, _cert| Ok(()),
+        )
+        .map_err(|e| ClientError::tls(format!("failed to add ALPS extension: {}", e)))?;
+
+    // encrypted_client_hello (0xfe0d). Chrome sends a GREASE ECH: a decoy
+    // shaped like the real thing that decrypts to nothing. OpenSSL 3.3.2 has
+    // no ECH at all, so this is hand-built. Nothing reads it, and its only job
+    // is to occupy the codepoint, but it is shaped correctly so that a server
+    // which does parse ECH sees something well-formed.
+    builder
+        .add_custom_ext(
+            0xfe0d,
+            ctx,
+            |_ssl, _ctx, _cert| {
+                let mut body = Vec::with_capacity(140);
+                body.push(0x00); // ClientHelloOuter
+                body.push(0x00); // HKDF-SHA256
+                body.extend_from_slice(&[0x00, 0x01]); // AES-128-GCM
+                body.extend_from_slice(&[0x00, 0x00]); // config id
+                body.extend_from_slice(&[0x00, 0x20]); // 32-byte enc
+                body.extend_from_slice(&[0x42; 32]);
+                body.extend_from_slice(&[0x00, 0x60]); // 96-byte payload
+                body.extend_from_slice(&[0x17; 96]);
+                Ok(Some(EchGrease(body)))
+            },
+            |_ssl, _ctx, _data, _cert| Ok(()),
+        )
+        .map_err(|e| ClientError::tls(format!("failed to add ECH extension: {}", e)))?;
+
+    Ok(())
+}
+
+/// Apply the cipher, signature-algorithm, group and version settings to a
+/// connector builder.
+///
+/// Shared because there are two places that build an SSL context, the pooled
+/// connector and `connect_stream`, and they have historically been
+/// copy-pasted siblings. Anything applied in only one of them silently gives
+/// `raw_connect`, `resolve_ip` and `request_target` requests a different
+/// fingerprint from ordinary ones.
+///
+/// Precedence is: an explicit setting beats the profile, and the profile beats
+/// the default. A caller who names a cipher string means it, and several
+/// existing tests depend on that still being true.
+fn apply_tls_settings(
+    builder: &mut openssl::ssl::SslConnectorBuilder,
+    config: &RequestConfig,
+) -> Result<(), ClientError> {
+    use openssl::ssl::SslOptions;
+
+    let profile = config.resolved_profile();
+
+    // Security level 0: allow all ciphers including RC4 and DES. This is an
+    // offensive-first tool and needs to connect to anything.
+    builder.set_security_level(0);
+
+    // `SslConnector::builder` sets NO_SSLV3. Clear it, or a server that speaks
+    // nothing newer stays unreachable even when asked for by name. Clearing
+    // the option only permits the protocol; what is actually offered is
+    // decided by the min/max version below, and a browser profile pins that
+    // floor at 1.2 so this never widens a profile's offer.
+    builder.clear_options(SslOptions::NO_SSLV3);
+
+    if let Some(p) = profile {
+        // Removing two extensions a browser does not send.
+        //
+        // encrypt_then_mac (0x0016) goes away by disabling the feature.
+        // padding (0x0015) is added by SSL_OP_TLSEXT_PADDING, which arrives
+        // switched on inside SSL_OP_ALL, so it has to be cleared rather than
+        // set. JA4 counts extensions, so both of these move the fingerprint.
+        //
+        // The `openssl` crate exposes neither flag, so the bits are taken from
+        // ssl.h directly: SSL_OP_TLSEXT_PADDING is SSL_OP_BIT(4) and
+        // SSL_OP_NO_ENCRYPT_THEN_MAC is SSL_OP_BIT(19). Both are stable parts
+        // of the public ABI.
+        const SSL_OP_TLSEXT_PADDING: u64 = 1 << 4;
+        const SSL_OP_NO_ENCRYPT_THEN_MAC: u64 = 1 << 19;
+        builder.set_options(SslOptions::from_bits_retain(SSL_OP_NO_ENCRYPT_THEN_MAC));
+        builder.clear_options(SslOptions::from_bits_retain(SSL_OP_TLSEXT_PADDING));
+
+        builder.set_ciphersuites(p.tls.ciphersuites).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid TLS 1.3 suite list: {}",
+                p.name, e
+            ))
+        })?;
+        builder.set_sigalgs_list(p.tls.sigalgs).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid signature algorithm list: {}",
+                p.name, e
+            ))
+        })?;
+        builder.set_groups_list(p.tls.groups).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid group list: {}",
+                p.name, e
+            ))
+        })?;
+
+        add_browser_extensions(builder)?;
+    }
+
+    let ciphers = config
+        .cipher_string
+        .as_deref()
+        .or(profile.map(|p| p.tls.cipher_list))
+        .unwrap_or(DEFAULT_CIPHER_LIST);
+    builder
+        .set_cipher_list(ciphers)
+        .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
+
+    let min_version = config
+        .min_tls_version
+        .as_deref()
+        .or(profile.map(|p| p.tls.min_version));
+    if let Some(v) = min_version {
+        let version = parse_tls_version(v)?;
+        builder
+            .set_min_proto_version(Some(version))
+            .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
+    }
+
+    let max_version = config
+        .max_tls_version
+        .as_deref()
+        .or(profile.map(|p| p.tls.max_version));
+    if let Some(v) = max_version {
+        let version = parse_tls_version(v)?;
+        builder
+            .set_max_proto_version(Some(version))
+            .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
+    }
+
+    Ok(())
+}
+
 // Load the OpenSSL legacy provider once (for RC4, DES, etc.).
 // The provider is statically compiled into libcrypto via `no-module` build flag.
 // `Once` ensures this runs exactly once even across threads.
@@ -217,6 +446,9 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
 // Wraps HttpConnector with TLS handshake via openssl + tokio-openssl.
 #[derive(Clone)]
 struct OpenSslConnector {
+    /// Whether a browser profile is active. Needed in `call()` because
+    /// status_request can only be set once an `Ssl` exists.
+    profile_active: bool,
     http: HttpConnector,
     ssl: openssl::ssl::SslConnector,
     // Shared slot for cert info — written during handshake, read after response
@@ -357,44 +589,13 @@ impl OpenSslConnector {
             openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
                 .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
-        // Security level 0: allow all ciphers including RC4, DES, export.
-        // This is an offensive-first tool — we need to connect to anything.
-        builder.set_security_level(0);
-
-        // `SslConnector::builder` sets NO_SSLV3 for us. Clear it, or a server
-        // that speaks nothing newer stays unreachable even when the caller
-        // asks for SSLv3 by name. Clearing the option only permits the
-        // protocol; which versions actually get offered is still decided by
-        // the min/max proto version below.
-        builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
-
         if !config.should_verify_certs() {
             builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
         } else {
             load_system_ca_certs(&mut builder)?;
         }
 
-        let ciphers = config
-            .cipher_string
-            .as_deref()
-            .unwrap_or(DEFAULT_CIPHER_LIST);
-        builder
-            .set_cipher_list(ciphers)
-            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
-
-        if let Some(ref min_ver) = config.min_tls_version {
-            let version = parse_tls_version(min_ver)?;
-            builder
-                .set_min_proto_version(Some(version))
-                .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
-        }
-
-        if let Some(ref max_ver) = config.max_tls_version {
-            let version = parse_tls_version(max_ver)?;
-            builder
-                .set_max_proto_version(Some(version))
-                .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
-        }
+        apply_tls_settings(&mut builder, config)?;
 
         // ALPN: advertise HTTP/2 and HTTP/1.1 support during TLS handshake.
         // The wire format is length-prefixed: [2, b'h', b'2', 8, b'h', b't', ...].
@@ -421,6 +622,7 @@ impl OpenSslConnector {
         http.set_connect_timeout(Some(connect_timeout));
 
         Ok(OpenSslConnector {
+            profile_active: config.resolved_profile().is_some(),
             http,
             ssl,
             cert_slot,
@@ -535,6 +737,7 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
         let slot_key = peer_slot_key(&uri);
         let http_fut = self.http.call(uri);
         let ssl_connector = self.ssl.clone();
+        let profile_active = self.profile_active;
         let cert_slot = self.cert_slot.clone();
         let peer_slot = self.peer_slot.clone();
         let connect_timeout = self.connect_timeout;
@@ -558,6 +761,15 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 
             let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            // status_request (0x0005). OpenSSL keeps this codepoint for itself
+            // and refuses a custom extension for it, and its own API,
+            // SSL_set_tlsext_status_type, is per-connection rather than
+            // per-context. So it has to be set here, where an Ssl finally
+            // exists, rather than alongside the other profile extensions.
+            if profile_active {
+                let _ = ssl_conf.set_status_type(openssl::ssl::StatusType::OCSP);
+            }
             // Only set SNI for hostnames, not IP addresses (SNI with IPs is invalid per RFC)
             if host.parse::<std::net::IpAddr>().is_err() {
                 ssl_conf
@@ -646,6 +858,12 @@ enum AnyClient {
 #[derive(Clone, Hash, Eq, PartialEq)]
 struct TlsKey {
     verify_certs: bool,
+    /// Part of the key because a profile changes the cipher list, the
+    /// signature algorithms, the groups and the version floor. Leaving it out
+    /// means the first request to a host fixes the TLS configuration for every
+    /// later one, so an impersonated request and a plain one would quietly
+    /// share a connection.
+    profile: Option<String>,
     cipher_string: Option<String>,
     min_tls_version: Option<String>,
     max_tls_version: Option<String>,
@@ -656,6 +874,7 @@ impl TlsKey {
     fn from_config(config: &RequestConfig) -> Self {
         TlsKey {
             verify_certs: config.should_verify_certs(),
+            profile: config.profile.clone(),
             cipher_string: config.cipher_string.clone(),
             min_tls_version: config.min_tls_version.clone(),
             max_tls_version: config.max_tls_version.clone(),
@@ -998,23 +1217,13 @@ pub(crate) async fn connect_stream(
         openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
             .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
-    ssl_builder.set_security_level(0);
-    // Same reason as the pooled path: openssl-rs sets NO_SSLV3 and an SSLv3
-    // server is unreachable until it is cleared.
-    ssl_builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
-
     if !config.should_verify_certs() {
         ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
     } else {
         load_system_ca_certs(&mut ssl_builder)?;
     }
-    let ciphers = config
-        .cipher_string
-        .as_deref()
-        .unwrap_or(DEFAULT_CIPHER_LIST);
-    ssl_builder
-        .set_cipher_list(ciphers)
-        .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
+
+    apply_tls_settings(&mut ssl_builder, config)?;
     if let Some(ref min_ver) = config.min_tls_version {
         let version = parse_tls_version(min_ver)?;
         ssl_builder
@@ -1041,8 +1250,15 @@ pub(crate) async fn connect_stream(
         .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
     let ssl_connector = ssl_builder.build();
+    let profile_active = config.resolved_profile().is_some();
     let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
         .map_err(|e| ClientError::tls(format!("SSL conf failed: {}", e)))?;
+
+    // See the pooled path: OpenSSL keeps status_request for itself and its API
+    // for it is per-connection, so it can only be set once an Ssl exists.
+    if profile_active {
+        let _ = ssl_conf.set_status_type(openssl::ssl::StatusType::OCSP);
+    }
 
     // SNI = original hostname, NOT the resolved IP
     if host.parse::<std::net::IpAddr>().is_err() {

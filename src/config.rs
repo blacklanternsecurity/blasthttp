@@ -28,6 +28,17 @@ pub struct RequestConfig {
     /// `corp`), single IPs, CIDR ranges (`10.0.0.0/8`), or `*` for all.
     #[serde(default)]
     pub no_proxy: Vec<String>,
+    /// Browser profile to impersonate, e.g. `"chrome"`. Applies a matching
+    /// TLS configuration, HTTP/2 settings and default headers together.
+    ///
+    /// Applied as a unit on purpose. A profile whose layers disagree is worse
+    /// than none: a client claiming to be Chrome whose handshake says
+    /// otherwise has stated something checkably false.
+    ///
+    /// An explicit `cipher_string`, `min_tls_version` or `max_tls_version`
+    /// overrides the profile's value for that field, on the grounds that a
+    /// caller naming something specific means it.
+    pub profile: Option<String>,
     pub cipher_string: Option<String>,
     pub min_tls_version: Option<String>,
     pub max_tls_version: Option<String>,
@@ -70,6 +81,7 @@ impl RequestConfig {
             verify_certs: None,
             proxy: None,
             no_proxy: Vec::new(),
+            profile: None,
             cipher_string: None,
             min_tls_version: None,
             max_tls_version: None,
@@ -82,6 +94,15 @@ impl RequestConfig {
             alpn_protocols: None,
             verbosity: 0,
         }
+    }
+
+    /// The browser profile this request should imitate, if it named one.
+    ///
+    /// An unknown name resolves to `None` rather than erroring, so a profile
+    /// that has not been written yet degrades to ordinary behaviour instead of
+    /// failing the request.
+    pub fn resolved_profile(&self) -> Option<&'static crate::profile::BrowserProfile> {
+        self.profile.as_deref().and_then(crate::profile::by_name)
     }
 
     pub fn method(&self) -> &str {
