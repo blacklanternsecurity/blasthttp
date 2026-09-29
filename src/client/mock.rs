@@ -75,6 +75,7 @@ impl HttpClient for ErrorKindMockClient {
         Err(ClientError {
             message: self.message.clone(),
             kind: self.kind.clone(),
+            tls_failure: None,
         })
     }
 }
@@ -117,6 +118,7 @@ impl HttpClient for SequenceMockClient {
             return Err(ClientError {
                 message: format!("mock error on call {}", call),
                 kind: self.fail_kind.clone(),
+                tls_failure: None,
             });
         }
 

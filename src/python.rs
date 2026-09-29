@@ -19,6 +19,7 @@ use crate::batch::{self, BatchResult, RateLimiter};
 use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
 use crate::client::raw;
+use crate::client::{ClientError, ErrorKind, TlsFailure};
 use crate::config::RequestConfig;
 use crate::multipart;
 use crate::response::{CertInfo, RedirectHop, Response, ResponseHash};
@@ -379,6 +380,61 @@ pyo3::create_exception!(
     pyo3::exceptions::PyException,
     "Raised by Response.raise_for_status() when the response status is 4xx or 5xx."
 );
+
+// ── Turning a ClientError into a Python exception ─────────────────
+
+pyo3::create_exception!(
+    blasthttp,
+    TransportError,
+    pyo3::exceptions::PyRuntimeError,
+    "Raised when a request never produced a response: DNS, TCP, TLS or timeout."
+);
+
+/// Convert a `ClientError` into a Python exception that keeps what we know.
+///
+/// Every call site used to do `PyRuntimeError::new_err(e.message)`, which threw
+/// away `kind` and left Python to substring-match a sentence to find out
+/// whether a host was unreachable, timed out, or refused our ciphers. The
+/// message stays the same so existing `except RuntimeError` keeps working
+/// (TransportError subclasses it), but the detail is now attached as
+/// attributes:
+///
+///   `kind`         one of connection, timeout, tls, invalid_url,
+///                  too_many_redirects, status, other
+///   `tls_failure`  when the handshake failed, why: no_shared_cipher,
+///                  unsupported_protocol, alert, certificate_verify, reset,
+///                  timeout, other. `None` otherwise.
+///   `retryable`    whether trying the same request again might help.
+fn client_error_to_py(e: ClientError) -> PyErr {
+    let kind = match &e.kind {
+        ErrorKind::Connection => "connection",
+        ErrorKind::Timeout => "timeout",
+        ErrorKind::Tls => "tls",
+        ErrorKind::InvalidUrl => "invalid_url",
+        ErrorKind::TooManyRedirects => "too_many_redirects",
+        ErrorKind::Status(_) => "status",
+        ErrorKind::Other => "other",
+    };
+    let tls_failure = e.tls_failure.as_ref().map(|f| match f {
+        TlsFailure::NoSharedCipher => "no_shared_cipher",
+        TlsFailure::UnsupportedProtocol => "unsupported_protocol",
+        TlsFailure::Alert { .. } => "alert",
+        TlsFailure::CertificateVerify { .. } => "certificate_verify",
+        TlsFailure::Reset => "reset",
+        TlsFailure::Timeout => "timeout",
+        TlsFailure::Other { .. } => "other",
+    });
+    let retryable = e.kind.is_retryable();
+
+    let err = TransportError::new_err(e.message);
+    Python::attach(|py| {
+        let v = err.value(py);
+        let _ = v.setattr("kind", kind);
+        let _ = v.setattr("tls_failure", tls_failure);
+        let _ = v.setattr("retryable", retryable);
+    });
+    err
+}
 
 // ── Response wrapper ──────────────────────────────────────────────
 
@@ -996,10 +1052,7 @@ impl BlastHTTP {
             if let Some(ref limiter) = limiter {
                 limiter.acquire().await;
             }
-            let response = client
-                .send(&config)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            let response = client.send(&config).await.map_err(client_error_to_py)?;
             Ok(PyResponse {
                 inner: response,
                 headers_cache: OnceLock::new(),
@@ -1190,10 +1243,7 @@ impl BlastHTTP {
             if let Some(ref limiter) = limiter {
                 limiter.acquire().await;
             }
-            let response = client
-                .send(&config)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            let response = client.send(&config).await.map_err(client_error_to_py)?;
 
             // Write body bytes to file
             let mut file = std::fs::File::create(&path).map_err(|e| {
@@ -1271,7 +1321,7 @@ impl BlastHTTP {
             }
             let conn = raw::RawConnection::connect(&url, &config)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+                .map_err(client_error_to_py)?;
             Ok(PyRawConnection {
                 inner: Arc::new(conn),
                 rate_limiter: limiter_for_conn,
@@ -1306,10 +1356,7 @@ impl PyRawConnection {
             if let Some(ref limiter) = limiter {
                 limiter.acquire().await;
             }
-            inner
-                .send_bytes(&data)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            inner.send_bytes(&data).await.map_err(client_error_to_py)?;
             Ok(())
         })
     }
@@ -1337,7 +1384,7 @@ impl PyRawConnection {
             let data = inner
                 .read_raw(max_bytes, timeout_ms)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+                .map_err(client_error_to_py)?;
             Ok(data)
         })
     }
@@ -1346,10 +1393,7 @@ impl PyRawConnection {
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
-                .close()
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            inner.close().await.map_err(client_error_to_py)?;
             Ok(())
         })
     }
@@ -2052,6 +2096,7 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRequest>()?;
     m.add_class::<PyRawConnection>()?;
     m.add("HTTPStatusError", m.py().get_type::<HTTPStatusError>())?;
+    m.add("TransportError", m.py().get_type::<TransportError>())?;
     register_h2_submodule(m)?;
     crate::mock::register_mock_submodule(m)?;
     register_headers_as_mapping(m)?;
