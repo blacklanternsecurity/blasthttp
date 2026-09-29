@@ -940,10 +940,6 @@ pub struct HyperClient {
     // the ladder on every request. Written only on success; see
     // `remember_profile`.
     host_profiles: Mutex<HashMap<String, &'static crate::profile::ConnectionProfile>>,
-    // One-at-a-time ladder discovery per host. See `discovery_permit`.
-    // Entries are removed once a host's profile is known, so this holds only
-    // hosts currently being discovered rather than every host ever seen.
-    host_discovery: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     // Why the last handshake to each host failed.
     //
     // Deliberately on the client rather than on `CachedClient`: a retry with
@@ -964,7 +960,6 @@ impl HyperClient {
         HyperClient {
             cached: Mutex::new(std::collections::HashMap::new()),
             host_profiles: Mutex::new(HashMap::new()),
-            host_discovery: Mutex::new(HashMap::new()),
             tls_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2116,90 +2111,21 @@ impl HyperClient {
     /// a host we have succeeded against before starts on whatever worked,
     /// which is the whole point of remembering: the ladder costs a wasted
     /// request every time it walks, and a scan hits the same host repeatedly.
-    /// What we already know about this host, if anything.
-    fn remembered_profile(
-        &self,
-        uri: &http::Uri,
-    ) -> Option<&'static crate::profile::ConnectionProfile> {
-        let key = peer_slot_key(uri)?;
-        let map = self.host_profiles.lock().ok()?;
-        map.get(&key).copied()
-    }
-
-    /// Hold the right to be the one that walks the ladder for this host.
-    ///
-    /// Without it, every request in an opening burst walks independently,
-    /// because the per-host memory is only written once something succeeds and
-    /// nothing has succeeded yet. Measured: twelve concurrent requests to a
-    /// host needing one shift produced twenty-four handshake attempts instead
-    /// of twelve. The overshoot is bounded by concurrency rather than by scan
-    /// size, so a thousand-path scan at fifty concurrent pays about fifty
-    /// extra handshakes, not a thousand. They all land in the same burst
-    /// though, against a host that is by definition already watching, which is
-    /// the worst moment to look like a pile of odd clients.
-    ///
-    /// So one request discovers and the rest wait for the answer. That costs
-    /// the followers the leader's walk in latency, once per host, in exchange
-    /// for roughly a third of the handshakes.
-    ///
-    /// Bounded: if the leader is slow or fails outright, waiters give up and
-    /// walk it themselves rather than inheriting a stall. A wasted handshake
-    /// is a much smaller problem than a request that never returns.
-    async fn discovery_permit(
-        &self,
-        uri: &http::Uri,
-        timeout: Duration,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let key = peer_slot_key(uri)?;
-        let sem = {
-            // Clone the Arc and drop the std guard before awaiting: holding a
-            // std::sync::Mutex across an await point is how this deadlocks.
-            let mut map = self.host_discovery.lock().ok()?;
-            map.entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
-                .clone()
-        };
-        tokio::time::timeout(timeout, sem.acquire_owned())
-            .await
-            .ok()?
-            .ok()
-    }
-
-    /// Which profile this hop starts on.
-    ///
-    /// A pinned config starts and ends on what the caller asked for. Otherwise
-    /// a host we have succeeded against before starts on whatever worked,
-    /// which is the point of remembering: the ladder costs a wasted request
-    /// every time it walks, and a scan hits the same host repeatedly.
-    ///
-    /// Returns a permit alongside the profile. Holding it is what stops the
-    /// rest of a concurrent burst walking the same ladder; it is released when
-    /// the hop finishes, whether or not anything worked.
-    async fn starting_profile(
+    fn starting_profile(
         &self,
         config: &RequestConfig,
         uri: &http::Uri,
-    ) -> (
-        &'static crate::profile::ConnectionProfile,
-        Option<tokio::sync::OwnedSemaphorePermit>,
-    ) {
+    ) -> &'static crate::profile::ConnectionProfile {
         if config.tls_is_pinned() {
-            return (config.resolved_profile(), None);
+            return config.resolved_profile();
         }
-        if let Some(p) = self.remembered_profile(uri) {
-            return (p, None);
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(map) = self.host_profiles.lock()
+            && let Some(p) = map.get(&key)
+        {
+            return p;
         }
-
-        let permit = self
-            .discovery_permit(uri, Duration::from_secs(config.timeout()))
-            .await;
-
-        // Check again now we hold it. The leader may have finished while we
-        // were waiting, which is the whole point of having waited.
-        if let Some(p) = self.remembered_profile(uri) {
-            return (p, None);
-        }
-        (config.resolved_profile(), permit)
+        config.resolved_profile()
     }
 
     /// The next rung, or `None` to stop.
@@ -2232,16 +2158,10 @@ impl HyperClient {
         uri: &http::Uri,
         profile: &'static crate::profile::ConnectionProfile,
     ) {
-        let Some(key) = peer_slot_key(uri) else {
-            return;
-        };
-        if let Ok(mut map) = self.host_profiles.lock() {
-            map.insert(key.clone(), profile);
-        }
-        // Discovery is over for this host, so drop its semaphore rather than
-        // keeping one per host for the life of the client.
-        if let Ok(mut map) = self.host_discovery.lock() {
-            map.remove(&key);
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(mut map) = self.host_profiles.lock()
+        {
+            map.insert(key, profile);
         }
     }
 
@@ -2353,7 +2273,7 @@ impl HyperClient {
             // `send`, so it does not spend the caller's retry budget: those are
             // different questions, one being "did this flake" and the other
             // "is this the wrong way to talk to this host".
-            let (mut rung, mut discovery_permit) = self.starting_profile(config, &uri).await;
+            let mut rung = self.starting_profile(config, &uri);
             let mut tried: Vec<&'static str> = Vec::new();
             let mut attempts: Vec<crate::report::Attempt> = Vec::new();
             let (resp, cached) = loop {
@@ -2388,12 +2308,6 @@ impl HyperClient {
                             // evidence.
                             if outcome.got_through() {
                                 self.remember_profile(&uri, rung);
-                                // Release the moment the answer is known,
-                                // rather than at the end of the hop. Waiters
-                                // only ever needed the profile; making them
-                                // also wait out redirect handling and cookie
-                                // bookkeeping would be latency for nothing.
-                                drop(discovery_permit.take());
                             }
                             break (resp, cached);
                         }

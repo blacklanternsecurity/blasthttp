@@ -237,24 +237,33 @@ async fn test_modern_still_reachable_by_default() {
     server.shutdown().await;
 }
 
-// ── Concurrent discovery ──────────────────────────────────────────
+// ── A known cost, deliberately not fixed ──────────────────────────
 
 #[tokio::test]
-async fn test_a_burst_does_not_all_walk_the_ladder() {
-    // Every request in an opening burst used to walk the ladder
-    // independently, because the per-host memory is only written once
-    // something succeeds and nothing has succeeded yet. Measured against a
-    // real host before this was fixed: twelve concurrent requests produced
-    // twenty-four handshake attempts.
+async fn test_a_cold_burst_rediscovers_per_request() {
+    // Every request in an opening burst walks the ladder independently,
+    // because the per-host memory is only written once something succeeds and
+    // nothing has succeeded yet. This test records that rather than asserting
+    // it away, because the obvious fix turned out to cost more than it saved.
     //
-    // That overshoot is bounded by concurrency rather than by scan size, so a
-    // thousand-path scan at fifty concurrent pays about fifty extra
-    // handshakes. They all land in the same burst though, against a host that
-    // is by definition already watching, which is the worst moment to look
-    // like a pile of odd clients.
+    // The cost: roughly double the handshakes in the first burst against a
+    // host needing a shift. Measured against a real host, twelve concurrent
+    // requests produced twenty-four attempts. It is bounded by concurrency
+    // and not by scan size, so a thousand-path scan at fifty concurrent pays
+    // about fifty extra handshakes, and only on the first burst; afterwards
+    // the memory answers.
     //
-    // One request now discovers and the rest wait for the answer.
-    const N: usize = 8;
+    // The attempted fix was a per-host semaphore, so one request discovers
+    // and the rest wait. It worked, 24 attempts down to 13. But a waiter
+    // cannot be released until the leader has classified its response, and
+    // classification needs the body, so the wait is a full request long. That
+    // is a head-of-line stall, which is exactly what request_batch_stream
+    // exists to avoid, and it broke the test that guards that property.
+    // Shortening the wait enough to preserve it removed the entire saving.
+    //
+    // So: leave it, and revisit if scan telemetry ever shows the burst
+    // mattering more than the latency.
+    const N: usize = 6;
 
     let server = TlsTestServer::start(TlsServerConfig {
         cipher_list: Some("RC4-SHA".to_string()),
@@ -273,8 +282,7 @@ async fn test_a_burst_does_not_all_walk_the_ladder() {
         tasks.push(tokio::spawn(async move { client.send(&config).await }));
     }
 
-    let mut attempts = 0usize;
-    let mut reached = 0usize;
+    let (mut attempts, mut reached) = (0usize, 0usize);
     for t in tasks {
         if let Ok(Ok(resp)) = t.await {
             attempts += resp.attempts.len();
@@ -284,15 +292,12 @@ async fn test_a_burst_does_not_all_walk_the_ladder() {
         }
     }
 
-    assert_eq!(reached, N, "every request should have got through");
-    // The floor is N, one attempt each. The leader spends one extra walking
-    // from `modern` to `compatibility`. Anything approaching 2N means the
-    // burst is re-discovering per request.
+    // Correctness is what matters and it holds: every request gets through,
+    // the ladder just runs more often than it strictly needs to.
+    assert_eq!(reached, N, "every request should get through");
     assert!(
-        attempts <= N + 2,
-        "burst made {attempts} attempts for {N} requests; expected about {} \
-         (one each, plus the leader's walk). Discovery is not being shared.",
-        N + 1
+        attempts >= N,
+        "expected at least one attempt each, got {attempts}"
     );
 
     server.shutdown().await;
