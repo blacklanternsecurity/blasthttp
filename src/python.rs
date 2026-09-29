@@ -406,6 +406,19 @@ pyo3::create_exception!(
 ///                  unsupported_protocol, alert, certificate_verify, reset,
 ///                  timeout, other. `None` otherwise.
 ///   `retryable`    whether trying the same request again might help.
+/// Render a `Conclusion` as the `(name, vendor)` pair Python sees.
+fn conclusion_to_py(c: &crate::report::Conclusion) -> (String, String) {
+    use crate::report::Conclusion;
+    let (name, vendor) = match c {
+        Conclusion::Reached => ("reached", None),
+        Conclusion::Blocked { vendor } => ("blocked", vendor.clone()),
+        Conclusion::NeedsBrowser { vendor } => ("needs_browser", vendor.clone()),
+        Conclusion::NeedsLegacyTls { .. } => ("needs_legacy_tls", None),
+        Conclusion::Unreachable { .. } => ("unreachable", None),
+    };
+    (name.to_string(), vendor.unwrap_or_else(|| "-".to_string()))
+}
+
 fn client_error_to_py(e: ClientError) -> PyErr {
     let kind = match &e.kind {
         ErrorKind::Connection => "connection",
@@ -427,12 +440,22 @@ fn client_error_to_py(e: ClientError) -> PyErr {
     });
     let retryable = e.kind.is_retryable();
 
+    let (conclusion, conclusion_vendor) = conclusion_to_py(&e.conclusion());
+    let attempts: Vec<(String, String)> = e
+        .attempts
+        .iter()
+        .map(|a| (a.profile.clone(), format!("{:?}", a.outcome)))
+        .collect();
+
     let err = TransportError::new_err(e.message);
     Python::attach(|py| {
         let v = err.value(py);
         let _ = v.setattr("kind", kind);
         let _ = v.setattr("tls_failure", tls_failure);
         let _ = v.setattr("retryable", retryable);
+        let _ = v.setattr("conclusion", conclusion);
+        let _ = v.setattr("conclusion_vendor", conclusion_vendor);
+        let _ = v.setattr("attempts", attempts);
     });
     err
 }
@@ -525,6 +548,9 @@ impl PyResponse {
             status,
             headers: headers.unwrap_or_default(),
             body_bytes,
+            // A response built from Python was not produced by the ladder, so
+            // it has nothing to report about what was tried.
+            attempts: Vec::new(),
             elapsed_ms,
             redirect_chain: redirect_chain
                 .map(|hops| hops.into_iter().map(|h| h.inner.clone()).collect())
@@ -722,6 +748,44 @@ impl PyResponse {
     /// with different settings; a challenge will not, because answering it
     /// means running the page's JavaScript. It is the signal to hand the URL
     /// to a real browser rather than retry.
+    /// What this request amounts to, as a single verdict a caller can branch
+    /// on. Returns `(conclusion, vendor)`:
+    ///
+    ///   reached          got the page
+    ///   blocked          a product refused us
+    ///   needs_browser    a JavaScript challenge; hand this URL to a real
+    ///                    browser, because no HTTP client passes this tier
+    ///   needs_legacy_tls the peer wants cryptography we declined or cannot do
+    ///   unreachable      never got a response
+    ///
+    /// `needs_browser` is the one worth acting on. It means retrying with
+    /// different settings cannot help, which is the opposite of `blocked`.
+    #[getter]
+    fn conclusion(&self) -> (String, String) {
+        conclusion_to_py(&self.inner.conclusion())
+    }
+
+    /// What the profile ladder tried, in order, as `(profile, outcome, status)`
+    /// tuples. Usually one entry; more than one means the first approach did
+    /// not work and the client moved.
+    #[getter]
+    fn attempts(&self) -> Vec<(String, String, Option<u16>)> {
+        use crate::report::AttemptOutcome;
+        self.inner
+            .attempts
+            .iter()
+            .map(|a| {
+                let (kind, status) = match &a.outcome {
+                    AttemptOutcome::Reached { status } => ("reached", Some(*status)),
+                    AttemptOutcome::Refused { status, .. } => ("refused", Some(*status)),
+                    AttemptOutcome::Challenged { status, .. } => ("challenged", Some(*status)),
+                    AttemptOutcome::HandshakeFailed { .. } => ("handshake_failed", None),
+                };
+                (a.profile.clone(), kind.to_string(), status)
+            })
+            .collect()
+    }
+
     #[getter]
     fn protection(&self) -> (String, String) {
         let outcome = self.inner.protection();

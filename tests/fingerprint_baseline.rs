@@ -81,28 +81,51 @@ async fn test_default_ja4_is_pinned() {
     let hello = capture_default_hello().await;
     let actual = support::ja4::ja4(&hello);
 
-    // Current default: the broad legacy cipher list, which is 105 suites.
-    // JA4 renders that as `99`, because the count field is two digits wide and
-    // the spec caps it. Worth knowing on its own: past 99 suites, JA4 cannot
-    // tell 105 from 200, so the header alone stops distinguishing us from any
-    // other client with an unreasonable cipher list.
+    // The default is now `modern`: 11 cipher suites, TLS 1.2 and 1.3 only.
     //
-    // The extension count is 11 rather than 12 because this server is
-    // addressed by IP, so no SNI is sent. Against a hostname it reads
-    // t13d9912h2.
+    // 12 extensions rather than 11, because a TLS 1.2 floor trips our OpenSSL
+    // patch into sending renegotiation_info (0xff01) instead of the SCSV. That
+    // is the intended behaviour of the patch and not incidental: a client
+    // whose floor is 1.2 signals the modern way, and one willing to speak
+    // older protocols keeps the SCSV.
     //
-    // Chrome 150 for contrast is t13d1516h2_8daaf6152771_806a8c22fdea: 15
-    // ciphers, 16 extensions. Closing that gap is the point of the stealth
-    // work, and this pin is how we will see it move.
-    const EXPECTED: &str = "t13i9911h2";
+    // Reads `t13i` rather than `t13d` because this server is addressed by IP,
+    // so no SNI is sent. Chrome 131 for contrast is t13d1516h2.
+    const EXPECTED: &str = "t13i1112h2";
 
     let header = actual.split('_').next().unwrap_or_default();
     assert_eq!(
         header,
         EXPECTED,
-        "JA4 header moved.\n  was: {}\n  now: {}\n  raw: {}",
+        "default JA4 header moved.\n  was: {}\n  now: {}\n  raw: {}",
         EXPECTED,
         header,
+        support::ja4::ja4_raw(&hello),
+    );
+}
+
+#[tokio::test]
+async fn test_compatibility_ja4_is_pinned() {
+    // What the default used to be, and still is when asked for by name. This
+    // pin is `compatibility`'s specification along with legacy_default.rs: if
+    // it moves, the profile has stopped being a faithful transcription of what
+    // shipped before profiles existed.
+    //
+    // 105 suites renders as 99 because the JA4 count field is two digits and
+    // the spec caps it. Worth knowing on its own: past 99, JA4 cannot tell 105
+    // from 200.
+    //
+    // Reads `t13d` and 12 extensions, not `t13i` and 11, because this capture
+    // addresses the server by hostname so SNI is sent. The IP-addressed
+    // equivalent is t13i9911h2.
+    let hello = capture_profile_hello("compatibility").await;
+    let header = support::ja4::ja4(&hello);
+    let header = header.split('_').next().unwrap_or_default();
+
+    assert_eq!(
+        header,
+        "t13d9912h2",
+        "compatibility JA4 moved.\n  raw: {}",
         support::ja4::ja4_raw(&hello),
     );
 }
@@ -135,11 +158,12 @@ async fn test_grease_is_absent() {
 }
 
 #[tokio::test]
-async fn test_offers_legacy_protocol_versions() {
-    // The companion to the cipher work: SSLv3 through TLS 1.3 are all offered,
-    // which is what makes an ancient server reachable without configuration.
-    // It is also conspicuous, since a browser offers 1.2 and 1.3 only.
-    let hello = capture_default_hello().await;
+async fn test_compatibility_offers_legacy_protocol_versions() {
+    // SSLv3 through TLS 1.3 all offered, which is what makes an ancient server
+    // reachable. No longer what an unconfigured request sends: the default is
+    // `modern`, and a legacy server is reached by the ladder falling back to
+    // this profile instead.
+    let hello = capture_profile_hello("compatibility").await;
 
     for (version, label) in [
         (0x0300u16, "SSLv3"),
@@ -159,9 +183,13 @@ async fn test_offers_legacy_protocol_versions() {
 
 #[tokio::test]
 async fn test_no_browser_only_extensions_yet() {
-    // The six extensions a JA4 match against Chrome needs, none of which we
-    // send today. Named here so the gap is legible and so each one flips this
-    // test as it lands.
+    // Extensions the browser profile sends and the default does not. Named
+    // here so the gap stays legible.
+    //
+    // renegotiation_info (0xff01) is deliberately absent from this list: the
+    // default now sends it, because `modern` sets a TLS 1.2 floor and the
+    // OpenSSL patch keys on exactly that. It is not a browser-only extension,
+    // it is what any client with a modern floor should send.
     let hello = capture_default_hello().await;
 
     for (ext, name) in [
@@ -170,7 +198,6 @@ async fn test_no_browser_only_extensions_yet() {
         (0x001b, "compress_certificate"),
         (0x44cd, "application_settings (ALPS)"),
         (0xfe0d, "encrypted_client_hello"),
-        (0xff01, "renegotiation_info"),
     ] {
         assert!(
             !hello.extensions.contains(&ext),
@@ -283,10 +310,11 @@ async fn test_chrome_profile_drops_non_browser_extensions() {
 
 #[tokio::test]
 async fn test_compat_path_keeps_the_scsv() {
-    // The patch is conditioned on the TLS floor so the compatibility path is
-    // byte-identical to stock OpenSSL. Without a profile we should still send
-    // the SCSV and still not send renegotiation_info.
-    let hello = capture_default_hello().await;
+    // The OpenSSL patch is conditioned on the TLS floor, so `compatibility`,
+    // which sets no floor, stays byte-identical to stock OpenSSL: the SCSV
+    // goes out and renegotiation_info does not. `modern` is the other side of
+    // that same condition, and test_default_ja4_is_pinned covers it.
+    let hello = capture_profile_hello("compatibility").await;
     assert!(
         hello.ciphers.contains(&0x00ff),
         "compatibility path lost the SCSV, so the patch is too broad"

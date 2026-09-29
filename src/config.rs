@@ -105,12 +105,44 @@ impl RequestConfig {
     /// so a typo is caught once at the edge rather than silently changing
     /// behaviour deep in the connector.
     pub fn resolved_profile(&self) -> &'static crate::profile::ConnectionProfile {
-        match self.profile.as_deref() {
-            Some(name) => {
-                crate::profile::by_name(name).unwrap_or_else(|_| crate::profile::default_profile())
-            }
-            None => crate::profile::default_profile(),
+        if let Some(name) = self.profile.as_deref() {
+            return crate::profile::by_name(name)
+                .unwrap_or_else(|_| crate::profile::default_profile());
         }
+        // Asking for a pre-TLS1.2 floor is asking for the legacy profile,
+        // whether or not the caller said so. The default offers only modern
+        // ciphers, none of which exist in SSLv3 or TLS 1.0, so honouring the
+        // version alone produces "no ciphers available": a request that names
+        // a protocol, and is told that protocol is impossible.
+        //
+        // The ladder cannot rescue this, because naming a version pins the
+        // configuration and pinning is what stops the ladder moving.
+        if self.wants_legacy_protocol() {
+            return crate::profile::by_name("compatibility")
+                .unwrap_or_else(|_| crate::profile::default_profile());
+        }
+        crate::profile::default_profile()
+    }
+
+    /// Did the caller ask to speak something older than TLS 1.2?
+    fn wants_legacy_protocol(&self) -> bool {
+        let is_legacy = |v: &str| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "3.0"
+                    | "ssl3"
+                    | "sslv3"
+                    | "ssl3.0"
+                    | "1.0"
+                    | "tls1.0"
+                    | "tlsv1.0"
+                    | "1.1"
+                    | "tls1.1"
+                    | "tlsv1.1"
+            )
+        };
+        self.min_tls_version.as_deref().is_some_and(is_legacy)
+            || self.max_tls_version.as_deref().is_some_and(is_legacy)
     }
 
     /// This config with a different profile selected.

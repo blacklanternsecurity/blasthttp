@@ -186,6 +186,12 @@ pub struct ClientError {
     /// Structured detail when the failure was a TLS handshake, so callers can
     /// branch on why rather than substring-matching `message`.
     pub tls_failure: Option<TlsFailure>,
+    /// What the profile ladder tried before giving up.
+    ///
+    /// Empty when nothing laddered, which is every error raised before a hop
+    /// begins. More than one entry means the client already tried the obvious
+    /// alternatives, so the caller need not.
+    pub attempts: Vec<crate::report::Attempt>,
 }
 
 impl ClientError {
@@ -194,6 +200,7 @@ impl ClientError {
             message,
             kind: ErrorKind::Connection,
             tls_failure: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -202,6 +209,7 @@ impl ClientError {
             message,
             kind: ErrorKind::Timeout,
             tls_failure: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -210,6 +218,7 @@ impl ClientError {
             message,
             kind: ErrorKind::Tls,
             tls_failure: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -218,6 +227,7 @@ impl ClientError {
             message,
             kind: ErrorKind::InvalidUrl,
             tls_failure: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -226,6 +236,7 @@ impl ClientError {
             message,
             kind: ErrorKind::TooManyRedirects,
             tls_failure: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -234,6 +245,7 @@ impl ClientError {
             message,
             kind: ErrorKind::Status(status),
             tls_failure: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -245,6 +257,23 @@ impl ClientError {
             message,
             kind: ErrorKind::Tls,
             tls_failure: Some(failure),
+            attempts: Vec::new(),
+        }
+    }
+
+    /// What this failure amounts to for a caller deciding what to do next.
+    ///
+    /// A peer that could not negotiate with us is reported separately from one
+    /// we never reached: the first is alive and wants cryptography we declined
+    /// or cannot do, which is actionable, and the second is not.
+    pub fn conclusion(&self) -> crate::report::Conclusion {
+        match &self.tls_failure {
+            Some(f) if f.suggests_wider_offer() => crate::report::Conclusion::NeedsLegacyTls {
+                reason: self.message.clone(),
+            },
+            _ => crate::report::Conclusion::Unreachable {
+                reason: self.message.clone(),
+            },
         }
     }
 
@@ -253,6 +282,7 @@ impl ClientError {
             message,
             kind: ErrorKind::Other,
             tls_failure: None,
+            attempts: Vec::new(),
         }
     }
 }

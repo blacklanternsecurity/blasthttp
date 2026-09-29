@@ -6,6 +6,7 @@ pub mod cookies;
 pub mod debug;
 pub mod h2;
 pub mod profile;
+pub mod report;
 pub mod response;
 
 #[cfg(feature = "python")]

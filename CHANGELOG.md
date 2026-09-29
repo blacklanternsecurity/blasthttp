@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.0.0
+
+Breaking: a request that names no profile no longer offers 105 cipher suites
+and every protocol version back to SSLv3. It sends `modern` instead, which is
+11 suites and TLS 1.2 or 1.3. A server too old for that is still reached, by
+the ladder falling back to `compatibility` on the second handshake.
+
+- **Connection profiles.** Three of them. `compatibility` is a faithful
+  transcription of what 0.10 sent by default, kept byte-identical and verified
+  by the existing tests. `modern` is new. `chrome131` imitates Chrome's TLS,
+  HTTP/2 settings and headers together. Select one with `profile=`; an unknown
+  name is now an error rather than silently falling back
+- **Automatic shifting between them.** A handshake failure that suggests the
+  peer could not negotiate widens the offer; a refusal from a recognised
+  protection product changes what the client claims to be. Per redirect hop,
+  since a redirect can land on a differently protected host, and without
+  spending the caller's retry budget, which is a different question. A profile
+  that gets through is remembered per host so a scan does not re-walk the
+  ladder on every request. Naming a `profile`, `cipher_string`,
+  `min_tls_version` or `max_tls_version` pins the configuration and the ladder
+  does not move
+- The ladder only moves on positive evidence that a product intervened, not on
+  any refusal. Most 403s are ordinary authorization failures, and retrying each
+  one with different TLS settings would double the request count of any scan
+  that touches one
+- **`Response.protection`** reports what a bot-management product did:
+  `(outcome, vendor)` where outcome is ok, present, challenge, blocked or error
+- **`Response.conclusion`** reduces that to one verdict: reached, blocked,
+  needs_browser, needs_legacy_tls or unreachable. `needs_browser` means a
+  JavaScript challenge, which no HTTP client passes, so the URL should go to a
+  real browser rather than be retried
+- **`Response.attempts`** lists what the ladder tried, in order
+- **TLS failures now say why.** The reason used to be destroyed in transit:
+  hyper-util's error displays as the literal "client error (Connect)" for every
+  connect-time failure, so a cipher mismatch, a rejected certificate, a DNS
+  failure and a refused connection were indistinguishable. Failures now raise
+  `TransportError` carrying `kind`, `tls_failure`, `retryable`, `conclusion`
+  and `attempts`. `TransportError` subclasses `RuntimeError`, so existing
+  handlers keep working
+- Fixes a consequence of that: TLS failures were being retried, because they
+  were misclassified as connection errors, contradicting the rule that says
+  they should not be
+- Asking for a pre-TLS1.2 version without naming a profile now selects
+  `compatibility`, rather than failing with "no ciphers available" because the
+  default offers nothing that exists in SSLv3
+- `BLASTHTTP_BISECT=tls,headers,http2` disables profile layers independently,
+  for finding out which one a detector is reacting to
+
 ## 0.10.1
 
 - Legacy ciphers are offered by default, which is what the custom OpenSSL build has always been for. A server speaking only RC4, RC4-MD5, 3DES, SEED, Camellia or anonymous DH is now reachable without passing `cipher_string` yourself. Previously `SslConnector::builder` installed its own list (`DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`) and nothing replaced it, so those suites never reached the wire and such a server was unreachable at any setting. `set_security_level(0)` did not help: the security level governs how weak a negotiated cipher may be, not which ones are offered

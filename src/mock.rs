@@ -276,6 +276,7 @@ fn make_response(
         status: status_code,
         headers,
         body_bytes: body,
+        attempts: Vec::new(),
         elapsed_ms: 0,
         redirect_chain: Vec::new(),
         cert_info: None,

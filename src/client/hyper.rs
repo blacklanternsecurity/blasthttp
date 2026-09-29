@@ -2213,6 +2213,10 @@ impl HyperClient {
                 status: resp.status,
                 headers: resp.headers,
                 body_bytes: resp.body_bytes,
+                // This path never ladders: it is the resolve_ip /
+                // request_target branch, which dispatches once and follows no
+                // redirects.
+                attempts: Vec::new(),
                 elapsed_ms,
                 redirect_chain,
                 cert_info,
@@ -2265,6 +2269,7 @@ impl HyperClient {
             // "is this the wrong way to talk to this host".
             let mut rung = self.starting_profile(config, &uri);
             let mut tried: Vec<&'static str> = Vec::new();
+            let mut attempts: Vec<crate::report::Attempt> = Vec::new();
             let (resp, cached) = loop {
                 tried.push(rung.name);
                 let rung_config = config.with_profile(rung.name);
@@ -2285,6 +2290,12 @@ impl HyperClient {
                         // an ordinary refusal, and retrying it differently
                         // just spends another request to be told the same
                         // thing.
+                        attempts.push(crate::report::Attempt::from_outcome(
+                            rung.name,
+                            resp.status,
+                            &outcome,
+                        ));
+
                         if outcome.got_through() || !outcome.indicates_protection() {
                             // Remember what worked, but only on a real
                             // success. A failure is a hypothesis; this is
@@ -2315,7 +2326,14 @@ impl HyperClient {
                             None => break (resp, cached),
                         }
                     }
-                    Err(e) => {
+                    Err(mut e) => {
+                        attempts.push(crate::report::Attempt::new(
+                            rung.name,
+                            crate::report::AttemptOutcome::HandshakeFailed {
+                                reason: e.message.clone(),
+                            },
+                        ));
+
                         let widens = e
                             .tls_failure
                             .as_ref()
@@ -2340,8 +2358,12 @@ impl HyperClient {
                             }
                             // Nothing else to try, or the failure says nothing
                             // about our offer. Report the error we actually
-                            // got.
-                            None => return Err(e),
+                            // got, carrying what was tried so the caller can
+                            // see the ladder ran and where it stopped.
+                            None => {
+                                e.attempts = attempts;
+                                return Err(e);
+                            }
                         }
                     }
                 }
@@ -2460,6 +2482,8 @@ impl HyperClient {
                 status: resp.status,
                 headers: resp.headers,
                 body_bytes: resp.body_bytes,
+                // What the ladder tried on this, the final, hop.
+                attempts,
                 elapsed_ms,
                 redirect_chain,
                 cert_info,

@@ -323,8 +323,18 @@ pub fn by_name(name: &str) -> Result<&'static ConnectionProfile, String> {
 }
 
 /// The profile a request gets when it does not name one.
+///
+/// `MODERN` rather than `COMPATIBILITY`, which is the breaking change in 1.0.
+/// A request that meets a server too old for it does not fail: the ladder
+/// widens to `COMPATIBILITY` on a negotiation failure, at the cost of one
+/// extra handshake against such a server and nothing at all against the rest.
+///
+/// The old default offered 105 cipher suites and every protocol version back
+/// to SSLv3 to every host on the internet, to stay reachable for the small
+/// number that need it. This inverts that: be ordinary by default, and pay
+/// for breadth only where breadth is actually wanted.
 pub fn default_profile() -> &'static ConnectionProfile {
-    &COMPATIBILITY
+    &MODERN
 }
 
 #[cfg(test)]

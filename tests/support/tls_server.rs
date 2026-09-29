@@ -358,14 +358,28 @@ impl TlsTestServer {
                 config.response_body,
             );
 
-            tokio::select! {
-                result = listener.accept() => {
-                    if let Ok((tcp_stream, _)) = result {
-                        // Read the ClientHello off the wire and parse it before
-                        // TLS touches it, then hand the same bytes to the
-                        // handshake. Peeking rather than consuming keeps the
-                        // stream intact, so no replay buffer is needed and the
-                        // handshake proceeds exactly as it would have.
+            // Serve connections until shutdown, rather than exactly one.
+            //
+            // One was enough while a failed handshake was the end of the
+            // story. It is not any more: the profile ladder retries a refused
+            // handshake with a wider offer, so every legacy-cipher test needs
+            // at least two connections. With a single-shot server the second
+            // attempt gets ECONNREFUSED and the test fails for a reason that
+            // has nothing to do with what it is testing.
+            let mut shutdown_rx = shutdown_rx;
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        let Ok((tcp_stream, _)) = result else { continue };
+
+                        // Read the ClientHello off the wire and parse it
+                        // before TLS touches it. Peeking rather than consuming
+                        // keeps the stream intact, so no replay buffer is
+                        // needed and the handshake proceeds as it would have.
+                        //
+                        // Overwritten per connection, so after a ladder walk
+                        // the slot holds the LAST hello, which is the one that
+                        // succeeded.
                         let mut peek = vec![0u8; 8192];
                         if let Ok(n) = tcp_stream.peek(&mut peek).await
                             && let Some(parsed) = parse_client_hello(&peek[..n])
@@ -374,30 +388,26 @@ impl TlsTestServer {
                             *slot = Some(parsed);
                         }
 
-                        // Async TLS handshake via tokio-openssl
                         let ssl = openssl::ssl::Ssl::new(acceptor.context()).unwrap();
                         let mut tls_stream = match tokio_openssl::SslStream::new(ssl, tcp_stream) {
                             Ok(s) => s,
-                            Err(_) => return,
+                            Err(_) => continue,
                         };
 
-                        // Perform the TLS accept handshake
+                        // A failed handshake is an ordinary event here, not
+                        // the end: it is what the cipher and version mismatch
+                        // tests are producing on purpose, and what the ladder
+                        // then retries.
                         if std::pin::Pin::new(&mut tls_stream).accept().await.is_err() {
-                            // Handshake failed — expected for cipher/version mismatch tests
-                            return;
+                            continue;
                         }
 
-                        // Read the HTTP request (we don't care about contents)
                         let mut buf = [0u8; 4096];
                         let _ = tls_stream.read(&mut buf).await;
-
-                        // Send response
                         let _ = tls_stream.write_all(response.as_bytes()).await;
                         let _ = tls_stream.shutdown().await;
                     }
-                }
-                _ = shutdown_rx => {
-                    // Shutdown requested
+                    _ = &mut shutdown_rx => break,
                 }
             }
         });
