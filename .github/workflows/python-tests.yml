@@ -96,7 +96,7 @@ jobs:
   version-check:
     needs: python-tests
     if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       new_version: ${{ steps.check.outputs.new_version }}
     steps:
@@ -231,7 +231,7 @@ jobs:
 
   sdist-build:
     needs: version-check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: needs.version-check.outputs.new_version == 'yes'
     steps:
       - uses: actions/checkout@v7
@@ -252,7 +252,7 @@ jobs:
       - linux-build
       - musllinux-build
       - sdist-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       id-token: write
       contents: write
