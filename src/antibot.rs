@@ -30,6 +30,7 @@ pub enum Vendor {
     Imperva,
     F5,
     Kasada,
+    AwsWaf,
     Unknown,
 }
 
@@ -43,6 +44,7 @@ impl fmt::Display for Vendor {
             Vendor::Imperva => "imperva",
             Vendor::F5 => "f5",
             Vendor::Kasada => "kasada",
+            Vendor::AwsWaf => "awswaf",
             Vendor::Unknown => "unknown",
         };
         f.write_str(s)
@@ -70,6 +72,27 @@ impl Outcome {
     /// Did we get real content? The bar the benchmark scores against.
     pub fn got_through(&self) -> bool {
         matches!(self, Outcome::Ok | Outcome::Present(_))
+    }
+
+    /// Is there positive evidence that a protection product intervened?
+    ///
+    /// The distinction between this and "we did not get through" matters, and
+    /// getting it wrong costs real requests. Most 403s are ordinary
+    /// authorization failures: an endpoint needing a token, a path that is not
+    /// public, a method that is not allowed. Those classify as
+    /// `Blocked(Unknown)` because they are refusals with no product signature,
+    /// and retrying them with different TLS settings is pure waste against a
+    /// server that will say 403 however it is asked.
+    ///
+    /// So a named vendor is the bar. It means something recognisable answered
+    /// instead of the origin, which is the only case where trying a different
+    /// profile is worth a second request.
+    ///
+    /// The cost of that conservatism is missing a product we cannot
+    /// fingerprint. The cost of the alternative is doubling the request count
+    /// of every scan that touches a 403, which is most of them.
+    pub fn indicates_protection(&self) -> bool {
+        !matches!(self.vendor(), None | Some(Vendor::Unknown))
     }
 
     pub fn vendor(&self) -> Option<Vendor> {
@@ -187,6 +210,17 @@ pub fn classify(facts: &ResponseFacts) -> Outcome {
     // ── Imperva / Incapsula ───────────────────────────────────────
     if facts.body_contains("_Incapsula_Resource") {
         return Outcome::Challenge(Vendor::Imperva);
+    }
+
+    // ── AWS WAF ───────────────────────────────────────────────────
+    // The header carries the action, and there is more than one: `challenge`
+    // for the silent JavaScript kind, `captcha` for the kind wanting a person.
+    // Matching only `challenge` missed wizzair.com, which answers 405 with
+    // `captcha`, so the ladder read a genuine interception as an ordinary
+    // refusal and declined to try anything else. Match the header's presence
+    // and let the value be detail.
+    if facts.has_header("x-amzn-waf-action") {
+        return Outcome::Challenge(Vendor::AwsWaf);
     }
 
     // ── Kasada ────────────────────────────────────────────────────

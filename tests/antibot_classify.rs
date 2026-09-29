@@ -257,3 +257,34 @@ fn test_product_cookie_with_refusal_still_counts_as_blocked() {
     assert_eq!(outcome, Outcome::Blocked(Vendor::Cloudflare));
     assert!(!outcome.got_through());
 }
+
+#[test]
+fn test_aws_waf_captcha_is_a_challenge() {
+    // wizzair.com answers 405 with `captcha` rather than `challenge`. A rule
+    // matching only the latter classified this as an ordinary refusal, which
+    // meant the profile ladder saw no reason to try anything else against a
+    // host that a browser profile does in fact reach.
+    let h = hdrs(&[
+        ("server", "CloudFront"),
+        ("x-amzn-waf-action", "captcha"),
+        ("x-cache", "Error from cloudfront"),
+    ]);
+    let outcome = classify(&facts(405, &h, ""));
+    assert_eq!(outcome, Outcome::Challenge(Vendor::AwsWaf));
+    assert!(
+        outcome.indicates_protection(),
+        "the ladder only moves on positive evidence of a product"
+    );
+}
+
+#[test]
+fn test_a_bare_403_is_not_evidence_of_protection() {
+    // The counterpart, and the reason `indicates_protection` exists at all.
+    // Most 403s are ordinary authorization failures, and retrying each one
+    // with different TLS settings would double the request count of any scan
+    // that touches one.
+    let h = hdrs(&[("server", "nginx")]);
+    let outcome = classify(&facts(403, &h, "forbidden"));
+    assert_eq!(outcome, Outcome::Blocked(Vendor::Unknown));
+    assert!(!outcome.indicates_protection());
+}

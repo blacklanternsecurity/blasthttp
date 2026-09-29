@@ -113,6 +113,32 @@ impl RequestConfig {
         }
     }
 
+    /// This config with a different profile selected.
+    ///
+    /// Used by the ladder to retry a hop differently. A clone rather than a
+    /// parameter threaded through the connector because `TlsKey`, and so the
+    /// cached-client lookup, is derived from the config: changing the profile
+    /// anywhere else would key the cache on one profile while building the
+    /// connector from another.
+    pub fn with_profile(&self, name: &str) -> RequestConfig {
+        let mut c = self.clone();
+        c.profile = Some(name.to_string());
+        c
+    }
+
+    /// Whether the caller pinned TLS settings themselves.
+    ///
+    /// When they did, the ladder must not move: naming a cipher string, a TLS
+    /// version or a profile means they meant it, and silently substituting
+    /// another profile would send something they did not ask for.
+    /// `tests/tls_integration.rs` depends on this.
+    pub fn tls_is_pinned(&self) -> bool {
+        self.profile.is_some()
+            || self.cipher_string.is_some()
+            || self.min_tls_version.is_some()
+            || self.max_tls_version.is_some()
+    }
+
     /// Reject an unknown profile name.
     pub fn validate_profile(&self) -> Result<(), String> {
         match self.profile.as_deref() {

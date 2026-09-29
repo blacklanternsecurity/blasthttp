@@ -1,6 +1,7 @@
 use super::{ClientError, HttpClient, TlsFailure};
 use crate::config::RequestConfig;
 use crate::debug::{DebugLog, debug_record, new_debug_log};
+use crate::profile::RungFailure;
 use crate::response::{CertInfo, RedirectHop, Response};
 
 use http_body_util::BodyExt;
@@ -935,6 +936,10 @@ pub struct HyperClient {
     // both a ForwardProxy client (for HTTP targets) and a Tunnel client (for
     // HTTPS targets), so we cache per-mode rather than a single client.
     cached: Mutex<std::collections::HashMap<ConnMode, CachedClient>>,
+    // Which profile last got through to each host, so a scan does not re-walk
+    // the ladder on every request. Written only on success; see
+    // `remember_profile`.
+    host_profiles: Mutex<HashMap<String, &'static crate::profile::ConnectionProfile>>,
     // Why the last handshake to each host failed.
     //
     // Deliberately on the client rather than on `CachedClient`: a retry with
@@ -954,6 +959,7 @@ impl HyperClient {
     pub fn new() -> Self {
         HyperClient {
             cached: Mutex::new(std::collections::HashMap::new()),
+            host_profiles: Mutex::new(HashMap::new()),
             tls_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2037,6 +2043,122 @@ impl HttpClient for HyperClient {
 }
 
 impl HyperClient {
+    /// One attempt at one hop with one profile.
+    ///
+    /// Everything that used to sit inline in the redirect loop, extracted so
+    /// the ladder can call it more than once. The `?` operators that used to
+    /// short-circuit out of `send_inner` now surface here as an `Err` the
+    /// ladder can decide about, which is the substance of the change rather
+    /// than the extraction itself.
+    async fn attempt_hop(
+        &self,
+        config: &RequestConfig,
+        uri: &http::Uri,
+        log: &DebugLog,
+        hop_cookies: Option<&str>,
+    ) -> Result<(SingleResponse, Option<CachedClient>), ClientError> {
+        // Decide the connection mode for the *current* target host on every
+        // hop, not just the first. A redirect can send the request to a
+        // different host, and the proxy / no_proxy decision has to follow it.
+        // Freezing the first hop's choice would otherwise let a request that
+        // started direct keep connecting directly after a redirect onto a
+        // proxied host (leaking traffic past the proxy), and let a request
+        // that started proxied keep using the proxy after a redirect onto a
+        // no_proxy host. Clients are cached by mode, so hops that share a mode
+        // reuse the same client.
+        let mode = Self::conn_mode(config, uri)?;
+
+        // Forward proxy: dispatch directly via TCP + http1::SendRequest
+        // (bypasses hyper Client's URI normalization to preserve absolute-form)
+        let proxy_url_for_fwd = if let ConnMode::ForwardProxy(ref url) = mode {
+            Some(url.clone())
+        } else {
+            None
+        };
+
+        let cached = if proxy_url_for_fwd.is_some() {
+            None
+        } else {
+            Some(self.get_or_build(config, &mode)?)
+        };
+
+        let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
+            dispatch_forward_proxy(proxy_url, uri, config, log, hop_cookies).await?
+        } else {
+            dispatch_request(
+                &cached.as_ref().unwrap().inner,
+                uri,
+                config,
+                log,
+                hop_cookies,
+                &self.tls_failures,
+            )
+            .await?
+        };
+
+        Ok((resp, cached))
+    }
+
+    /// Which profile this hop starts on.
+    ///
+    /// A pinned config starts and ends on what the caller asked for. Otherwise
+    /// a host we have succeeded against before starts on whatever worked,
+    /// which is the whole point of remembering: the ladder costs a wasted
+    /// request every time it walks, and a scan hits the same host repeatedly.
+    fn starting_profile(
+        &self,
+        config: &RequestConfig,
+        uri: &http::Uri,
+    ) -> &'static crate::profile::ConnectionProfile {
+        if config.tls_is_pinned() {
+            return config.resolved_profile();
+        }
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(map) = self.host_profiles.lock()
+            && let Some(p) = map.get(&key)
+        {
+            return p;
+        }
+        config.resolved_profile()
+    }
+
+    /// The next rung, or `None` to stop.
+    ///
+    /// Returns `None` immediately for a pinned config: naming a cipher string,
+    /// a TLS version or a profile means the caller meant it, and quietly
+    /// substituting another profile would put something on the wire they did
+    /// not ask for.
+    fn next_rung_for(
+        &self,
+        config: &RequestConfig,
+        current: &crate::profile::ConnectionProfile,
+        failure: RungFailure,
+        tried: &[&'static str],
+    ) -> Option<&'static crate::profile::ConnectionProfile> {
+        if config.tls_is_pinned() || tried.len() >= crate::profile::MAX_RUNGS {
+            return None;
+        }
+        crate::profile::next_rung(current, failure, tried)
+    }
+
+    /// Record that a profile worked against a host.
+    ///
+    /// Only ever called after an attempt got through. A failure alone is a
+    /// hypothesis and could be the host having a bad minute; a success is
+    /// evidence. Recording failures would let one flake pin a host to a worse
+    /// profile for the rest of a scan.
+    fn remember_profile(
+        &self,
+        uri: &http::Uri,
+        profile: &'static crate::profile::ConnectionProfile,
+    ) {
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(mut map) = self.host_profiles.lock()
+        {
+            map.insert(key, profile);
+        }
+    }
+
     async fn send_inner(
         &self,
         config: &RequestConfig,
@@ -2134,36 +2256,95 @@ impl HyperClient {
             // that started proxied keep using the proxy after a redirect onto a
             // no_proxy host. Clients are cached by mode, so hops that share a
             // mode reuse the same client.
-            let mode = Self::conn_mode(config, &uri)?;
+            // Walk the profile ladder for this hop.
+            //
+            // Per hop rather than per request, because a redirect can land on
+            // a differently protected host. Inside `send_inner` rather than in
+            // `send`, so it does not spend the caller's retry budget: those are
+            // different questions, one being "did this flake" and the other
+            // "is this the wrong way to talk to this host".
+            let mut rung = self.starting_profile(config, &uri);
+            let mut tried: Vec<&'static str> = Vec::new();
+            let (resp, cached) = loop {
+                tried.push(rung.name);
+                let rung_config = config.with_profile(rung.name);
 
-            // Forward proxy: dispatch directly via TCP + http1::SendRequest
-            // (bypasses hyper Client's URI normalization to preserve absolute-form)
-            let is_forward_proxy = matches!(&mode, ConnMode::ForwardProxy(_));
-            let proxy_url_for_fwd = if let ConnMode::ForwardProxy(ref url) = mode {
-                Some(url.clone())
-            } else {
-                None
-            };
+                match self
+                    .attempt_hop(&rung_config, &uri, log, hop_cookies.as_deref())
+                    .await
+                {
+                    Ok((resp, cached)) => {
+                        let outcome = crate::antibot::classify(&crate::antibot::ResponseFacts {
+                            status: resp.status,
+                            headers: &resp.headers,
+                            body: &String::from_utf8_lossy(&resp.body_bytes),
+                        });
 
-            // For non-forward-proxy modes, get the cached hyper Client.
-            let cached = if is_forward_proxy {
-                None
-            } else {
-                Some(self.get_or_build(config, &mode)?)
-            };
+                        // Only walk the ladder when something recognisable
+                        // refused us. A bare 403 with no product signature is
+                        // an ordinary refusal, and retrying it differently
+                        // just spends another request to be told the same
+                        // thing.
+                        if outcome.got_through() || !outcome.indicates_protection() {
+                            // Remember what worked, but only on a real
+                            // success. A failure is a hypothesis; this is
+                            // evidence.
+                            if outcome.got_through() {
+                                self.remember_profile(&uri, rung);
+                            }
+                            break (resp, cached);
+                        }
 
-            let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
-                dispatch_forward_proxy(proxy_url, &uri, config, log, hop_cookies.as_deref()).await?
-            } else {
-                dispatch_request(
-                    &cached.as_ref().unwrap().inner,
-                    &uri,
-                    config,
-                    log,
-                    hop_cookies.as_deref(),
-                    &self.tls_failures,
-                )
-                .await?
+                        match self.next_rung_for(config, rung, RungFailure::Refused, &tried) {
+                            Some(next) => {
+                                debug_record(
+                                    log,
+                                    v,
+                                    1,
+                                    &format!(
+                                        "   {} refused under '{}', trying '{}'",
+                                        resp.status, rung.name, next.name
+                                    ),
+                                );
+                                rung = next;
+                            }
+                            // Out of rungs: the refusal is the answer. Hand it
+                            // back as a response rather than an error, so the
+                            // caller can read the status, the headers and
+                            // whatever the challenge page said.
+                            None => break (resp, cached),
+                        }
+                    }
+                    Err(e) => {
+                        let widens = e
+                            .tls_failure
+                            .as_ref()
+                            .is_some_and(|f| f.suggests_wider_offer());
+                        let next = if widens {
+                            self.next_rung_for(config, rung, RungFailure::CouldNotNegotiate, &tried)
+                        } else {
+                            None
+                        };
+                        match next {
+                            Some(next) => {
+                                debug_record(
+                                    log,
+                                    v,
+                                    1,
+                                    &format!(
+                                        "   handshake failed under '{}', widening to '{}'",
+                                        rung.name, next.name
+                                    ),
+                                );
+                                rung = next;
+                            }
+                            // Nothing else to try, or the failure says nothing
+                            // about our offer. Report the error we actually
+                            // got.
+                            None => return Err(e),
+                        }
+                    }
+                }
             };
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));

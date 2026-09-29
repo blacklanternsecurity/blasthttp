@@ -429,3 +429,166 @@ mod tests {
         assert!(CHROME_131.claims_browser);
     }
 }
+
+// ── The ladder ────────────────────────────────────────────────────
+
+/// Why an attempt did not produce a usable response.
+///
+/// The two variants move along different axes and must not be conflated. A
+/// transport failure says the peer could not negotiate with us, which is about
+/// breadth. A policy block says it negotiated fine and then refused, which is
+/// about what we claimed to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RungFailure {
+    /// The handshake failed in a way suggesting a wider offer might work.
+    /// Retrying is free: no application data was sent.
+    CouldNotNegotiate,
+    /// A clean handshake, then a refusal or a challenge.
+    Refused,
+}
+
+/// Which profile to try next, if any.
+///
+/// Deliberately a decision rather than a fixed list, because the two axes have
+/// different triggers and a linear chain cannot express that.
+///
+/// On a negotiation failure, widen: `modern` and `chrome131` both offer narrow
+/// modern ciphers, so the answer is `compatibility`, which offers everything
+/// back to SSLv3. From `compatibility` there is nowhere wider to go.
+///
+/// On a refusal, change what we claim. Empirically rather than by rule: the
+/// evidence points both ways depending on the host, so try the other side once
+/// and let the result decide. Akamai, Kasada and Cloudflare deployments have
+/// rewarded the browser claim; PerimeterX has punished it, on every target
+/// tested. Nothing here inspects the vendor, because two deployments of one
+/// product routinely disagree.
+/// `tried` is every profile already attempted for this hop, and it is not
+/// optional bookkeeping. Without it the honest and browser profiles oscillate:
+/// a refusal moves `modern` to `chrome131`, and a refusal there moves it back
+/// to `modern`, forever. Termination is a property of this function rather
+/// than of the cap at the call site.
+pub fn next_rung(
+    current: &ConnectionProfile,
+    failure: RungFailure,
+    tried: &[&str],
+) -> Option<&'static ConnectionProfile> {
+    let candidate = match failure {
+        RungFailure::CouldNotNegotiate => {
+            if current.name == COMPATIBILITY.name {
+                // Already offering everything; the same bytes would go out
+                // again and waste a handshake on a server that just refused
+                // them.
+                None
+            } else {
+                Some(&COMPATIBILITY)
+            }
+        }
+        RungFailure::Refused => {
+            if current.claims_browser {
+                // Drop the claim. A client that says it is Chrome gets checked
+                // against that; one that says nothing does not.
+                Some(&MODERN)
+            } else if current.name == COMPATIBILITY.name {
+                // Both honest and conspicuous, so there are two things to
+                // change. Narrowing is the smaller step and leaves the browser
+                // claim available afterwards.
+                Some(&MODERN)
+            } else {
+                Some(&CHROME_131)
+            }
+        }
+    }?;
+
+    if tried.contains(&candidate.name) {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+/// How many attempts one hop may make.
+///
+/// Three is the longest sensible walk: compatibility narrows to modern, modern
+/// claims a browser, and that is the end of it. `next_rung` already terminates
+/// on its own by refusing to revisit; this is the belt to that braces, because
+/// the cost of being wrong is an unbounded request loop against someone else's
+/// server.
+pub const MAX_RUNGS: usize = 3;
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+
+    #[test]
+    fn test_negotiation_failure_widens_to_compatibility() {
+        assert_eq!(
+            next_rung(&MODERN, RungFailure::CouldNotNegotiate, &["modern"]).map(|p| p.name),
+            Some("compatibility")
+        );
+        assert_eq!(
+            next_rung(&CHROME_131, RungFailure::CouldNotNegotiate, &["chrome131"]).map(|p| p.name),
+            Some("compatibility")
+        );
+    }
+
+    #[test]
+    fn test_nowhere_wider_than_compatibility() {
+        // Offering everything already; a second attempt would send the same
+        // bytes and waste a handshake on a server that just refused them.
+        assert!(
+            next_rung(
+                &COMPATIBILITY,
+                RungFailure::CouldNotNegotiate,
+                &["compatibility"]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_refusal_drops_a_browser_claim() {
+        // The PerimeterX case: claiming Chrome invited an inspection we
+        // failed, so stop claiming it.
+        let next = next_rung(&CHROME_131, RungFailure::Refused, &["chrome131"]).unwrap();
+        assert_eq!(next.name, "modern");
+        assert!(!next.claims_browser);
+    }
+
+    #[test]
+    fn test_refusal_from_an_honest_profile_tries_the_claim() {
+        // The Akamai case: honest gets refused, a browser claim gets through.
+        assert_eq!(
+            next_rung(&MODERN, RungFailure::Refused, &["modern"]).map(|p| p.name),
+            Some("chrome131")
+        );
+    }
+
+    #[test]
+    fn test_the_walk_terminates_within_the_cap() {
+        // Guards the cap against a future edit to next_rung that cycles.
+        for start in [&COMPATIBILITY, &MODERN, &CHROME_131] {
+            for failure in [RungFailure::CouldNotNegotiate, RungFailure::Refused] {
+                let mut seen = vec![start.name];
+                let mut current = start;
+                while let Some(next) = next_rung(current, failure, &seen) {
+                    assert!(
+                        !seen.contains(&next.name),
+                        "ladder revisited {} starting from {} on {:?}",
+                        next.name,
+                        start.name,
+                        failure
+                    );
+                    seen.push(next.name);
+                    current = next;
+                    assert!(
+                        seen.len() <= MAX_RUNGS,
+                        "walk from {} on {:?} exceeded MAX_RUNGS: {:?}",
+                        start.name,
+                        failure,
+                        seen
+                    );
+                }
+            }
+        }
+    }
+}
