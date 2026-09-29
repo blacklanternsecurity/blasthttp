@@ -236,3 +236,64 @@ async fn test_modern_still_reachable_by_default() {
 
     server.shutdown().await;
 }
+
+// ── Concurrent discovery ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_a_burst_does_not_all_walk_the_ladder() {
+    // Every request in an opening burst used to walk the ladder
+    // independently, because the per-host memory is only written once
+    // something succeeds and nothing has succeeded yet. Measured against a
+    // real host before this was fixed: twelve concurrent requests produced
+    // twenty-four handshake attempts.
+    //
+    // That overshoot is bounded by concurrency rather than by scan size, so a
+    // thousand-path scan at fifty concurrent pays about fifty extra
+    // handshakes. They all land in the same burst though, against a host that
+    // is by definition already watching, which is the worst moment to look
+    // like a pile of odd clients.
+    //
+    // One request now discovers and the rest wait for the answer.
+    const N: usize = 8;
+
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("RC4-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let client = std::sync::Arc::new(HyperClient::new());
+    let url = server.url();
+
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let client = client.clone();
+        let config = default_config(&url);
+        tasks.push(tokio::spawn(async move { client.send(&config).await }));
+    }
+
+    let mut attempts = 0usize;
+    let mut reached = 0usize;
+    for t in tasks {
+        if let Ok(Ok(resp)) = t.await {
+            attempts += resp.attempts.len();
+            if resp.status == 200 {
+                reached += 1;
+            }
+        }
+    }
+
+    assert_eq!(reached, N, "every request should have got through");
+    // The floor is N, one attempt each. The leader spends one extra walking
+    // from `modern` to `compatibility`. Anything approaching 2N means the
+    // burst is re-discovering per request.
+    assert!(
+        attempts <= N + 2,
+        "burst made {attempts} attempts for {N} requests; expected about {} \
+         (one each, plus the leader's walk). Discovery is not being shared.",
+        N + 1
+    );
+
+    server.shutdown().await;
+}
