@@ -180,6 +180,25 @@ fn add_browser_extensions(
     Ok(())
 }
 
+/// Layers of a profile that can be disabled independently, for working out
+/// which one a particular detector is reacting to.
+///
+/// Driven by `BLASTHTTP_BISECT`, a comma-separated list of layers to leave
+/// off: `tls`, `headers`, `http2`. This exists because "we are blocked" does
+/// not say which part of the imitation is failing, and the alternative is
+/// rebuilding between every experiment.
+///
+/// ```text
+/// BLASTHTTP_BISECT=headers,http2   # profile TLS only
+/// BLASTHTTP_BISECT=tls             # everything but TLS
+/// ```
+pub(crate) fn bisect_disabled(layer: &str) -> bool {
+    match std::env::var("BLASTHTTP_BISECT") {
+        Ok(v) => v.split(',').any(|p| p.trim().eq_ignore_ascii_case(layer)),
+        Err(_) => false,
+    }
+}
+
 /// Apply the cipher, signature-algorithm, group and version settings to a
 /// connector builder.
 ///
@@ -198,7 +217,9 @@ fn apply_tls_settings(
 ) -> Result<(), ClientError> {
     use openssl::ssl::SslOptions;
 
-    let profile = config.resolved_profile();
+    let profile = config
+        .resolved_profile()
+        .filter(|_| !bisect_disabled("tls"));
 
     // Security level 0: allow all ciphers including RC4 and DES. This is an
     // offensive-first tool and needs to connect to anything.
@@ -957,7 +978,10 @@ impl HyperClient {
         // everything hyper-util exposes of the Akamai HTTP/2 fingerprint; the
         // remaining two fields, HEADER_TABLE_SIZE and the pseudo-header order,
         // need forks of hyper-util and h2 respectively and are left alone.
-        if let Some(p) = config.resolved_profile() {
+        if let Some(p) = config
+            .resolved_profile()
+            .filter(|_| !bisect_disabled("http2"))
+        {
             builder
                 .http2_initial_stream_window_size(p.http2.initial_stream_window)
                 .http2_initial_connection_window_size(p.http2.initial_connection_window)
@@ -1573,7 +1597,10 @@ fn build_request(
     //
     // A caller's own header still wins over the profile's, since naming one
     // explicitly means it.
-    if let Some(p) = config.resolved_profile() {
+    if let Some(p) = config
+        .resolved_profile()
+        .filter(|_| !bisect_disabled("headers"))
+    {
         for (name, value) in p.headers {
             let already_set = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
             if !already_set {
