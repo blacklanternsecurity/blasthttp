@@ -1973,6 +1973,12 @@ fn retry_backoff(attempt: u32, min_wait: Duration, max_wait: Duration) -> Durati
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
         config.validate_proxy().map_err(ClientError::other)?;
+        // Checked once, at the edge. `resolved_profile` deliberately falls
+        // back rather than erroring, because it is called from deep inside the
+        // connector where there is nothing useful to do with a failure; this
+        // is the place that turns a typo into a message instead of silently
+        // giving the caller a profile they did not ask for.
+        config.validate_profile().map_err(ClientError::other)?;
         let timeout_duration = Duration::from_secs(config.timeout());
         let max_retries = config.max_retries();
         let min_wait = config.retry_wait_min();
