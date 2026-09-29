@@ -36,11 +36,43 @@ pub struct TlsProfile {
     pub alpn: &'static [&'static str],
 }
 
+/// The HTTP/2 half of a profile.
+///
+/// Values are what the browser puts in its SETTINGS frame and its
+/// connection-level WINDOW_UPDATE, which together make up most of what is
+/// commonly called the Akamai HTTP/2 fingerprint.
+///
+/// Two fields of that fingerprint are deliberately absent because our stack
+/// cannot reach them without forking dependencies:
+///
+///   HEADER_TABLE_SIZE (setting 1): hyper carries it internally but
+///   hyper-util does not expose it, so there is no way to set it from here.
+///
+///   Pseudo-header order: `h2` hardcodes method, scheme, authority, path in
+///   `Iter::next()`, and Chrome sends method, authority, scheme, path.
+///   Changing it means forking h2, hyper and hyper-util, since each layer
+///   translates a fixed set of options rather than passing them through.
+#[derive(Debug, Clone, Copy)]
+pub struct Http2Profile {
+    /// SETTINGS 4, INITIAL_WINDOW_SIZE.
+    pub initial_stream_window: u32,
+    /// The connection window. The WINDOW_UPDATE a browser sends is this minus
+    /// the protocol default of 65535, so Chrome's 15663105 increment comes
+    /// from asking for 15 MiB.
+    pub initial_connection_window: u32,
+    /// SETTINGS 6, MAX_HEADER_LIST_SIZE.
+    pub max_header_list_size: u32,
+    /// SETTINGS 5, MAX_FRAME_SIZE. `None` leaves it out, which is what Chrome
+    /// does; our default sends 16384 and Chrome sends nothing.
+    pub max_frame_size: Option<u32>,
+}
+
 /// A complete profile: TLS, plus the HTTP layers that have to agree with it.
 #[derive(Debug, Clone, Copy)]
 pub struct BrowserProfile {
     pub name: &'static str,
     pub tls: TlsProfile,
+    pub http2: Http2Profile,
     /// Default request headers in the order the browser sends them. HTTP/1.1
     /// header order is preserved by this client, so this is the order that
     /// goes on the wire.
@@ -89,6 +121,17 @@ pub const CHROME_131: BrowserProfile = BrowserProfile {
         min_version: "1.2",
         max_version: "1.3",
         alpn: &["h2", "http/1.1"],
+    },
+    // Chrome's Akamai fingerprint is
+    // 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p. ENABLE_PUSH is
+    // already 0 because hyper always disables push.
+    http2: Http2Profile {
+        initial_stream_window: 6_291_456,
+        // 15 MiB. The WINDOW_UPDATE that results is 15728640 - 65535 =
+        // 15663105, which is what Chrome sends.
+        initial_connection_window: 15_728_640,
+        max_header_list_size: 262_144,
+        max_frame_size: None,
     },
     headers: &[
         (

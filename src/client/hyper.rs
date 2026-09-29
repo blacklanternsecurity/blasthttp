@@ -948,7 +948,29 @@ impl HyperClient {
         let cert_slot: CertSlot = Arc::new(Mutex::new(None));
         let peer_slot: PeerSlot = Arc::new(Mutex::new(HashMap::new()));
         let connector = OpenSslConnector::new(config, cert_slot.clone(), peer_slot.clone())?;
-        let builder = Client::builder(TokioExecutor::new());
+        let mut builder = Client::builder(TokioExecutor::new());
+
+        // Shape the HTTP/2 SETTINGS and connection window to the profile.
+        //
+        // Nothing here was being set at all before, so the values on the wire
+        // were hyper-util's defaults, which match no browser. These four are
+        // everything hyper-util exposes of the Akamai HTTP/2 fingerprint; the
+        // remaining two fields, HEADER_TABLE_SIZE and the pseudo-header order,
+        // need forks of hyper-util and h2 respectively and are left alone.
+        if let Some(p) = config.resolved_profile() {
+            builder
+                .http2_initial_stream_window_size(p.http2.initial_stream_window)
+                .http2_initial_connection_window_size(p.http2.initial_connection_window)
+                .http2_max_header_list_size(p.http2.max_header_list_size)
+                // `None` omits MAX_FRAME_SIZE entirely, which is what Chrome
+                // does. Our default announces 16384 and Chrome announces
+                // nothing, so leaving this unset is itself part of the match.
+                .http2_max_frame_size(p.http2.max_frame_size)
+                // Adaptive window resizes the connection window as traffic
+                // flows, which would emit WINDOW_UPDATE frames no browser
+                // sends and undo the fixed value set above.
+                .http2_adaptive_window(false);
+        }
 
         let inner = match mode {
             ConnMode::Direct(_) => AnyClient::Direct(builder.build(connector)),
