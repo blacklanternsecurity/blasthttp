@@ -58,26 +58,6 @@ fn sanitize_uri(url: &str) -> String {
     out
 }
 
-/// Cipher list used when the caller doesn't name one.
-///
-/// This has to be set explicitly. `SslConnector::builder` installs its own
-/// list first, `DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`,
-/// and `set_security_level(0)` does NOT undo it. The security level governs
-/// how weak a cipher may be; the cipher list governs which ones are offered at
-/// all. Leaving the list alone means RC4, DES, 3DES and SEED never reach the
-/// wire whatever the security level says, so a server speaking only one of
-/// them is unreachable, which is the whole reason this project builds its own
-/// OpenSSL.
-///
-/// `ALL` is every suite the build provides except the eNULL (no encryption)
-/// ones. It does include the aNULL suites, which skip authentication: those
-/// are worth reaching for a scanner, and this client already defaults to not
-/// verifying certificates, so they give up nothing that was being enforced.
-/// Null *encryption* stays opt-in through `cipher_string`, because negotiating
-/// it by default would hand back a connection that looks like TLS and encrypts
-/// nothing.
-const DEFAULT_CIPHER_LIST: &str = "ALL";
-
 /// Add the extensions a browser sends that OpenSSL does not send on its own.
 ///
 /// JA4 hashes the list of extension *types*, not their contents, so presence
@@ -217,9 +197,13 @@ fn apply_tls_settings(
 ) -> Result<(), ClientError> {
     use openssl::ssl::SslOptions;
 
-    let profile = config
-        .resolved_profile()
-        .filter(|_| !bisect_disabled("tls"));
+    // A bisect of the TLS layer means "what the default would have sent",
+    // which is now a named profile rather than an absence.
+    let profile = if bisect_disabled("tls") {
+        crate::profile::default_profile()
+    } else {
+        config.resolved_profile()
+    };
 
     // Security level 0: allow all ciphers including RC4 and DES. This is an
     // offensive-first tool and needs to connect to anything.
@@ -232,7 +216,7 @@ fn apply_tls_settings(
     // floor at 1.2 so this never widens a profile's offer.
     builder.clear_options(SslOptions::NO_SSLV3);
 
-    if let Some(p) = profile {
+    if profile.tls.browser_extensions {
         // Removing two extensions a browser does not send.
         //
         // encrypt_then_mac (0x0016) goes away by disabling the feature.
@@ -249,33 +233,51 @@ fn apply_tls_settings(
         builder.set_options(SslOptions::from_bits_retain(SSL_OP_NO_ENCRYPT_THEN_MAC));
         builder.clear_options(SslOptions::from_bits_retain(SSL_OP_TLSEXT_PADDING));
 
-        builder.set_ciphersuites(p.tls.ciphersuites).map_err(|e| {
-            ClientError::tls(format!(
-                "profile '{}' has an invalid TLS 1.3 suite list: {}",
-                p.name, e
-            ))
-        })?;
-        builder.set_sigalgs_list(p.tls.sigalgs).map_err(|e| {
-            ClientError::tls(format!(
-                "profile '{}' has an invalid signature algorithm list: {}",
-                p.name, e
-            ))
-        })?;
-        builder.set_groups_list(p.tls.groups).map_err(|e| {
-            ClientError::tls(format!(
-                "profile '{}' has an invalid group list: {}",
-                p.name, e
-            ))
-        })?;
-
         add_browser_extensions(builder)?;
     }
 
+    // Each of these is optional: leaving one unset keeps OpenSSL's own list
+    // and order, which is what a profile imitating an ordinary OpenSSL client
+    // wants.
+    if let Some(suites) = profile.tls.ciphersuites {
+        builder.set_ciphersuites(suites).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid TLS 1.3 suite list: {}",
+                profile.name, e
+            ))
+        })?;
+    }
+    if let Some(sigalgs) = profile.tls.sigalgs {
+        builder.set_sigalgs_list(sigalgs).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid signature algorithm list: {}",
+                profile.name, e
+            ))
+        })?;
+    }
+    if let Some(groups) = profile.tls.groups {
+        builder.set_groups_list(groups).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid group list: {}",
+                profile.name, e
+            ))
+        })?;
+    }
+
+    // Always set the cipher list, never leave it alone.
+    //
+    // `SslConnector::builder` installs its own first,
+    // `DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`, and
+    // `set_security_level(0)` does NOT undo it. The security level governs how
+    // weak a negotiated cipher may be; the cipher list governs which ones are
+    // offered at all. Leaving it alone means RC4, DES, 3DES and SEED never
+    // reach the wire whatever the security level says, so a server speaking
+    // only one of them is unreachable, which is the whole reason this project
+    // builds its own OpenSSL.
     let ciphers = config
         .cipher_string
         .as_deref()
-        .or(profile.map(|p| p.tls.cipher_list))
-        .unwrap_or(DEFAULT_CIPHER_LIST);
+        .unwrap_or(profile.tls.cipher_list);
     builder
         .set_cipher_list(ciphers)
         .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
@@ -283,7 +285,7 @@ fn apply_tls_settings(
     let min_version = config
         .min_tls_version
         .as_deref()
-        .or(profile.map(|p| p.tls.min_version));
+        .or(profile.tls.min_version);
     if let Some(v) = min_version {
         let version = parse_tls_version(v)?;
         builder
@@ -294,7 +296,7 @@ fn apply_tls_settings(
     let max_version = config
         .max_tls_version
         .as_deref()
-        .or(profile.map(|p| p.tls.max_version));
+        .or(profile.tls.max_version);
     if let Some(v) = max_version {
         let version = parse_tls_version(v)?;
         builder
@@ -638,7 +640,7 @@ impl OpenSslConnector {
         http.set_connect_timeout(Some(connect_timeout));
 
         Ok(OpenSslConnector {
-            profile_active: config.resolved_profile().is_some(),
+            profile_active: config.resolved_profile().tls.browser_extensions,
             http,
             ssl,
             cert_slot,
@@ -1025,18 +1027,20 @@ impl HyperClient {
         // everything hyper-util exposes of the Akamai HTTP/2 fingerprint; the
         // remaining two fields, HEADER_TABLE_SIZE and the pseudo-header order,
         // need forks of hyper-util and h2 respectively and are left alone.
-        if let Some(p) = config
-            .resolved_profile()
-            .filter(|_| !bisect_disabled("http2"))
-        {
+        let http2_profile = if bisect_disabled("http2") {
+            None
+        } else {
+            config.resolved_profile().http2
+        };
+        if let Some(p) = http2_profile {
             builder
-                .http2_initial_stream_window_size(p.http2.initial_stream_window)
-                .http2_initial_connection_window_size(p.http2.initial_connection_window)
-                .http2_max_header_list_size(p.http2.max_header_list_size)
+                .http2_initial_stream_window_size(p.initial_stream_window)
+                .http2_initial_connection_window_size(p.initial_connection_window)
+                .http2_max_header_list_size(p.max_header_list_size)
                 // `None` omits MAX_FRAME_SIZE entirely, which is what Chrome
                 // does. Our default announces 16384 and Chrome announces
                 // nothing, so leaving this unset is itself part of the match.
-                .http2_max_frame_size(p.http2.max_frame_size)
+                .http2_max_frame_size(p.max_frame_size)
                 // Adaptive window resizes the connection window as traffic
                 // flows, which would emit WINDOW_UPDATE frames no browser
                 // sends and undo the fixed value set above.
@@ -1360,7 +1364,7 @@ pub(crate) async fn connect_stream(
         .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
     let ssl_connector = ssl_builder.build();
-    let profile_active = config.resolved_profile().is_some();
+    let profile_active = config.resolved_profile().tls.browser_extensions;
     let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
         .map_err(|e| ClientError::tls(format!("SSL conf failed: {}", e)))?;
 
@@ -1690,11 +1694,15 @@ fn build_request(
     //
     // A caller's own header still wins over the profile's, since naming one
     // explicitly means it.
-    if let Some(p) = config
-        .resolved_profile()
-        .filter(|_| !bisect_disabled("headers"))
-    {
-        for (name, value) in p.headers {
+    // A profile with no headers of its own means the client's own minimal
+    // defaults, which is what `compatibility` and `modern` both want.
+    let header_profile = if bisect_disabled("headers") {
+        crate::profile::default_profile()
+    } else {
+        config.resolved_profile()
+    };
+    if !header_profile.headers.is_empty() {
+        for (name, value) in header_profile.headers {
             let already_set = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
             if !already_set {
                 builder = builder.header(*name, *value);

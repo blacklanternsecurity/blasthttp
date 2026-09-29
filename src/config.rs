@@ -96,13 +96,29 @@ impl RequestConfig {
         }
     }
 
-    /// The browser profile this request should imitate, if it named one.
+    /// The connection profile this request should use.
     ///
-    /// An unknown name resolves to `None` rather than erroring, so a profile
-    /// that has not been written yet degrades to ordinary behaviour instead of
-    /// failing the request.
-    pub fn resolved_profile(&self) -> Option<&'static crate::profile::BrowserProfile> {
-        self.profile.as_deref().and_then(crate::profile::by_name)
+    /// Infallible, because every request has a profile now: naming none means
+    /// the default rather than "no profile", and the code that applies one no
+    /// longer has an absent case to branch on. An unrecognised name falls back
+    /// to the default here; `validate_profile` is what turns it into an error,
+    /// so a typo is caught once at the edge rather than silently changing
+    /// behaviour deep in the connector.
+    pub fn resolved_profile(&self) -> &'static crate::profile::ConnectionProfile {
+        match self.profile.as_deref() {
+            Some(name) => {
+                crate::profile::by_name(name).unwrap_or_else(|_| crate::profile::default_profile())
+            }
+            None => crate::profile::default_profile(),
+        }
+    }
+
+    /// Reject an unknown profile name.
+    pub fn validate_profile(&self) -> Result<(), String> {
+        match self.profile.as_deref() {
+            Some(name) => crate::profile::by_name(name).map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     pub fn method(&self) -> &str {
