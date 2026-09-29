@@ -153,32 +153,65 @@ async fn live_fingerprint_prevalence() {
 #[tokio::test]
 #[ignore = "needs network; run with --ignored"]
 async fn live_block_scorecard() {
-    // One GET per target, classified structurally.
+    // One GET per target, classified structurally, scored per tier.
     //
-    // Target choice is deliberate. The scrapingcourse pages exist to be
-    // scraped against. akamai.com is the vendor's own property and the
-    // clearest discriminator we have: it refused blasthttp and served a
-    // Chrome-impersonating client 219KB from the same address in the same
-    // minute. cloudflare.com is a control that should always pass.
+    // Scoring across tiers as one number is worse than useless, which an
+    // earlier version of this proved by reporting "1/4" when the true bypass
+    // count was zero. Two ways that number lied:
+    //
+    //   - the one success was the control, which protects nothing, so passing
+    //     it demonstrates nothing
+    //   - it counted the JS tier in the denominator, which no HTTP client
+    //     reaches, so the score could never approach 4/4 however good the
+    //     work got
+    //
+    // So: controls are verified and not scored, and only the passive tier is
+    // scored, because that is the only tier this work can move.
     //
     // Do not grow this into a list of ordinary commercial sites, and do not
     // put it on a schedule.
+
+    /// What a target is for, which decides whether and how it is scored.
+    enum Tier {
+        /// Protects nothing. Confirms the harness reaches the internet and
+        /// reads an ordinary response correctly.
+        Control,
+        /// Passive fingerprinting. The tier stealth mode exists to beat, and
+        /// the only one worth a score.
+        Passive,
+        /// Interactive JavaScript challenge. Out of reach for any HTTP client,
+        /// curl_cffi included. Reported so a change would be visible, never
+        /// counted against us.
+        Javascript,
+    }
+
     let targets = [
-        ("cloudflare.com (control)", "https://www.cloudflare.com/"),
-        ("akamai.com", "https://www.akamai.com/"),
         (
+            Tier::Control,
+            "cloudflare.com",
+            "https://www.cloudflare.com/",
+        ),
+        // The vendor's own property, and the clearest discriminator we have:
+        // it refused blasthttp and served a Chrome-impersonating client 219KB
+        // from the same address in the same minute.
+        (Tier::Passive, "akamai.com", "https://www.akamai.com/"),
+        (
+            Tier::Javascript,
             "scrapingcourse cf-challenge",
             "https://www.scrapingcourse.com/cloudflare-challenge",
         ),
         (
+            Tier::Javascript,
             "scrapingcourse antibot",
             "https://www.scrapingcourse.com/antibot-challenge",
         ),
     ];
 
     println!();
-    let mut through = 0;
-    for (label, url) in targets {
+    let (mut passive_through, mut passive_total) = (0, 0);
+    let mut control_failed = false;
+
+    for (tier, label, url) in targets {
         let outcome = match fetch(url).await {
             Some((status, headers, body)) => classify(&ResponseFacts {
                 status,
@@ -187,13 +220,37 @@ async fn live_block_scorecard() {
             }),
             None => Outcome::Error,
         };
-        if outcome.got_through() {
-            through += 1;
-        }
-        println!("  {:32} {:?}", label, outcome);
+
+        let tag = match tier {
+            Tier::Control => {
+                if !outcome.got_through() {
+                    control_failed = true;
+                }
+                "control"
+            }
+            Tier::Passive => {
+                passive_total += 1;
+                if outcome.got_through() {
+                    passive_through += 1;
+                }
+                "passive"
+            }
+            Tier::Javascript => "js",
+        };
+        println!("  [{:7}] {:30} {:?}", tag, label, outcome);
     }
-    println!("\n  got through: {}/{}", through, targets.len());
-    println!("  (the JS challenge tier is out of reach for any HTTP client,");
-    println!("   curl_cffi included, so the scrapingcourse pages are expected");
-    println!("   to stay unreachable until something executes JavaScript)");
+
+    println!();
+    println!(
+        "  passive-fingerprint tier: {}/{} reached",
+        passive_through, passive_total
+    );
+    println!("  javascript tier: not scored, unreachable without a browser");
+    println!("  controls: not scored");
+
+    assert!(
+        !control_failed,
+        "a control target was blocked, so this run says nothing about us: \
+         either the network path is interfering or the site changed"
+    );
 }
