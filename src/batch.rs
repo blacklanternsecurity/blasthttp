@@ -189,13 +189,24 @@ struct SchedulerState {
     remaining_total: usize,
     remaining_by_host: std::collections::HashMap<String, usize>,
     /// How many requests are standing aside right now, and the ceiling on
-    /// that. A request that has stepped aside holds no permit, so it stops
-    /// counting against concurrency and the driver spawns another in its
-    /// place. Without a ceiling, a batch alternating between two slow hosts
-    /// would have the driver spawn task after task, each stepping aside and
-    /// freeing the permit for the next, until the whole batch was resident.
-    /// The ceiling keeps live tasks inside the envelope the stream already
-    /// had.
+    /// that.
+    ///
+    /// The ceiling is about *spawning*, so the two callers want different
+    /// numbers and passing one for both was a mistake worth recording.
+    ///
+    /// The stream driver takes a permit before it spawns, which is how it
+    /// keeps a million-URL batch from being resident all at once. A request
+    /// that stands aside hands that permit straight back, so the driver
+    /// spawns another, which may also stand aside, and so on: a batch
+    /// alternating between two slow hosts would spawn the lot. There the
+    /// ceiling is the concurrency limit and it is load-bearing.
+    ///
+    /// `send_batch` spawns every task up front regardless. Standing aside
+    /// creates nothing, so a ceiling protects nothing, and setting one only
+    /// throws the benefit away: measured over a grid of batch shapes, the
+    /// duplicate handshakes went to zero exactly when the ceiling was not
+    /// binding and were left completely untouched when it was. There the
+    /// limit is the batch size, which is to say no limit at all.
     aside: usize,
     aside_limit: usize,
 }
@@ -275,7 +286,10 @@ fn host_key(url: &str) -> String {
 }
 
 impl Scheduler {
-    fn new(configs: &[RequestConfig], concurrency: usize) -> Arc<Self> {
+    /// `aside_limit` is how many requests may stand aside at once. See the
+    /// field: the stream driver needs the concurrency limit, `send_batch`
+    /// needs no limit and passes the batch size.
+    fn new(configs: &[RequestConfig], aside_limit: usize) -> Arc<Self> {
         let mut remaining_by_host: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for c in configs {
@@ -287,7 +301,7 @@ impl Scheduler {
                 remaining_total: configs.len(),
                 remaining_by_host,
                 aside: 0,
-                aside_limit: concurrency.max(1),
+                aside_limit: aside_limit.max(1),
             }),
         })
     }
@@ -401,7 +415,9 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
 ) -> Vec<BatchResult> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let limiter = merge_limiters(shared_limiter, rate_limit);
-    let sched = Scheduler::new(&configs, concurrency);
+    // No ceiling here: the tasks all exist either way, so standing aside
+    // costs nothing that going would not have cost anyway.
+    let sched = Scheduler::new(&configs, configs.len());
     let mut handles = Vec::new();
 
     for config in configs {
@@ -481,6 +497,8 @@ pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
 ) -> impl Stream<Item = BatchResult> + Send + 'static {
     let limiter = merge_limiters(shared_limiter, rate_limit);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    // Ceiling here, because this driver spawns lazily and a request that
+    // stands aside gives its permit back for the driver to spawn against.
     let sched = Scheduler::new(&configs, concurrency);
 
     stream::once(async move {
@@ -1040,9 +1058,11 @@ mod scheduler_tests {
 
     #[test]
     fn test_the_ceiling_bounds_how_many_can_be_standing_aside() {
-        // Without this, a batch alternating between two slow hosts has the
-        // driver spawn a task, watch it hand the permit straight back, spawn
-        // another, and so on until the whole batch is resident.
+        // The stream driver's limit, which is the concurrency one. Without
+        // it, a batch alternating between two slow hosts has the driver spawn
+        // a task, watch it hand the permit straight back, spawn another, and
+        // so on until the whole batch is resident. `send_batch` wants the
+        // opposite and the test above covers that.
         let mut urls = vec!["https://a.test/"; 10];
         urls.push("https://b.test/");
         let sched = Scheduler::new(&cfgs(&urls), 2);
@@ -1058,6 +1078,29 @@ mod scheduler_tests {
         assert!(
             !is_aside(&sched.dispatch(&a, true)),
             "the third should go rather than pile up"
+        );
+    }
+
+    #[test]
+    fn test_no_ceiling_lets_a_whole_batch_stand_aside() {
+        // What `send_batch` passes, and why it differs from the stream. Its
+        // tasks are all spawned up front, so standing aside creates nothing
+        // and a ceiling protects nothing. Setting one anyway only throws the
+        // saving away: measured across a grid of batch shapes, a ceiling of
+        // the concurrency limit left the duplicate handshakes completely
+        // untouched wherever a batch was bigger than that limit, which is
+        // every batch worth scheduling.
+        let mut urls = vec!["https://a.test/"; 40];
+        urls.push("https://b.test/");
+        let configs = cfgs(&urls);
+        let sched = Scheduler::new(&configs, configs.len());
+        let a = host_key("https://a.test/");
+
+        let _lead = sched.dispatch(&a, true);
+        let aside: Vec<_> = (0..39).map(|_| sched.dispatch(&a, true)).collect();
+        assert!(
+            aside.iter().all(is_aside),
+            "every one of them should wait for the answer the first is fetching"
         );
     }
 

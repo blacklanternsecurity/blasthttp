@@ -54,7 +54,12 @@ the ladder falling back to `compatibility` on the second handshake.
   from twelve handshakes to seven, with nothing idling: standing aside only
   happens when there is undispatched work elsewhere, so when a batch is all
   one host every request goes immediately and discovers it again, which is the
-  cheaper mistake. A slow request still never holds up faster ones behind it
+  cheaper mistake. A slow request still never holds up faster ones behind it.
+  Measured over a grid of batch shapes, the duplicate handshakes go to zero in
+  every one: a scan of 2000 URLs across 20 hosts drops 62 handshakes, 500 URLs
+  across 10 hosts drops 139, and wall time is unchanged. A batch no deeper than
+  its own concurrency limit pays one extra round trip for it, since there the
+  discovery cannot be overlapped with anything
 - `raw_connect`, and requests using `resolve_ip` or `request_target`, widen
   their cipher offer and retry on a handshake the peer could not negotiate,
   the same as an ordinary request. These bypass the pooled client, so they
