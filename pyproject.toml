@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "blasthttp"
 version = "0.10.0"
 description = "Offensive-first HTTP library"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 requires-python = ">=3.10"
 
 [tool.maturin]
