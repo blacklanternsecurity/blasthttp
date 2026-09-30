@@ -237,32 +237,26 @@ async fn test_modern_still_reachable_by_default() {
     server.shutdown().await;
 }
 
-// ── A known cost, deliberately not fixed ──────────────────────────
+// ── What a cold burst costs when there is nothing else to do ──────
 
 #[tokio::test]
-async fn test_a_cold_burst_rediscovers_per_request() {
-    // Every request in an opening burst walks the ladder independently,
-    // because the per-host memory is only written once something succeeds and
-    // nothing has succeeded yet. This test records that rather than asserting
-    // it away, because the obvious fix turned out to cost more than it saved.
+async fn test_a_cold_burst_rediscovers_when_it_has_nothing_else_to_do() {
+    // Concurrent requests straight at `client.send`, all to one host, with no
+    // batch around them. Each walks the ladder alone, because the per-host
+    // memory is only written once something has succeeded and nothing has
+    // yet. Two handshakes apiece where one would have done.
     //
-    // The cost: roughly double the handshakes in the first burst against a
-    // host needing a shift. Measured against a real host, twelve concurrent
-    // requests produced twenty-four attempts. It is bounded by concurrency
-    // and not by scan size, so a thousand-path scan at fifty concurrent pays
-    // about fifty extra handshakes, and only on the first burst; afterwards
-    // the memory answers.
+    // That is the right answer here and the test says so rather than treating
+    // it as a defect. The only way to share the discovery is for these
+    // requests to wait on each other, and a waiter cannot be released until
+    // the leader has classified its response, which needs the body, which
+    // means the wait is a whole request long. Paying for fewer handshakes
+    // with dead time is a bad trade, and it breaks the rule that a slow
+    // request never holds up faster ones.
     //
-    // The attempted fix was a per-host semaphore, so one request discovers
-    // and the rest wait. It worked, 24 attempts down to 13. But a waiter
-    // cannot be released until the leader has classified its response, and
-    // classification needs the body, so the wait is a full request long. That
-    // is a head-of-line stall, which is exactly what request_batch_stream
-    // exists to avoid, and it broke the test that guards that property.
-    // Shortening the wait enough to preserve it removed the entire saving.
-    //
-    // So: leave it, and revisit if scan telemetry ever shows the burst
-    // mattering more than the latency.
+    // A batch does better, because a batch has somewhere else to send the
+    // slot: see `tests/burst_scheduler.rs`. The saving is only available when
+    // there is other work, and this test is the case where there is not.
     const N: usize = 6;
 
     let server = TlsTestServer::start(TlsServerConfig {

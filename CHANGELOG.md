@@ -47,6 +47,14 @@ the ladder falling back to `compatibility` on the second handshake.
   default offers nothing that exists in SSLv3
 - `BLASTHTTP_BISECT=tls,headers,http2` disables profile layers independently,
   for finding out which one a detector is reacting to
+- Batches no longer have every request in an opening burst work out the same
+  host's profile separately. A request whose host is already being discovered
+  stands aside and lets a request for a *different* host take its slot, then
+  goes once there is an answer. Six requests to a host needing a shift went
+  from twelve handshakes to seven, with nothing idling: standing aside only
+  happens when there is undispatched work elsewhere, so when a batch is all
+  one host every request goes immediately and discovers it again, which is the
+  cheaper mistake. A slow request still never holds up faster ones behind it
 - `raw_connect`, and requests using `resolve_ip` or `request_target`, widen
   their cipher offer and retry on a handshake the peer could not negotiate,
   the same as an ordinary request. These bypass the pooled client, so they
