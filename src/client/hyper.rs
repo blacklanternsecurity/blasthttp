@@ -214,7 +214,10 @@ struct OpenSslConnector {
 /// A proxy the connector tunnels through before talking to the target.
 #[derive(Clone)]
 struct TunnelProxy {
-    /// Dialed the same way a direct connection's target is.
+    /// The proxy's own endpoint as `http://host:port`, dialed the same way a
+    /// direct connection's target is. Always carries an explicit port, because
+    /// `HttpConnector` would otherwise fill in 80 and disagree with the
+    /// scheme's default.
     uri: http::Uri,
     kind: super::proxy::ProxyScheme,
     username: Option<String>,
@@ -222,25 +225,23 @@ struct TunnelProxy {
 }
 
 impl TunnelProxy {
-    fn parse(proxy_url: &str, kind: super::proxy::ProxyScheme) -> Result<Self, ClientError> {
-        let proxy_uri: http::Uri = proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-            ClientError::invalid_url(format!("invalid proxy URL: {}", e))
-        })?;
-        // Credentials come from the URL's userinfo, `socks5://user:pass@host`.
-        let userinfo = proxy_uri
-            .authority()
-            .and_then(|a| a.as_str().rsplit_once('@'))
-            .map(|(u, _)| u.to_string());
-        let (username, password) = match userinfo.as_deref().map(|u| u.split_once(':')) {
-            Some(Some((user, pass))) => (Some(user.to_string()), Some(pass.to_string())),
-            Some(None) => (userinfo.clone(), None),
-            None => (None, None),
-        };
+    /// Built from the same parse `raw_connect` uses, so both paths agree on
+    /// the port, the host and the credentials for any given proxy URL.
+    fn from_url(proxy_url: &str) -> Result<Self, ClientError> {
+        let cfg = super::proxy::parse_proxy_url(proxy_url)?;
+        let uri = http::Uri::builder()
+            .scheme("http")
+            .authority(format!("{}:{}", cfg.host, cfg.port))
+            .path_and_query("/")
+            .build()
+            .map_err(|e| {
+                ClientError::invalid_url(format!("invalid proxy URL '{}': {}", proxy_url, e))
+            })?;
         Ok(TunnelProxy {
-            uri: proxy_uri,
-            kind,
-            username,
-            password,
+            uri,
+            kind: cfg.scheme,
+            username: cfg.username,
+            password: cfg.password,
         })
     }
 }
@@ -819,7 +820,6 @@ impl HyperClient {
         let connector = OpenSslConnector::new(config, cert_slot.clone(), peer_slot.clone())?;
         let builder = Client::builder(TokioExecutor::new());
 
-        use super::proxy::ProxyScheme;
         let connector = match mode {
             ConnMode::Direct(_) => connector,
             ConnMode::ForwardProxy(_) => {
@@ -828,11 +828,10 @@ impl HyperClient {
                 // never be reached.
                 unreachable!("ForwardProxy uses dispatch_forward_proxy, not get_or_build")
             }
-            ConnMode::Tunnel { proxy_url, .. } => {
-                connector.with_proxy(TunnelProxy::parse(proxy_url, ProxyScheme::Http)?)
-            }
-            ConnMode::Socks5 { proxy_url, .. } => {
-                connector.with_proxy(TunnelProxy::parse(proxy_url, ProxyScheme::Socks5)?)
+            // The scheme comes out of the proxy URL itself, so these two modes
+            // build the tunnel the same way.
+            ConnMode::Tunnel { proxy_url, .. } | ConnMode::Socks5 { proxy_url, .. } => {
+                connector.with_proxy(TunnelProxy::from_url(proxy_url)?)
             }
         };
         let inner = builder.build(connector);
@@ -3024,5 +3023,46 @@ mod tests {
         let (out, cut) = read_body(body, NO_LIMIT).await.unwrap();
         assert_eq!(out, SAMPLE);
         assert!(!cut);
+    }
+
+    /// The pooled path and `raw_connect` have to land on the same proxy, so
+    /// the endpoint the connector dials must match what `parse_proxy_url`
+    /// resolved. Portless URLs are where these used to disagree: handing the
+    /// raw URL to `HttpConnector` got port 80 for both schemes.
+    #[test]
+    fn test_tunnel_proxy_endpoint_matches_the_shared_parser() {
+        for url in [
+            "http://proxy",
+            "http://proxy:3128",
+            "socks5://proxy",
+            "socks5://proxy:9050",
+            "socks5h://alice:s3cret@proxy",
+        ] {
+            let cfg = super::super::proxy::parse_proxy_url(url).unwrap();
+            let tunnel = TunnelProxy::from_url(url).unwrap();
+            assert_eq!(
+                tunnel.uri.authority().map(|a| a.as_str()),
+                Some(format!("{}:{}", cfg.host, cfg.port).as_str()),
+                "dialed endpoint disagrees with the parser for {}",
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn test_tunnel_proxy_carries_socks5_credentials() {
+        let tunnel = TunnelProxy::from_url("socks5://alice:s3cret@proxy:1080").unwrap();
+        assert_eq!(tunnel.username.as_deref(), Some("alice"));
+        assert_eq!(tunnel.password.as_deref(), Some("s3cret"));
+        assert!(matches!(
+            tunnel.kind,
+            super::super::proxy::ProxyScheme::Socks5
+        ));
+    }
+
+    #[test]
+    fn test_tunnel_proxy_rejects_what_the_parser_rejects() {
+        assert!(TunnelProxy::from_url("ftp://proxy:21").is_err());
+        assert!(TunnelProxy::from_url("http://:8080").is_err());
     }
 }
