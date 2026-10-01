@@ -361,6 +361,8 @@ Run with `-v` to see it happen: the debug log records both the cookies each hop 
 
 `proxy` routes a request through an HTTP or SOCKS5 proxy; `no_proxy` is a per-request list of hosts that bypass it and connect directly — the `NO_PROXY` equivalent. It's accepted by `request()`, `download()`, `raw_connect()`, and `BatchConfig`, and as the repeatable `--no-proxy` CLI flag.
 
+An HTTPS request through a proxy is TLS with the target, carried inside the tunnel the proxy opens, so `verify_certs` and the other TLS settings apply to the target as usual. SOCKS5 credentials go in the URL (`socks5://user:pass@host:1080`). An `https://` proxy URL is refused for HTTPS targets, since that would need TLS inside TLS.
+
 ```python
 # Proxy everything except internal hosts and the loopback range.
 r = await client.request(

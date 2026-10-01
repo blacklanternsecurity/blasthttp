@@ -206,6 +206,44 @@ struct OpenSslConnector {
     // on the `RedirectHop` (or final `Response`).
     peer_slot: PeerSlot,
     connect_timeout: Duration,
+    // Set when requests go through a CONNECT or SOCKS5 proxy. The connector
+    // opens the tunnel itself, so that TLS is with the target, inside it.
+    proxy: Option<TunnelProxy>,
+}
+
+/// A proxy the connector tunnels through before talking to the target.
+#[derive(Clone)]
+struct TunnelProxy {
+    /// The proxy's own endpoint as `http://host:port`, dialed the same way a
+    /// direct connection's target is. Always carries an explicit port, because
+    /// `HttpConnector` would otherwise fill in 80 and disagree with the
+    /// scheme's default.
+    uri: http::Uri,
+    kind: super::proxy::ProxyScheme,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl TunnelProxy {
+    /// Built from the same parse `raw_connect` uses, so both paths agree on
+    /// the port, the host and the credentials for any given proxy URL.
+    fn from_url(proxy_url: &str) -> Result<Self, ClientError> {
+        let cfg = super::proxy::parse_proxy_url(proxy_url)?;
+        let uri = http::Uri::builder()
+            .scheme("http")
+            .authority(format!("{}:{}", cfg.host, cfg.port))
+            .path_and_query("/")
+            .build()
+            .map_err(|e| {
+                ClientError::invalid_url(format!("invalid proxy URL '{}': {}", proxy_url, e))
+            })?;
+        Ok(TunnelProxy {
+            uri,
+            kind: cfg.scheme,
+            username: cfg.username,
+            password: cfg.password,
+        })
+    }
 }
 
 /// Encode a list of ALPN protocol names into the wire format OpenSSL
@@ -396,7 +434,13 @@ impl OpenSslConnector {
             cert_slot,
             peer_slot,
             connect_timeout,
+            proxy: None,
         })
+    }
+
+    fn with_proxy(mut self, proxy: TunnelProxy) -> Self {
+        self.proxy = Some(proxy);
+        self
     }
 }
 
@@ -499,11 +543,21 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
     fn call(&mut self, uri: http::Uri) -> Self::Future {
         let host = uri.host().unwrap_or("").to_string();
         let is_https = uri.scheme_str() == Some("https");
+        let port = uri.port_u16().unwrap_or(if is_https { 443 } else { 80 });
+        let proxy = self.proxy.clone();
         // Compute the slot key from the original URI before we hand it
         // off to hyper's HttpConnector — that's the authority callers
-        // will look up by.
-        let slot_key = peer_slot_key(&uri);
-        let http_fut = self.http.call(uri);
+        // will look up by. Through a proxy the socket's peer is the proxy,
+        // not the target, so there is no peer IP to record.
+        let slot_key = if proxy.is_some() {
+            None
+        } else {
+            peer_slot_key(&uri)
+        };
+        let http_fut = match &proxy {
+            Some(p) => self.http.call(p.uri.clone()),
+            None => self.http.call(uri),
+        };
         let ssl_connector = self.ssl.clone();
         let cert_slot = self.cert_slot.clone();
         let peer_slot = self.peer_slot.clone();
@@ -511,7 +565,7 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 
         Box::pin(async move {
             let tcp = http_fut.await?;
-            let tcp_stream = tcp.into_inner();
+            let mut tcp_stream = tcp.into_inner();
 
             // Record peer IP for this fresh connection. Best-effort —
             // failure to read peer_addr (vanishingly rare) is not fatal.
@@ -519,6 +573,45 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
                 && let Ok(mut map) = peer_slot.lock()
             {
                 map.insert(key, peer.ip());
+            }
+
+            // Open the tunnel to the target before anything else, so that
+            // the TLS below is with the target and runs inside it.
+            if let Some(p) = proxy {
+                use super::proxy::{self as tunnel, ProxyScheme};
+                let handshake = async {
+                    match p.kind {
+                        ProxyScheme::Http => {
+                            tunnel::perform_http_connect(&mut tcp_stream, &host, port).await
+                        }
+                        ProxyScheme::Socks5 => {
+                            tunnel::perform_socks5(
+                                &mut tcp_stream,
+                                &host,
+                                port,
+                                p.username.as_deref(),
+                                p.password.as_deref(),
+                            )
+                            .await
+                        }
+                    }
+                };
+                tokio::time::timeout(connect_timeout, handshake)
+                    .await
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "proxy tunnel to {}:{} timed out after {}s",
+                                host,
+                                port,
+                                connect_timeout.as_secs()
+                            ),
+                        ))
+                    })?
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        Box::new(std::io::Error::other(e.message))
+                    })?;
             }
 
             // Plain HTTP — return raw TCP stream, no TLS handshake
@@ -586,29 +679,23 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 //   `GET http://target/path HTTP/1.1`. Uses raw http1::SendRequest to bypass
 //   hyper Client's URI normalization (which strips scheme+authority).
 // - CONNECT tunnel (HTTPS targets): proxy opens a raw TCP tunnel via CONNECT.
-//   Uses hyper_util's Tunnel connector.
 // - SOCKS5: works for both HTTP and HTTPS targets.
+//
+// For both tunnel kinds `OpenSslConnector` opens the tunnel itself and then
+// does TLS with the target over it. hyper_util's `Tunnel` and `SocksV5` can't
+// be used for this: they hand the inner connector the proxy's URI, so TLS
+// would be decided by the proxy's scheme and HTTPS would go into the tunnel
+// as plaintext.
 
-type DirectClient = Client<OpenSslConnector, FullBody>;
-type TunnelProxyClient =
-    Client<hyper_util::client::legacy::connect::proxy::Tunnel<OpenSslConnector>, FullBody>;
-type Socks5ProxyClient =
-    Client<hyper_util::client::legacy::connect::proxy::SocksV5<OpenSslConnector>, FullBody>;
+type PooledClient = Client<OpenSslConnector, FullBody>;
 
 /// The cached hyper client + its cert info slot.
 /// hyper's Client uses Arc internally, so Clone shares the connection pool.
 #[derive(Clone)]
 struct CachedClient {
-    inner: AnyClient,
+    inner: PooledClient,
     cert_slot: CertSlot,
     peer_slot: PeerSlot,
-}
-
-#[derive(Clone)]
-enum AnyClient {
-    Direct(DirectClient),
-    Tunnel(TunnelProxyClient),
-    Socks5(Socks5ProxyClient),
 }
 
 /// TLS config fields that must be part of the client cache key.
@@ -682,6 +769,15 @@ impl HyperClient {
                     "http" | "https" => {
                         // HTTP proxy: use forward proxy for HTTP targets, tunnel for HTTPS
                         let target_is_https = target_uri.scheme_str() == Some("https");
+                        if target_is_https && proxy_scheme == "https" {
+                            // That would be TLS to the target inside TLS to
+                            // the proxy, which isn't supported.
+                            return Err(ClientError::other(format!(
+                                "https:// proxies are not supported for HTTPS targets; \
+                                 use http:// or socks5:// ({})",
+                                proxy_url
+                            )));
+                        }
                         if target_is_https {
                             Ok(ConnMode::Tunnel {
                                 proxy_url: proxy_url.to_string(),
@@ -724,33 +820,21 @@ impl HyperClient {
         let connector = OpenSslConnector::new(config, cert_slot.clone(), peer_slot.clone())?;
         let builder = Client::builder(TokioExecutor::new());
 
-        let inner = match mode {
-            ConnMode::Direct(_) => AnyClient::Direct(builder.build(connector)),
+        let connector = match mode {
+            ConnMode::Direct(_) => connector,
             ConnMode::ForwardProxy(_) => {
                 // Forward proxy doesn't use a cached hyper Client — it dispatches
                 // directly via http1::SendRequest in send_inner. This branch should
                 // never be reached.
                 unreachable!("ForwardProxy uses dispatch_forward_proxy, not get_or_build")
             }
-            ConnMode::Tunnel { proxy_url, .. } => {
-                let proxy_uri: http::Uri =
-                    proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-                        ClientError::invalid_url(format!("invalid proxy URL: {}", e))
-                    })?;
-                use hyper_util::client::legacy::connect::proxy::Tunnel;
-                let tunnel = Tunnel::new(proxy_uri, connector);
-                AnyClient::Tunnel(builder.build(tunnel))
-            }
-            ConnMode::Socks5 { proxy_url, .. } => {
-                let proxy_uri: http::Uri =
-                    proxy_url.parse().map_err(|e: http::uri::InvalidUri| {
-                        ClientError::invalid_url(format!("invalid proxy URL: {}", e))
-                    })?;
-                use hyper_util::client::legacy::connect::proxy::SocksV5;
-                let socks = SocksV5::new(proxy_uri, connector);
-                AnyClient::Socks5(builder.build(socks))
+            // The scheme comes out of the proxy URL itself, so these two modes
+            // build the tunnel the same way.
+            ConnMode::Tunnel { proxy_url, .. } | ConnMode::Socks5 { proxy_url, .. } => {
+                connector.with_proxy(TunnelProxy::from_url(proxy_url)?)
             }
         };
+        let inner = builder.build(connector);
 
         let cached = CachedClient {
             inner,
@@ -765,7 +849,7 @@ impl HyperClient {
 // ── Request dispatch ──────────────────────────────────────────────
 
 async fn dispatch_request(
-    client: &AnyClient,
+    client: &PooledClient,
     uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
@@ -788,12 +872,7 @@ async fn dispatch_request(
     }
     debug_record(log, v, 1, "   Sending request...");
 
-    let hyper_response = match client {
-        AnyClient::Direct(c) => c.request(request).await,
-        AnyClient::Tunnel(c) => c.request(request).await,
-        AnyClient::Socks5(c) => c.request(request).await,
-    }
-    .map_err(|e| {
+    let hyper_response = client.request(request).await.map_err(|e| {
         let msg = format!("request failed: {}", e);
         let err_str = e.to_string().to_lowercase();
         if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
@@ -2944,5 +3023,46 @@ mod tests {
         let (out, cut) = read_body(body, NO_LIMIT).await.unwrap();
         assert_eq!(out, SAMPLE);
         assert!(!cut);
+    }
+
+    /// The pooled path and `raw_connect` have to land on the same proxy, so
+    /// the endpoint the connector dials must match what `parse_proxy_url`
+    /// resolved. Portless URLs are where these used to disagree: handing the
+    /// raw URL to `HttpConnector` got port 80 for both schemes.
+    #[test]
+    fn test_tunnel_proxy_endpoint_matches_the_shared_parser() {
+        for url in [
+            "http://proxy",
+            "http://proxy:3128",
+            "socks5://proxy",
+            "socks5://proxy:9050",
+            "socks5h://alice:s3cret@proxy",
+        ] {
+            let cfg = super::super::proxy::parse_proxy_url(url).unwrap();
+            let tunnel = TunnelProxy::from_url(url).unwrap();
+            assert_eq!(
+                tunnel.uri.authority().map(|a| a.as_str()),
+                Some(format!("{}:{}", cfg.host, cfg.port).as_str()),
+                "dialed endpoint disagrees with the parser for {}",
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn test_tunnel_proxy_carries_socks5_credentials() {
+        let tunnel = TunnelProxy::from_url("socks5://alice:s3cret@proxy:1080").unwrap();
+        assert_eq!(tunnel.username.as_deref(), Some("alice"));
+        assert_eq!(tunnel.password.as_deref(), Some("s3cret"));
+        assert!(matches!(
+            tunnel.kind,
+            super::super::proxy::ProxyScheme::Socks5
+        ));
+    }
+
+    #[test]
+    fn test_tunnel_proxy_rejects_what_the_parser_rejects() {
+        assert!(TunnelProxy::from_url("ftp://proxy:21").is_err());
+        assert!(TunnelProxy::from_url("http://:8080").is_err());
     }
 }
