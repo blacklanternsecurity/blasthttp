@@ -58,6 +58,26 @@ fn sanitize_uri(url: &str) -> String {
     out
 }
 
+/// Cipher list used when the caller doesn't name one.
+///
+/// This has to be set explicitly. `SslConnector::builder` installs its own
+/// list first, `DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`,
+/// and `set_security_level(0)` does NOT undo it. The security level governs
+/// how weak a cipher may be; the cipher list governs which ones are offered at
+/// all. Leaving the list alone means RC4, DES, 3DES and SEED never reach the
+/// wire whatever the security level says, so a server speaking only one of
+/// them is unreachable, which is the whole reason this project builds its own
+/// OpenSSL.
+///
+/// `ALL` is every suite the build provides except the eNULL (no encryption)
+/// ones. It does include the aNULL suites, which skip authentication: those
+/// are worth reaching for a scanner, and this client already defaults to not
+/// verifying certificates, so they give up nothing that was being enforced.
+/// Null *encryption* stays opt-in through `cipher_string`, because negotiating
+/// it by default would hand back a connection that looks like TLS and encrypts
+/// nothing.
+const DEFAULT_CIPHER_LIST: &str = "ALL";
+
 // Load the OpenSSL legacy provider once (for RC4, DES, etc.).
 // The provider is statically compiled into libcrypto via `no-module` build flag.
 // `Once` ensures this runs exactly once even across threads.
@@ -275,12 +295,13 @@ fn encode_alpn_protocols(protos: &[String]) -> Result<Vec<u8>, ClientError> {
 
 fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
     match s.to_lowercase().as_str() {
+        "3.0" | "ssl3" | "sslv3" | "ssl3.0" => Ok(openssl::ssl::SslVersion::SSL3),
         "1.0" | "tls1.0" | "tlsv1.0" => Ok(openssl::ssl::SslVersion::TLS1),
         "1.1" | "tls1.1" | "tlsv1.1" => Ok(openssl::ssl::SslVersion::TLS1_1),
         "1.2" | "tls1.2" | "tlsv1.2" => Ok(openssl::ssl::SslVersion::TLS1_2),
         "1.3" | "tls1.3" | "tlsv1.3" => Ok(openssl::ssl::SslVersion::TLS1_3),
         _ => Err(ClientError::other(format!(
-            "unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)",
+            "unknown TLS version '{}' (use 3.0 for SSLv3, or 1.0, 1.1, 1.2, 1.3)",
             s
         ))),
     }
@@ -378,17 +399,26 @@ impl OpenSslConnector {
         // This is an offensive-first tool — we need to connect to anything.
         builder.set_security_level(0);
 
+        // `SslConnector::builder` sets NO_SSLV3 for us. Clear it, or a server
+        // that speaks nothing newer stays unreachable even when the caller
+        // asks for SSLv3 by name. Clearing the option only permits the
+        // protocol; which versions actually get offered is still decided by
+        // the min/max proto version below.
+        builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
+
         if !config.should_verify_certs() {
             builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
         } else {
             load_system_ca_certs(&mut builder)?;
         }
 
-        if let Some(ref ciphers) = config.cipher_string {
-            builder.set_cipher_list(ciphers).map_err(|e| {
-                ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
-            })?;
-        }
+        let ciphers = config
+            .cipher_string
+            .as_deref()
+            .unwrap_or(DEFAULT_CIPHER_LIST);
+        builder
+            .set_cipher_list(ciphers)
+            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
 
         if let Some(ref min_ver) = config.min_tls_version {
             let version = parse_tls_version(min_ver)?;
@@ -1048,17 +1078,22 @@ pub(crate) async fn connect_stream(
             .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
     ssl_builder.set_security_level(0);
+    // Same reason as the pooled path: openssl-rs sets NO_SSLV3 and an SSLv3
+    // server is unreachable until it is cleared.
+    ssl_builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
 
     if !config.should_verify_certs() {
         ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
     } else {
         load_system_ca_certs(&mut ssl_builder)?;
     }
-    if let Some(ref ciphers) = config.cipher_string {
-        ssl_builder
-            .set_cipher_list(ciphers)
-            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
-    }
+    let ciphers = config
+        .cipher_string
+        .as_deref()
+        .unwrap_or(DEFAULT_CIPHER_LIST);
+    ssl_builder
+        .set_cipher_list(ciphers)
+        .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
     if let Some(ref min_ver) = config.min_tls_version {
         let version = parse_tls_version(min_ver)?;
         ssl_builder

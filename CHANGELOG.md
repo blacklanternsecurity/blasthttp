@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.1
+
+- Legacy ciphers are offered by default, which is what the custom OpenSSL build has always been for. A server speaking only RC4, RC4-MD5, 3DES, SEED, Camellia or anonymous DH is now reachable without passing `cipher_string` yourself. Previously `SslConnector::builder` installed its own list (`DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`) and nothing replaced it, so those suites never reached the wire and such a server was unreachable at any setting. `set_security_level(0)` did not help: the security level governs how weak a negotiated cipher may be, not which ones are offered
+- Null-encryption suites are the deliberate exception. They stay reachable through an explicit `cipher_string` but are never offered by default, since negotiating one by accident returns a connection that looks like TLS and encrypts nothing
+- The default applies on both TLS paths, the pooled client and the `resolve_ip` / `request_target` / `raw_connect` path, which build their SSL contexts separately
+- This widens the ClientHello from 31 cipher suites to 105, which changes the client's TLS fingerprint. Anything matching on JA3/JA4 will see a different value than it did on 0.10.0
+- SSLv3 works, for the first time. It had never been reachable in any build: `scripts/build-openssl.sh` passed `enable-ssl3`, but OpenSSL's Configure has a disable cascade reading "if `ssl3-method` is off, turn `ssl3` off too", and `ssl3-method` is off by default. The flag was silently undone, so every shipped build had `OPENSSL_NO_SSL3` defined and no `SSLv3_method` symbols. The script now passes `enable-ssl3-method` as well
+- `SslConnector::builder` also sets `NO_SSLV3`, which nothing cleared, and `parse_tls_version` only understood 1.0 through 1.3, so SSLv3 had no spelling even if the build had provided it. Both are fixed: the option is cleared on both TLS paths, and `min_tls_version` / `max_tls_version` / `--min-tls` / `--max-tls` now accept `3.0` (also `ssl3`, `sslv3`). An SSLv3-only server is reachable without asking for it
+- The OpenSSL build cache is keyed on the feature flags and version as well as the target, so changing what the build asks for now triggers a rebuild instead of silently reusing a build made a different way. The first run after upgrading rebuilds once
+- README no longer claims export ciphers work. OpenSSL removed them outright in 1.1.0, so no build flag brings them back
+
 ## 0.10.0
 
 - Cookies set on a redirect hop are applied to the hops that follow it, the way a browser does. What a chain collects lives for that one request, so nothing carries between requests
