@@ -6,22 +6,27 @@ Offensive-first HTTP library in Rust with Python bindings via maturin. Built for
 
 | Concern | This repository |
 |---|---|
-| Language | Rust, edition 2024. Python 3.10 through 3.14 bindings |
-| Package manager | cargo, uv |
-| Lint and format | clippy and rustfmt, pinned in rust-toolchain.toml. ruff for Python |
-| Tests | cargo test, pytest for tests/python |
+| Language | Rust, edition in Cargo.toml. Python bindings, `requires-python` in pyproject.toml |
+| Package manager | cargo. Python side via pip and maturin, see Setup |
+| Lint and format | clippy and rustfmt, channel in rust-toolchain.toml. ruff, version in the `dev` group of pyproject.toml |
+| Tests | cargo test, pytest (`testpaths` in pyproject.toml) |
 
 ## Setup
 
+uv does not manage this project (`[tool.uv] managed = false`), and openssl-sys links the weak-cipher OpenSSL that `.cargo/config.toml` points at.
+
 ```bash
-uv sync --group dev && uv run maturin develop
+./scripts/build-openssl.sh
+python -m venv .venv && . .venv/bin/activate
+pip install --upgrade pip maturin && pip install --group dev
+maturin develop
 ```
 
 ## Tests
 
 ```bash
 cargo test
-uv run pytest tests/python
+pytest
 ```
 
 ## Standards
