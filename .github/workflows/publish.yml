@@ -184,7 +184,7 @@ jobs:
           OPENSSL_NO_VENDOR: "1"
 
   pypi:
-    environment: release
+    environment: pypi
     needs: [version, linux-build, musllinux-build, sdist-build]
     runs-on: ubuntu-24.04
     permissions:
