@@ -614,3 +614,7 @@ This compiles the Rust code with Python bindings enabled and installs the `blast
 - `.cargo/config.toml` sets `OPENSSL_DIR` (relative path to `vendor/openssl/install/`) and `OPENSSL_STATIC=1` so the `openssl-sys` crate links against the custom build statically
 - `build.rs` runs before compilation and verifies the custom OpenSSL headers exist, failing fast with an actionable error if they don't
 - The `[features] python` gate means `cargo build` produces a pure Rust binary, while `maturin build` activates PyO3 and produces a Python-loadable `.so`
+
+## Releasing
+
+Releases are cut by pushing a `vMAJOR.MINOR.PATCH` (or `vMAJOR.MINOR.PATCH-rc.N`) tag with the org's [release.sh](https://github.com/blacklanternsecurity/CLA/blob/e532142ee9e7322888f6edc80d9a89e2f8c0d96d/scripts/release.sh), after the version bump is merged. The tag must equal the manifest version. `publish.yml` then tests, builds, publishes, and creates the GitHub release with its SBOM in the same run.
