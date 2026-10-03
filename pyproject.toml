@@ -12,12 +12,9 @@ requires-python = ">=3.10"
 [tool.maturin]
 features = ["python"]
 
-[tool.uv]
-# maturin manages the package install, don't let uv overwrite it
-managed = false
-
 [dependency-groups]
 dev = [
+    "maturin>=1.10",
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "ruff==0.16.8",
