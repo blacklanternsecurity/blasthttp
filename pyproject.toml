@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "blasthttp"
-version = "0.10.0"
+dynamic = ["version"]
 description = "Offensive-first HTTP library"
 license = "GPL-3.0"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ requires-python = ">=3.10"
 features = ["python"]
 
 [tool.uv]
-# maturin manages the package install — don't let uv overwrite it
+# maturin manages the package install, don't let uv overwrite it
 managed = false
 
 [dependency-groups]

@@ -15,7 +15,7 @@ jobs:
     steps:
       - name: Generate token from GitHub App
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -38,7 +38,7 @@ jobs:
           for LOGIN in $COMMITTERS; do
             # treat commits with no associated GitHub login as non-exempt
             if [ -z "$LOGIN" ] || [ "$LOGIN" = "null" ]; then
-              echo "Unknown committer (no GitHub login) — not exempt"
+              echo "Unknown committer (no GitHub login): not exempt"
               ALL_EXEMPT=false
               break
             fi
@@ -48,20 +48,20 @@ jobs:
             # check if account type is Bot (GitHub App accounts)
             AUTHOR_TYPE=$(gh api "users/${LOGIN}" --jq '.type' 2>/dev/null || echo "Unknown")
             if [ "$AUTHOR_TYPE" = "Bot" ]; then
-              echo "$LOGIN is a Bot account — exempt"
+              echo "$LOGIN is a Bot account: exempt"
               EXEMPT=true
             fi
 
             # check org membership
             if [ "$EXEMPT" = "false" ]; then
               if gh api "orgs/blacklanternsecurity/members/$LOGIN" > /dev/null 2>&1; then
-                echo "$LOGIN is an org member — exempt"
+                echo "$LOGIN is an org member: exempt"
                 EXEMPT=true
               fi
             fi
 
             if [ "$EXEMPT" = "false" ]; then
-              echo "$LOGIN is not exempt — CLA required"
+              echo "$LOGIN is not exempt: CLA required"
               ALL_EXEMPT=false
               break
             fi
@@ -77,13 +77,13 @@ jobs:
           gh api --method POST "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
             -f state=success \
             -f context="CLAAssistant" \
-            -f description="CLA check skipped — all committers are org members or bots"
+            -f description="CLA check skipped: all committers are org members or bots"
 
       - name: "CLA Assistant"
         if: |
           (steps.cla-check.outputs.all_exempt != 'true') &&
           ((github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target')
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ steps.app-token.outputs.token }}
