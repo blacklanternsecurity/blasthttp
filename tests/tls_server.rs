@@ -7,7 +7,7 @@ use openssl::bn::BigNum;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
-use openssl::ssl::{SslAcceptor, SslMethod, SslOptions, SslVersion};
+use openssl::ssl::{AlpnError, SslAcceptor, SslAcceptorBuilder, SslMethod, SslOptions, SslVersion};
 use openssl::x509::X509;
 use openssl::x509::extension::SubjectAlternativeName;
 use std::net::SocketAddr;
@@ -89,6 +89,21 @@ fn generate_self_signed(config: &TlsServerConfig) -> (PKey<openssl::pkey::Privat
 }
 
 fn build_acceptor(config: &TlsServerConfig) -> SslAcceptor {
+    acceptor_builder(config).build()
+}
+
+/// An acceptor that only speaks HTTP/2, for tests that serve with hyper's
+/// h2 server instead of the hardcoded HTTP/1.1 response above.
+#[allow(dead_code)]
+pub fn build_h2_acceptor(config: &TlsServerConfig) -> SslAcceptor {
+    let mut builder = acceptor_builder(config);
+    builder.set_alpn_select_callback(|_, client| {
+        openssl::ssl::select_next_proto(b"\x02h2", client).ok_or(AlpnError::NOACK)
+    });
+    builder.build()
+}
+
+fn acceptor_builder(config: &TlsServerConfig) -> SslAcceptorBuilder {
     // Load the legacy provider so the server can use weak ciphers too
     load_legacy_provider();
 
@@ -133,7 +148,7 @@ fn build_acceptor(config: &TlsServerConfig) -> SslAcceptor {
         builder.set_max_proto_version(Some(max_ver)).unwrap();
     }
 
-    builder.build()
+    builder
 }
 
 // Load legacy provider for the test server (same as our client does)

@@ -70,3 +70,5 @@ pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runti
 [dev-dependencies]
 # TLS test server — uses our custom OpenSSL to serve with weak ciphers
 tokio-test = "0.4"
+# h2 test server, for checking what the client puts on the wire over HTTP/2
+hyper = { version = "1", features = ["server"] }
