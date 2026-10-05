@@ -236,3 +236,141 @@ async fn test_modern_still_reachable_by_default() {
 
     server.shutdown().await;
 }
+
+// ── Anonymous suites must not survive turning verification on ─────
+//
+// These are the other half of `test_anon_dh_reachable_by_default`. Anonymous
+// suites are reachable while nobody has asked us to check identities, and have
+// to be gone the moment somebody does. An anonymous suite sends no
+// certificate, OpenSSL ignores verify-peer when no certificate arrives, and
+// the hostname check rides along with the certificate check, so offering one
+// to a caller who set `verify_certs` would hand them a handshake that reports
+// success while checking nothing.
+
+/// Stand up an anonymous-DH-only server, ask for verification, and assert we
+/// do not reach it. `cipher_string` is whatever the caller would have set.
+async fn assert_unreachable_with_verification(cipher_string: Option<&str>) {
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("ADH-AES128-SHA".to_string()),
+        // The anonymous suites only exist at 1.2 and below.
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = RequestConfig::new(server.url());
+    config.verify_certs = Some(true);
+    config.cipher_string = cipher_string.map(str::to_string);
+    config.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_err(),
+        "verify_certs was on, so a server with no certificate must be out of \
+         reach, but the request succeeded with status {:?}",
+        result.as_ref().ok().map(|r| r.status)
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_unreachable_when_verifying() {
+    assert_unreachable_with_verification(None).await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_unreachable_when_verifying_with_explicit_ciphers() {
+    // `ALL` admits the anonymous suites, and it is an ordinary thing to pass
+    // without meaning to give up authentication. The caller also asked for
+    // verification, so that is the half we honor.
+    assert_unreachable_with_verification(Some("ALL")).await;
+}
+
+#[tokio::test]
+async fn test_verification_does_not_disturb_ordinary_ciphers() {
+    // Excluding the anonymous suites must not cost us anything else: a normal
+    // server with a certificate the client trusts is still reachable. The CA
+    // here is the test harness's own, handed to the client explicitly.
+    let server = TlsTestServer::start(TlsServerConfig {
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = RequestConfig::new(server.url());
+    config.verify_certs = Some(false);
+    config.cipher_string = Some("ALL:!aNULL".to_string());
+    config.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_ok(),
+        "excluding anonymous suites should leave ordinary ones alone: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_unreachable_when_verifying_on_direct_path() {
+    // The pooled connector and `connect_stream` build their TLS contexts
+    // separately, and only the second one is used once `resolve_ip` is set.
+    // Both have to exclude the anonymous suites, so cover the other path.
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("ADH-AES128-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = RequestConfig::new(server.url());
+    config.verify_certs = Some(true);
+    config.resolve_ip = Some("127.0.0.1".to_string());
+    config.timeout_seconds = Some(5);
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_err(),
+        "the direct path must exclude anonymous suites too, but got status {:?}",
+        result.as_ref().ok().map(|r| r.status)
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_reachable_on_direct_path_without_verification() {
+    // ...and with verification off, that same path still reaches it. This is
+    // the half that must not change.
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("ADH-AES128-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = default_config(&server.url());
+    config.resolve_ip = Some("127.0.0.1".to_string());
+
+    let client = HyperClient::new();
+    let result = client.send(&config).await;
+
+    assert!(
+        result.is_ok(),
+        "verification is off, so the direct path should still reach an \
+         anonymous-DH server: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}

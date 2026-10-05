@@ -7,6 +7,7 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read;
@@ -70,13 +71,47 @@ fn sanitize_uri(url: &str) -> String {
 /// OpenSSL.
 ///
 /// `ALL` is every suite the build provides except the eNULL (no encryption)
-/// ones. It does include the aNULL suites, which skip authentication: those
-/// are worth reaching for a scanner, and this client already defaults to not
-/// verifying certificates, so they give up nothing that was being enforced.
-/// Null *encryption* stays opt-in through `cipher_string`, because negotiating
-/// it by default would hand back a connection that looks like TLS and encrypts
-/// nothing.
+/// ones. Null *encryption* stays opt-in through `cipher_string`, because
+/// negotiating it by default would hand back a connection that looks like TLS
+/// and encrypts nothing.
+///
+/// `ALL` does include the aNULL suites, which carry no certificate at all.
+/// Those are worth reaching when nobody asked us to check identities, which is
+/// this client's default. They must not be offered once somebody has, and that
+/// is what [`verified_cipher_list`] is for.
 const DEFAULT_CIPHER_LIST: &str = "ALL";
+
+/// The cipher list to offer, given what the caller asked for.
+///
+/// Certificate verification is off by default here, and while it is off the
+/// anonymous suites cost nothing: there is no identity being checked for them
+/// to slip past. Turning verification on changes that. An anonymous suite
+/// sends no certificate, and OpenSSL ignores verify-peer when no certificate
+/// arrives, so the handshake succeeds, the verify result reads OK, and the
+/// hostname check attached to it never runs. Anyone in the path can answer
+/// with an anonymous suite and be believed. Offering them would quietly cancel
+/// the setting instead of honoring it.
+///
+/// So when verification is on, `!aNULL` goes on the end of whatever list is in
+/// effect, including one the caller named. Two settings are in conflict there
+/// and this resolves it toward checking identities, because the alternative is
+/// to skip the check without saying so. Reaching anonymous suites is still a
+/// matter of leaving verification off, which is the honest way to ask.
+///
+/// Nothing else needs excluding. PSK and SRP are the only other suites that
+/// finish without a certificate, and both need a secret this client never
+/// configures, so neither can complete.
+fn verified_cipher_list(config: &RequestConfig) -> Cow<'_, str> {
+    let base = config
+        .cipher_string
+        .as_deref()
+        .unwrap_or(DEFAULT_CIPHER_LIST);
+    if config.should_verify_certs() {
+        Cow::Owned(format!("{}:!aNULL", base))
+    } else {
+        Cow::Borrowed(base)
+    }
+}
 
 // Load the OpenSSL legacy provider once (for RC4, DES, etc.).
 // The provider is statically compiled into libcrypto via `no-module` build flag.
@@ -374,12 +409,9 @@ impl OpenSslConnector {
             load_system_ca_certs(&mut builder)?;
         }
 
-        let ciphers = config
-            .cipher_string
-            .as_deref()
-            .unwrap_or(DEFAULT_CIPHER_LIST);
+        let ciphers = verified_cipher_list(config);
         builder
-            .set_cipher_list(ciphers)
+            .set_cipher_list(&ciphers)
             .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
 
         if let Some(ref min_ver) = config.min_tls_version {
@@ -1008,12 +1040,9 @@ pub(crate) async fn connect_stream(
     } else {
         load_system_ca_certs(&mut ssl_builder)?;
     }
-    let ciphers = config
-        .cipher_string
-        .as_deref()
-        .unwrap_or(DEFAULT_CIPHER_LIST);
+    let ciphers = verified_cipher_list(config);
     ssl_builder
-        .set_cipher_list(ciphers)
+        .set_cipher_list(&ciphers)
         .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
     if let Some(ref min_ver) = config.min_tls_version {
         let version = parse_tls_version(min_ver)?;
@@ -2979,5 +3008,60 @@ mod tests {
         let (out, cut) = read_body(body, NO_LIMIT).await.unwrap();
         assert_eq!(out, SAMPLE);
         assert!(!cut);
+    }
+
+    // ── verified_cipher_list ──────────────────────────────────────
+
+    fn cfg_with(verify: Option<bool>, ciphers: Option<&str>) -> RequestConfig {
+        let mut c = RequestConfig::new("https://example.com".to_string());
+        c.verify_certs = verify;
+        c.cipher_string = ciphers.map(str::to_string);
+        c
+    }
+
+    #[test]
+    fn default_offers_everything_including_anonymous_suites() {
+        // The default path has to stay exactly as it was: `ALL`, untouched.
+        assert_eq!(verified_cipher_list(&cfg_with(None, None)), "ALL");
+        assert_eq!(verified_cipher_list(&cfg_with(Some(false), None)), "ALL");
+    }
+
+    #[test]
+    fn default_path_passes_a_caller_list_through_unchanged() {
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(false), Some("RC4-SHA"))),
+            "RC4-SHA"
+        );
+    }
+
+    #[test]
+    fn verifying_drops_the_anonymous_suites() {
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(true), None)),
+            "ALL:!aNULL"
+        );
+    }
+
+    #[test]
+    fn verifying_drops_them_from_a_caller_list_too() {
+        // Otherwise `verify_certs` plus an explicit list is a way back to a
+        // handshake with no certificate in it.
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(true), Some("ALL"))),
+            "ALL:!aNULL"
+        );
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(true), Some("ADH-AES128-SHA"))),
+            "ADH-AES128-SHA:!aNULL"
+        );
+    }
+
+    #[test]
+    fn default_path_allocates_nothing() {
+        // Borrowed when off, owned only when verifying.
+        assert!(matches!(
+            verified_cipher_list(&cfg_with(Some(false), None)),
+            Cow::Borrowed(_)
+        ));
     }
 }
