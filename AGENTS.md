@@ -1,0 +1,47 @@
+# AGENTS.md
+
+Offensive-first HTTP library in Rust with Python bindings via maturin. Built for BBOT.
+
+## Toolchain
+
+| Concern | This repository |
+|---|---|
+| Language | Rust, edition in Cargo.toml. Python bindings, `requires-python` in pyproject.toml |
+| Package manager | cargo. Python side via pip and maturin, see Setup |
+| Lint and format | clippy and rustfmt, channel in rust-toolchain.toml. ruff, version in the `dev` group of pyproject.toml |
+| Tests | cargo test, pytest (`testpaths` in pyproject.toml) |
+
+## Setup
+
+uv does not manage this project (`[tool.uv] managed = false`), and openssl-sys links the weak-cipher OpenSSL that `.cargo/config.toml` points at.
+
+```bash
+./scripts/build-openssl.sh
+python -m venv .venv && . .venv/bin/activate
+pip install --upgrade pip maturin && pip install --group dev
+maturin develop
+```
+
+## Tests
+
+```bash
+cargo test
+pytest
+```
+
+## Standards
+
+Org-wide, in [blacklanternsecurity/.github/standards](https://github.com/blacklanternsecurity/.github/tree/main/standards). Read the one your task touches, not all of them.
+
+| Document | Read it when |
+|---|---|
+| [principles.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/principles.md) | Always |
+| [toolchain.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/toolchain.md) | Touching dependencies, linting, formatting, or language versions |
+| [git.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/git.md) | Branching, commit messages, opening or reviewing a pull request |
+| [rfc.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/rfc.md) | A change needs agreement before work starts, or an RFC is ending |
+| [testing.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/testing.md) | Writing or changing tests, or anything that has them |
+| [ci.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/ci.md) | Touching a workflow, an action pin, or a permissions block |
+| [releases.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/releases.md) | Versioning, tagging, or publishing |
+| [repository-setup.md](https://github.com/blacklanternsecurity/.github/blob/main/standards/repository-setup.md) | Creating a repository, or auditing one |
+
+Never restate a standard here. If this file and a standard disagree, the standard wins and this file is the bug.
