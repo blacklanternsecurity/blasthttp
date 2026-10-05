@@ -288,3 +288,33 @@ fn test_a_bare_403_is_not_evidence_of_protection() {
     assert_eq!(outcome, Outcome::Blocked(Vendor::Unknown));
     assert!(!outcome.indicates_protection());
 }
+
+#[test]
+fn test_a_body_cut_mid_character_does_not_panic() {
+    // `max_body_size` cuts the body at a byte count, so the last character can
+    // be left half-written. The classifier scans a 64 KiB window from the top,
+    // and slicing a str at a byte that is not a character boundary panics
+    // rather than erring, which took the whole request down.
+    let h = hdrs(&[("server", "nginx")]);
+
+    // One single-byte character, then two-byte ones, puts every boundary on an
+    // odd offset. The window ends at 65536, which is therefore inside a
+    // character rather than between two.
+    let body = format!("a{}", "\u{5ae}".repeat(40_000));
+    assert!(body.len() > 65_536);
+    assert!(!body.is_char_boundary(65_536));
+
+    let outcome = classify(&facts(200, &h, &body));
+    assert_eq!(outcome, Outcome::Ok);
+}
+
+#[test]
+fn test_a_marker_in_a_multibyte_body_is_still_found() {
+    // Walking back to a boundary must not cost us the match itself.
+    let h = hdrs(&[("server", "cloudflare")]);
+    let body = format!("{}window._cf_chl_opt", "\u{5ae}".repeat(10));
+    assert_eq!(
+        classify(&facts(403, &h, &body)),
+        Outcome::Challenge(Vendor::Cloudflare)
+    );
+}

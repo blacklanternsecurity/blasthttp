@@ -149,7 +149,14 @@ impl ResponseFacts<'_> {
     fn body_contains(&self, needle: &str) -> bool {
         // Bodies can be large; a challenge marker is always near the top.
         const WINDOW: usize = 64 * 1024;
-        let end = self.body.len().min(WINDOW);
+        let mut end = self.body.len().min(WINDOW);
+        // The cut can land in the middle of a multi-byte character, and
+        // slicing a str there panics rather than erring. A body truncated by
+        // max_body_size puts arbitrary bytes at the cap, so this is reachable
+        // from the wire. Walk back to the nearest boundary.
+        while end > 0 && !self.body.is_char_boundary(end) {
+            end -= 1;
+        }
         self.body[..end].contains(needle)
     }
 }

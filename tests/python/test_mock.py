@@ -405,12 +405,7 @@ async def test_passthrough_forwards_the_kwargs_it_ignores():
         while (line := await reader.readuntil(b"\r\n")) != b"\r\n":
             received.append(line.decode("latin1").rstrip("\r\n"))
         body = "\n".join(received).encode()
-        writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Length: "
-            + str(len(body)).encode()
-            + b"\r\n\r\n"
-            + body
-        )
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         await writer.drain()
         writer.close()
 
