@@ -30,7 +30,7 @@ thiserror = "2"
 
 # HTTP - our single-stack foundation
 hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "http2", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 
@@ -79,3 +79,6 @@ tokio-test = "0.4"
 # hands those bindings an `SSL *`.
 openssl-sys = "0.9"
 foreign-types-shared = "0.1"
+
+# h2 test server, for checking what the client puts on the wire over HTTP/2
+hyper = { version = "1", features = ["server"] }

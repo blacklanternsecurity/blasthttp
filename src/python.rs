@@ -1557,6 +1557,8 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     alpn_protocols: Option<Vec<String>>,
     #[pyo3(get, set)]
+    max_body_size: Option<usize>,
+    #[pyo3(get, set)]
     verify_certs: Option<bool>,
     #[pyo3(get, set)]
     proxy: Option<String>,
@@ -1611,6 +1613,7 @@ impl PyBatchConfig {
         request_target=None,
         resolve_ip=None,
         alpn_protocols=None,
+        max_body_size=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1637,6 +1640,7 @@ impl PyBatchConfig {
         request_target: Option<String>,
         resolve_ip: Option<String>,
         alpn_protocols: Option<Vec<String>>,
+        max_body_size: Option<usize>,
     ) -> Self {
         PyBatchConfig {
             url,
@@ -1662,6 +1666,7 @@ impl PyBatchConfig {
             request_target,
             resolve_ip,
             alpn_protocols,
+            max_body_size,
         }
     }
 }
@@ -1692,6 +1697,7 @@ impl Clone for PyBatchConfig {
             request_target: self.request_target.clone(),
             resolve_ip: self.resolve_ip.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
+            max_body_size: self.max_body_size,
         })
     }
 }
@@ -1707,7 +1713,7 @@ impl PyBatchConfig {
             headers,
             body: body_bytes,
             timeout_seconds: self.timeout,
-            max_body_size: None,
+            max_body_size: self.max_body_size,
             follow_redirects: self.follow_redirects,
             max_redirects: self.max_redirects,
             redirect_cookies: self.redirect_cookies,
