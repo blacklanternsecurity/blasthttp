@@ -1,0 +1,43 @@
+name: Rust Tests
+
+on:
+  push:
+    branches: [stable]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cache OpenSSL build
+        uses: actions/cache@v6
+        with:
+          path: vendor/openssl/install
+          key: openssl-3.3.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-openssl.sh') }}
+
+      - name: Build custom OpenSSL
+        run: ./scripts/build-openssl.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --verbose
