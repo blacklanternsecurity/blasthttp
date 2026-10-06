@@ -32,6 +32,13 @@ pub struct Response {
     /// Debug messages collected during the request (for Python-side inspection)
     #[serde(skip_serializing)]
     pub debug_log: Vec<String>,
+    /// What the profile ladder tried on the final hop, in order.
+    ///
+    /// Usually one entry. More than one means the first approach did not work
+    /// and the client moved, which is worth knowing even on success: it says
+    /// this host needs something other than the default.
+    #[serde(default)]
+    pub attempts: Vec<crate::report::Attempt>,
     /// Why `body_bytes` is not decoded content, when it isn't.
     ///
     /// `None` on any ordinary response, including one with no
@@ -79,7 +86,7 @@ impl Serialize for Response {
     /// callers that just want lazy memory behavior should access
     /// fields directly instead of serializing.
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut out = s.serialize_struct("Response", 13)?;
+        let mut out = s.serialize_struct("Response", 14)?;
         out.serialize_field("url", &self.url)?;
         out.serialize_field("status", &self.status)?;
         out.serialize_field("headers", &self.headers)?;
@@ -89,6 +96,7 @@ impl Serialize for Response {
         out.serialize_field("hash", self.hash())?;
         out.serialize_field("elapsed_ms", &self.elapsed_ms)?;
         out.serialize_field("redirect_chain", &self.redirect_chain)?;
+        out.serialize_field("attempts", &self.attempts)?;
         if let Some(ref c) = self.cert_info {
             out.serialize_field("cert_info", c)?;
         } else {
@@ -121,6 +129,7 @@ impl Clone for Response {
             status: self.status,
             headers: self.headers.clone(),
             body_bytes: self.body_bytes.clone(),
+            attempts: self.attempts.clone(),
             elapsed_ms: self.elapsed_ms,
             redirect_chain: self.redirect_chain.clone(),
             cert_info: self.cert_info.clone(),
@@ -147,6 +156,33 @@ impl Response {
 
     /// Body decoded as UTF-8 (lossy — invalid sequences become U+FFFD).
     /// Computed on first access and cached.
+    /// What, if anything, a bot-management product did to this request.
+    ///
+    /// Computed from the response rather than stored, so it stays correct if a
+    /// caller builds a `Response` by hand. Cheap: the classifier reads headers,
+    /// cookies, status and at most the first 64 KB of the body.
+    ///
+    /// The distinction worth acting on is `Challenge`. A blocked request might
+    /// succeed with different connection settings; a challenge will not,
+    /// because answering it means executing the page's JavaScript. That is the
+    /// signal to hand the URL to a real browser instead of retrying.
+    /// What this request amounts to, as a single verdict.
+    ///
+    /// `Conclusion::NeedsBrowser` is the one to branch on: it means a
+    /// JavaScript challenge, which no HTTP client passes, so the URL should go
+    /// to a real browser rather than be retried.
+    pub fn conclusion(&self) -> crate::report::Conclusion {
+        crate::report::Conclusion::from_attempts(&self.protection(), &self.attempts)
+    }
+
+    pub fn protection(&self) -> crate::antibot::Outcome {
+        crate::antibot::classify(&crate::antibot::ResponseFacts {
+            status: self.status,
+            headers: &self.headers,
+            body: self.body(),
+        })
+    }
+
     pub fn body(&self) -> &str {
         self.body_cache
             .get_or_init(|| match std::str::from_utf8(&self.body_bytes) {
@@ -450,5 +486,73 @@ mod tests {
         ];
         let cookies = parse_set_cookies(&headers);
         assert!(cookies.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+    use crate::antibot::{Outcome, Vendor};
+
+    fn response_with(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
+        Response {
+            url: "https://example.com/".to_string(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body_bytes: body.as_bytes().to_vec(),
+            attempts: Vec::new(),
+            elapsed_ms: 1,
+            redirect_chain: Vec::new(),
+            cert_info: None,
+            peer_ip: None,
+            request_url: "https://example.com/".to_string(),
+            request_method: "GET".to_string(),
+            debug_log: Vec::new(),
+            decode_error: None,
+            body_cache: OnceLock::new(),
+            raw_headers_cache: OnceLock::new(),
+            cookies_cache: OnceLock::new(),
+            hash_cache: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn test_response_classifies_itself() {
+        // The classifier is only useful if a caller can reach it from the
+        // response it already has. This is the path BBOT takes.
+        //
+        // Headers are the ones www.akamai.com actually returns, which notably
+        // include no `server` header at all.
+        let blocked = response_with(
+            403,
+            &[
+                ("akamai-grn", "0.6d551702.1790644996.315f62a4"),
+                ("content-type", "text/html"),
+            ],
+            "<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD></HTML>",
+        );
+        assert_eq!(blocked.protection(), Outcome::Blocked(Vendor::Akamai));
+    }
+
+    #[test]
+    fn test_challenge_is_distinguishable_from_a_block() {
+        // The distinction the whole escalation path rests on: a block might
+        // succeed with different settings, a challenge never will.
+        let challenge = response_with(
+            403,
+            &[("cf-mitigated", "challenge"), ("server", "cloudflare")],
+            "<html>Just a moment...</html>",
+        );
+        assert_eq!(
+            challenge.protection(),
+            Outcome::Challenge(Vendor::Cloudflare)
+        );
+
+        let ordinary = response_with(200, &[("server", "nginx")], "<html>hello</html>");
+        assert_eq!(ordinary.protection(), Outcome::Ok);
+        assert!(ordinary.protection().got_through());
     }
 }

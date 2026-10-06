@@ -136,6 +136,276 @@ fn merge_limiters(
     }
 }
 
+// ── Host discovery scheduler ──────────────────────────────────────
+
+/// Stops a burst of requests to one host from each separately working out
+/// which connection profile that host wants.
+///
+/// The problem. The client remembers, per host, the profile that got through,
+/// so a scan pays for the ladder once rather than once per request. At the
+/// start of a batch that has not been paid yet: if fifty requests to one host
+/// go out together, all fifty find the default refused and all fifty shift,
+/// a hundred handshakes where fifty one would have done.
+///
+/// What does not work, and this was built and measured before being thrown
+/// away: a per-host lock, so the first request discovers and the rest wait on
+/// it. It does cut the handshakes, and it is slower anyway, because a waiter
+/// cannot be released until the leader has classified its response,
+/// classification needs the body, and so the wait is a whole request long. A
+/// protection product does not refuse the handshake; it takes the connection
+/// and then answers 403, which puts the one fact worth knowing in the last
+/// byte to arrive. Waiting also broke the rule that a slow request never
+/// holds up faster ones behind it, which is the entire promise of
+/// `send_batch_stream`.
+///
+/// What works instead is to not wait. A request whose host is already being
+/// worked out steps aside and lets a request for a *different* host have its
+/// slot, then goes once there is an answer. Nothing idles, so the saving
+/// costs no time.
+///
+/// The condition is the whole design, and it comes straight from the test
+/// that killed the lock: six requests, one host, concurrency six. Step aside
+/// there and you are standing in the street, because every other request
+/// wants the same host. So: **only step aside when there is undispatched work
+/// for a different host.** When there is not, go and discover it yourself and
+/// accept the duplicate. That makes this strictly better or equal to having
+/// no scheduler at all, never worse, which is what the lock failed to be.
+struct HostGate {
+    /// Someone is making the first request to this host, so an answer is
+    /// coming.
+    claimed: bool,
+    /// Flips once a request to this host finishes. A `watch` rather than a
+    /// `Notify` because the answer can land between a waiter reading the
+    /// state and awaiting on it, and a watch carries the value so that
+    /// waiter sees it instead of sleeping until its timeout.
+    answered: tokio::sync::watch::Sender<bool>,
+}
+
+struct SchedulerState {
+    gates: std::collections::HashMap<String, HostGate>,
+    /// Requests not yet dispatched, in total and per host. Together these
+    /// answer the only question the scheduler asks: is there work for a
+    /// different host that could use the slot I would otherwise sit in?
+    remaining_total: usize,
+    remaining_by_host: std::collections::HashMap<String, usize>,
+    /// How many requests are standing aside right now, and the ceiling on
+    /// that.
+    ///
+    /// The ceiling is about *spawning*, so the two callers want different
+    /// numbers and passing one for both was a mistake worth recording.
+    ///
+    /// The stream driver takes a permit before it spawns, which is how it
+    /// keeps a million-URL batch from being resident all at once. A request
+    /// that stands aside hands that permit straight back, so the driver
+    /// spawns another, which may also stand aside, and so on: a batch
+    /// alternating between two slow hosts would spawn the lot. There the
+    /// ceiling is the concurrency limit and it is load-bearing.
+    ///
+    /// `send_batch` spawns every task up front regardless. Standing aside
+    /// creates nothing, so a ceiling protects nothing, and setting one only
+    /// throws the benefit away: measured over a grid of batch shapes, the
+    /// duplicate handshakes went to zero exactly when the ceiling was not
+    /// binding and were left completely untouched when it was. There the
+    /// limit is the batch size, which is to say no limit at all.
+    aside: usize,
+    aside_limit: usize,
+}
+
+pub(crate) struct Scheduler {
+    state: std::sync::Mutex<SchedulerState>,
+}
+
+/// What a request should do about its host.
+pub(crate) enum Dispatch {
+    /// Go, and you are the one discovering this host. Hold the guard for the
+    /// request.
+    Lead(LeaderGuard),
+    /// Go. Either the host is already answered, or there was nothing else to
+    /// do with the slot so discovering it twice is the cheaper mistake.
+    Go,
+    /// Stand aside until this says true, then ask again.
+    Aside(tokio::sync::watch::Receiver<bool>, AsideGuard),
+}
+
+/// Held for the duration of the first request to a host. Marks the host
+/// answered when dropped, so a request that fails, times out or panics
+/// releases whoever stepped aside for it instead of leaving them on the
+/// timeout.
+pub(crate) struct LeaderGuard {
+    sched: Arc<Scheduler>,
+    host: String,
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.sched.state.lock()
+            && let Some(gate) = st.gates.get_mut(&self.host)
+        {
+            // `send` refuses when nothing is subscribed and leaves the value
+            // alone, which is the common case here: usually the leader
+            // finishes with nobody yet standing aside. The answer would then
+            // be lost, and the next request to this host would stand aside
+            // waiting for news that had already been and gone.
+            gate.answered.send_replace(true);
+        }
+    }
+}
+
+/// Held while a request stands aside, so the ceiling is released however the
+/// wait ends.
+pub(crate) struct AsideGuard {
+    sched: Arc<Scheduler>,
+}
+
+impl Drop for AsideGuard {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.sched.state.lock() {
+            st.aside = st.aside.saturating_sub(1);
+        }
+    }
+}
+
+/// Host and port, matching how the client keys its per-host profile memory.
+/// A URL that will not parse gets a bucket under its own text, which just
+/// means it coordinates with nothing.
+fn host_key(url: &str) -> String {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return url.to_string();
+    };
+    match uri.host() {
+        Some(h) => {
+            let default_port = if uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            };
+            format!("{}:{}", h, uri.port_u16().unwrap_or(default_port))
+        }
+        None => url.to_string(),
+    }
+}
+
+impl Scheduler {
+    /// `aside_limit` is how many requests may stand aside at once. See the
+    /// field: the stream driver needs the concurrency limit, `send_batch`
+    /// needs no limit and passes the batch size.
+    fn new(configs: &[RequestConfig], aside_limit: usize) -> Arc<Self> {
+        let mut remaining_by_host: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for c in configs {
+            *remaining_by_host.entry(host_key(&c.url)).or_insert(0) += 1;
+        }
+        Arc::new(Scheduler {
+            state: std::sync::Mutex::new(SchedulerState {
+                gates: std::collections::HashMap::new(),
+                remaining_total: configs.len(),
+                remaining_by_host,
+                aside: 0,
+                aside_limit: aside_limit.max(1),
+            }),
+        })
+    }
+
+    /// Decide and commit in one lock, because deciding and then committing
+    /// separately lets two requests both look, both see no one discovering,
+    /// and both go: the duplicate this exists to prevent.
+    ///
+    /// `may_stand_aside` is false on the second ask, after a wait, so a
+    /// request stands aside at most once and cannot be starved by a host
+    /// that keeps being re-claimed.
+    fn dispatch(self: &Arc<Self>, host: &str, may_stand_aside: bool) -> Dispatch {
+        let Ok(mut st) = self.state.lock() else {
+            return Dispatch::Go;
+        };
+
+        if may_stand_aside && st.aside < st.aside_limit {
+            let busy = st
+                .gates
+                .get(host)
+                .is_some_and(|g| g.claimed && !*g.answered.borrow());
+            let mine = st.remaining_by_host.get(host).copied().unwrap_or(0);
+            let elsewhere = st.remaining_total.saturating_sub(mine) > 0;
+            if busy && elsewhere {
+                let rx = st.gates[host].answered.subscribe();
+                st.aside += 1;
+                return Dispatch::Aside(
+                    rx,
+                    AsideGuard {
+                        sched: self.clone(),
+                    },
+                );
+            }
+        }
+
+        // Going, so take the slot.
+        st.remaining_total = st.remaining_total.saturating_sub(1);
+        if let Some(n) = st.remaining_by_host.get_mut(host) {
+            *n = n.saturating_sub(1);
+        }
+        let gate = st
+            .gates
+            .entry(host.to_string())
+            .or_insert_with(|| HostGate {
+                claimed: false,
+                answered: tokio::sync::watch::Sender::new(false),
+            });
+        if gate.claimed || *gate.answered.borrow() {
+            return Dispatch::Go;
+        }
+        gate.claimed = true;
+        Dispatch::Lead(LeaderGuard {
+            sched: self.clone(),
+            host: host.to_string(),
+        })
+    }
+}
+
+/// How long a request stands aside before giving up and going anyway.
+///
+/// Only a backstop. The leader's guard releases waiters the moment its
+/// request ends, errors included, so this fires when a leader is wedged in a
+/// way its own timeout did not catch. Sized off the request timeout, since a
+/// leader cannot legitimately outlive that.
+fn step_aside_limit(config: &RequestConfig) -> Duration {
+    Duration::from_secs(config.timeout().clamp(1, 60))
+}
+
+/// Stand aside if asked to, then report whether this request is the one
+/// discovering its host.
+///
+/// Takes the caller's concurrency permit, if it is already holding one, and
+/// gives it back only if it never stood aside. The two callers differ on
+/// exactly this: `send_batch` has not taken a permit yet and passes `None`,
+/// while the stream driver hands one over with the request and needs it
+/// released for the wait, since a request standing aside is not in flight
+/// and holding a slot as though it were is the lock all over again.
+async fn await_turn(
+    sched: &Arc<Scheduler>,
+    host: &str,
+    config: &RequestConfig,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> (
+    Option<LeaderGuard>,
+    Option<tokio::sync::OwnedSemaphorePermit>,
+) {
+    match sched.dispatch(host, true) {
+        Dispatch::Lead(g) => (Some(g), permit),
+        Dispatch::Go => (None, permit),
+        Dispatch::Aside(mut rx, aside) => {
+            drop(permit);
+            if !*rx.borrow() {
+                let _ = tokio::time::timeout(step_aside_limit(config), rx.changed()).await;
+            }
+            drop(aside);
+            let lead = match sched.dispatch(host, false) {
+                Dispatch::Lead(g) => Some(g),
+                _ => None,
+            };
+            (lead, None)
+        }
+    }
+}
+
 pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
     client: Arc<C>,
     configs: Vec<RequestConfig>,
@@ -145,6 +415,9 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
 ) -> Vec<BatchResult> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let limiter = merge_limiters(shared_limiter, rate_limit);
+    // No ceiling here: the tasks all exist either way, so standing aside
+    // costs nothing that going would not have cost anyway.
+    let sched = Scheduler::new(&configs, configs.len());
     let mut handles = Vec::new();
 
     for config in configs {
@@ -156,8 +429,15 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
         let client = client.clone();
         let permit = semaphore.clone();
         let url = config.url.clone();
+        let sched = sched.clone();
 
         let handle = tokio::spawn(async move {
+            // Stand aside before taking a permit rather than after, so the
+            // slot is genuinely free while we are standing there. Waiting
+            // with a permit in hand would be the lock this replaces.
+            let host = host_key(&config.url);
+            let (_lead, _) = await_turn(&sched, &host, &config, None).await;
+
             let _permit = permit.acquire().await.unwrap();
             let result = client.send(&config).await;
             BatchResult { url, result }
@@ -217,6 +497,9 @@ pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
 ) -> impl Stream<Item = BatchResult> + Send + 'static {
     let limiter = merge_limiters(shared_limiter, rate_limit);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    // Ceiling here, because this driver spawns lazily and a request that
+    // stands aside gives its permit back for the driver to spawn against.
+    let sched = Scheduler::new(&configs, concurrency);
 
     stream::once(async move {
         let (tx, rx) = futures::channel::mpsc::unbounded::<BatchResult>();
@@ -232,7 +515,22 @@ pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
                 };
                 let client = client.clone();
                 let tx = tx.clone();
+                let sched = sched.clone();
+                let semaphore = semaphore.clone();
                 tokio::spawn(async move {
+                    let host = host_key(&config.url);
+                    // The driver holds the permit here, unlike `send_batch`,
+                    // so standing aside means handing it back. The driver is
+                    // parked on the next acquire and takes it immediately,
+                    // which is what sends the slot to another host. Dispatch
+                    // order is untouched; only this one request is late.
+                    let (_lead, permit) = await_turn(&sched, &host, &config, Some(permit)).await;
+                    // Re-take a slot only if we gave ours up.
+                    let permit = match permit {
+                        Some(p) => Some(p),
+                        None => semaphore.acquire_owned().await.ok(),
+                    };
+
                     let _permit = permit;
                     let url = config.url.clone();
                     let result = client.send(&config).await;
@@ -646,5 +944,191 @@ mod tests {
             unlimited_elapsed,
             overhead,
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    fn cfgs(urls: &[&str]) -> Vec<RequestConfig> {
+        urls.iter()
+            .map(|u| RequestConfig::new(u.to_string()))
+            .collect()
+    }
+
+    fn is_aside(d: &Dispatch) -> bool {
+        matches!(d, Dispatch::Aside(..))
+    }
+
+    #[test]
+    fn test_one_host_never_stands_aside() {
+        // The case that killed the previous attempt, as a unit test. Six
+        // requests to one host: standing aside means standing in the street,
+        // because there is no other host to hand the slot to. Every one of
+        // them has to go, even though that means discovering the host six
+        // times over.
+        let sched = Scheduler::new(&cfgs(&["https://a.test/"; 6]), 6);
+        let host = host_key("https://a.test/");
+
+        let first = sched.dispatch(&host, true);
+        assert!(matches!(first, Dispatch::Lead(_)), "first one leads");
+
+        for i in 0..5 {
+            let d = sched.dispatch(&host, true);
+            assert!(!is_aside(&d), "request {i} should have gone, not waited");
+        }
+    }
+
+    #[test]
+    fn test_another_host_waiting_is_what_makes_it_worth_stepping_aside() {
+        // Same shape, one difference: there is work for a different host, so
+        // the slot this request would have sat in has somewhere to go.
+        let sched = Scheduler::new(
+            &cfgs(&["https://a.test/", "https://a.test/", "https://b.test/"]),
+            4,
+        );
+        let a = host_key("https://a.test/");
+
+        // Bound, not matched in place: the guard marks the host answered when
+        // it drops, so letting it die at the end of the statement would mean
+        // the discovering request had already finished.
+        let lead = sched.dispatch(&a, true);
+        assert!(matches!(lead, Dispatch::Lead(_)));
+        assert!(
+            is_aside(&sched.dispatch(&a, true)),
+            "b.test is still queued"
+        );
+    }
+
+    #[test]
+    fn test_the_second_ask_always_goes() {
+        // After standing aside once a request goes regardless, so a host that
+        // keeps being re-claimed cannot starve the requests behind it.
+        let sched = Scheduler::new(
+            &cfgs(&["https://a.test/", "https://a.test/", "https://b.test/"]),
+            4,
+        );
+        let a = host_key("https://a.test/");
+
+        let _lead = sched.dispatch(&a, true);
+        assert!(is_aside(&sched.dispatch(&a, true)));
+        assert!(!is_aside(&sched.dispatch(&a, false)), "the second ask goes");
+    }
+
+    #[test]
+    fn test_an_answered_host_is_not_worth_waiting_for() {
+        let configs = cfgs(&["https://a.test/", "https://a.test/", "https://b.test/"]);
+        let sched = Scheduler::new(&configs, 4);
+        let a = host_key("https://a.test/");
+
+        let lead = sched.dispatch(&a, true);
+        assert!(matches!(lead, Dispatch::Lead(_)));
+        drop(lead); // the discovering request finished
+
+        assert!(
+            !is_aside(&sched.dispatch(&a, true)),
+            "there is an answer now, so nothing to wait for"
+        );
+    }
+
+    #[test]
+    fn test_a_leader_that_dies_releases_the_host() {
+        // The guard marks the host answered on drop rather than on success,
+        // so a request that errors or panics does not leave everyone who
+        // stepped aside for it sitting on the timeout.
+        let configs = cfgs(&["https://a.test/", "https://a.test/", "https://b.test/"]);
+        let sched = Scheduler::new(&configs, 4);
+        let a = host_key("https://a.test/");
+
+        let Dispatch::Lead(lead) = sched.dispatch(&a, true) else {
+            panic!("expected to lead");
+        };
+        let Dispatch::Aside(rx, _guard) = sched.dispatch(&a, true) else {
+            panic!("expected to stand aside");
+        };
+        assert!(!*rx.borrow());
+
+        drop(lead);
+        assert!(
+            *rx.borrow(),
+            "dropping the leader should release the waiter"
+        );
+    }
+
+    #[test]
+    fn test_the_ceiling_bounds_how_many_can_be_standing_aside() {
+        // The stream driver's limit, which is the concurrency one. Without
+        // it, a batch alternating between two slow hosts has the driver spawn
+        // a task, watch it hand the permit straight back, spawn another, and
+        // so on until the whole batch is resident. `send_batch` wants the
+        // opposite and the test above covers that.
+        let mut urls = vec!["https://a.test/"; 10];
+        urls.push("https://b.test/");
+        let sched = Scheduler::new(&cfgs(&urls), 2);
+        let a = host_key("https://a.test/");
+
+        let _lead = sched.dispatch(&a, true);
+        let _one = sched.dispatch(&a, true);
+        let _two = sched.dispatch(&a, true);
+        assert!(
+            is_aside(&_one) && is_aside(&_two),
+            "both fit under a ceiling of 2"
+        );
+        assert!(
+            !is_aside(&sched.dispatch(&a, true)),
+            "the third should go rather than pile up"
+        );
+    }
+
+    #[test]
+    fn test_no_ceiling_lets_a_whole_batch_stand_aside() {
+        // What `send_batch` passes, and why it differs from the stream. Its
+        // tasks are all spawned up front, so standing aside creates nothing
+        // and a ceiling protects nothing. Setting one anyway only throws the
+        // saving away: measured across a grid of batch shapes, a ceiling of
+        // the concurrency limit left the duplicate handshakes completely
+        // untouched wherever a batch was bigger than that limit, which is
+        // every batch worth scheduling.
+        let mut urls = vec!["https://a.test/"; 40];
+        urls.push("https://b.test/");
+        let configs = cfgs(&urls);
+        let sched = Scheduler::new(&configs, configs.len());
+        let a = host_key("https://a.test/");
+
+        let _lead = sched.dispatch(&a, true);
+        let aside: Vec<_> = (0..39).map(|_| sched.dispatch(&a, true)).collect();
+        assert!(
+            aside.iter().all(is_aside),
+            "every one of them should wait for the answer the first is fetching"
+        );
+    }
+
+    #[test]
+    fn test_a_freed_slot_lets_another_stand_aside() {
+        let mut urls = vec!["https://a.test/"; 10];
+        urls.push("https://b.test/");
+        let sched = Scheduler::new(&cfgs(&urls), 1);
+        let a = host_key("https://a.test/");
+
+        let _lead = sched.dispatch(&a, true);
+        let waiting = sched.dispatch(&a, true);
+        assert!(is_aside(&waiting));
+        assert!(!is_aside(&sched.dispatch(&a, true)), "ceiling of 1 is full");
+
+        drop(waiting);
+        assert!(is_aside(&sched.dispatch(&a, true)), "and free again after");
+    }
+
+    #[test]
+    fn test_host_key_ignores_the_path_and_fills_in_the_port() {
+        assert_eq!(
+            host_key("https://a.test/one"),
+            host_key("https://a.test/two")
+        );
+        assert_eq!(host_key("https://a.test/"), "a.test:443");
+        assert_eq!(host_key("http://a.test/"), "a.test:80");
+        assert_eq!(host_key("https://a.test:8443/"), "a.test:8443");
+        assert_ne!(host_key("https://a.test/"), host_key("https://b.test/"));
     }
 }

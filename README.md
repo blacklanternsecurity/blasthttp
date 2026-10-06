@@ -25,7 +25,8 @@ cargo add blasthttp
 - **Batch connection reuse** — connections are pooled and reused within a batch, dramatically reducing overhead when scanning many URLs on the same hosts
 - **Rust performance** — async I/O, zero-copy where possible, and native concurrency give significant speed improvements over pure Python HTTP clients
 - **SSL cert info on every request** — extracts CN, SANs, emails, issuer, validity dates, and fingerprint during the TLS handshake that's already happening, eliminating the need for a separate connection to gather this information
-- **All TLS ciphers available by default** — custom-compiled OpenSSL 3.3.2 with legacy provider baked in (RC4, 3DES, export ciphers, SSLv3) so you can connect to anything
+- **Connection profiles, and automatic shifting between them**: `modern` by default (11 cipher suites, TLS 1.2+), `compatibility` for servers that speak only RC4, 3DES, SEED, Camellia, anonymous DH or SSLv3, and `chrome` to imitate a browser's TLS, HTTP/2 and headers together. A handshake the peer cannot negotiate widens the offer; a refusal from a recognised protection product changes what the client claims to be. What works is remembered per host
+- **Says why it failed**: a blocked request reports which product blocked it, and a JavaScript challenge reports `needs_browser`, because no HTTP client passes that tier and retrying will not change it
 - **No cert validation by default** — offensive-first: connects to self-signed, expired, and misconfigured TLS without extra config
 - **HTTP/2 support** — automatic via ALPN negotiation, falls back to HTTP/1.1
 - **Low-level primitives** — `RawConnection` for byte-level TCP/TLS I/O (bypasses HTTP framing entirely) and `blasthttp.h2` for manual H2 frame construction (includes a permissive HPACK encoder that emits bytes a strict encoder refuses, the building block for H2 smuggling / CRLF-injection tooling)
@@ -115,9 +116,10 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `--verify` | Enable TLS cert validation | off |
 | `-x, --proxy` | HTTP/SOCKS proxy URL | |
 | `--no-proxy` | Host that bypasses the proxy: `host`, `*.suffix`, IP, CIDR, or `*` (repeatable) | |
-| `--ciphers` | OpenSSL cipher string | all |
-| `--min-tls` | Minimum TLS version (1.0–1.3) | |
-| `--max-tls` | Maximum TLS version (1.0–1.3) | |
+| `--profile` | Connection profile: `modern`, `compatibility`, `chrome` | `modern` |
+| `--ciphers` | OpenSSL cipher string | from the profile |
+| `--min-tls` | Minimum TLS version (`3.0` for SSLv3, or 1.0–1.3) | |
+| `--max-tls` | Maximum TLS version (`3.0` for SSLv3, or 1.0–1.3) | |
 | `-v, --verbose` | Verbose output (-vv includes body) | |
 
 ## Python API
@@ -239,9 +241,10 @@ All parameters except `url` are optional:
 | `verify_certs` | `bool` | Enable TLS cert validation (default `False`) |
 | `proxy` | `str` | HTTP/SOCKS proxy URL |
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
-| `cipher_string` | `str` | OpenSSL cipher string |
-| `min_tls_version` | `str` | Minimum TLS version (`"1.0"`–`"1.3"`) |
-| `max_tls_version` | `str` | Maximum TLS version (`"1.0"`–`"1.3"`) |
+| `profile` | `str` | Connection profile: `modern` (default), `compatibility`, `chrome` |
+| `cipher_string` | `str` | OpenSSL cipher string. Overrides the profile's, and pins it so the ladder will not move |
+| `min_tls_version` | `str` | Minimum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
+| `max_tls_version` | `str` | Maximum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
 | `retries` | `int` | Number of retries on failure |
 | `retry_wait_min_ms` | `int` | Minimum backoff between retries (ms) |
 | `retry_wait_max_ms` | `int` | Maximum backoff between retries (ms) |
@@ -296,6 +299,11 @@ r = await client.request(
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
 | `headers` | `list[tuple[str, str]]` | Request headers |
 | `retries` | `int` | Number of retries on failure |
+| `redirect_cookies` | `bool` | Carry `Set-Cookie` across redirect hops |
+| `profile` | `str` | Connection profile, as on `request()` |
+| `cipher_string` | `str` | OpenSSL cipher string |
+| `min_tls_version` | `str` | Minimum TLS version |
+| `max_tls_version` | `str` | Maximum TLS version |
 
 ### DNS Pinning & Request-Line Control
 
@@ -442,7 +450,9 @@ async def main():
 asyncio.run(main())
 ```
 
-`raw_connect()` takes all the same TLS knobs as `request()` — `verify_certs`, `cipher_string`, `min_tls_version`, `max_tls_version`, `resolve_ip`, `proxy`, `no_proxy`. `alpn_protocols` is a list of byte-strings (commonly `["h2", "http/1.1"]`) used in the TLS ALPN extension. After the handshake, `conn.negotiated_alpn` reports which one the server picked (or `None` if no ALPN was negotiated, including all plain-HTTP connections).
+`raw_connect()` takes all the same TLS knobs as `request()` — `verify_certs`, `profile`, `cipher_string`, `min_tls_version`, `max_tls_version`, `resolve_ip`, `proxy`, `no_proxy`. `alpn_protocols` is a list of byte-strings (commonly `["h2", "http/1.1"]`) used in the TLS ALPN extension. After the handshake, `conn.negotiated_alpn` reports which one the server picked (or `None` if no ALPN was negotiated, including all plain-HTTP connections).
+
+`raw_connect`, and requests using `resolve_ip` or `request_target`, widen their cipher offer and retry when a handshake fails in a way that says the peer could not negotiate, the same as an ordinary request. They stop there: the other half of the ladder reacts to a *refusal* by changing what the client claims to be, and these are the callers who asked for exact control over one request, so re-sending it dressed differently would answer a question they did not ask. Naming a `profile`, `cipher_string` or TLS version pins the configuration and nothing widens at all.
 
 `conn.peer_ip` returns the actual IP address the OS connected to, same as `Response.peer_ip`. `None` when the connection went through a proxy.
 
@@ -574,7 +584,9 @@ def http_mock():
 
 ### 1. Build custom OpenSSL
 
-blasthttp ships a script that downloads OpenSSL 3.3.2, compiles it with weak cipher support (`RC4`, `DES`, `3DES`, export ciphers, `SSLv3`), and installs it to `vendor/openssl/install/`. This only needs to be run once — the result is cached and reused.
+blasthttp ships a script that downloads OpenSSL 3.3.2, compiles it with weak cipher support (`RC4`, `DES`, `3DES`, `SEED`) and `SSLv3`, and installs it to `vendor/openssl/install/`. The result is cached, keyed on the OpenSSL version, the target, and the feature flags, so changing any of those triggers a rebuild on the next run.
+
+Export ciphers are the one thing the build cannot provide: OpenSSL removed them outright in 1.1.0, so no build flag brings them back.
 
 ```bash
 ./scripts/build-openssl.sh

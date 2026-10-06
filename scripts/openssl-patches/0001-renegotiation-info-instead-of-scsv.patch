@@ -1,0 +1,67 @@
+Signal renegotiation-info support with the extension, not the SCSV
+
+RFC 5746 section 3.4 lets a client advertise renegotiation-info support on an
+initial ClientHello in either of two ways: the
+TLS_EMPTY_RENEGOTIATION_INFO_SCSV pseudo-cipher (0x00ff), or an empty
+renegotiation_info extension (0xff01).
+
+OpenSSL picks the SCSV. Every browser picks the extension. That one choice
+costs a fingerprint match twice over: it adds a cipher suite nothing else
+sends and omits an extension everything else sends, so both the cipher count
+and the extension set differ from any browser.
+
+The switch is conditioned on the minimum protocol version rather than made
+unconditional, because the SCSV exists for a reason. Pre-RFC5746 servers, the
+very ones that motivated it, can mishandle an unfamiliar extension. So a
+client whose floor is TLS 1.2 is treated as modern and sends the extension,
+while one willing to speak TLS 1.1 or older keeps the SCSV and stock
+behaviour. blasthttp's compatibility path stays byte-identical to unpatched
+OpenSSL; only the impersonation path changes, and it always pins its floor at
+TLS 1.2.
+
+On an initial handshake previous_client_finished_len is zero, so the existing
+WPACKET_sub_memcpy_u8 call already emits the empty renegotiated_connection
+field RFC 5746 requires. No new code is needed to build the body.
+
+--- a/ssl/statem/extensions_clnt.c
++++ b/ssl/statem/extensions_clnt.c
+@@ -16,8 +16,19 @@
+                                           unsigned int context, X509 *x,
+                                           size_t chainidx)
+ {
+-    /* Add RI if renegotiating */
+-    if (!s->renegotiate)
++    /*
++     * Add RI if renegotiating.
++     *
++     * On an initial handshake RFC 5746 3.4 allows either this extension or
++     * the SCSV. Browsers always send the extension, so a client whose floor
++     * is TLS 1.2 does too. One willing to speak older protocols keeps the
++     * SCSV, which is safer against pre-RFC5746 servers that mishandle
++     * unfamiliar extensions. ssl_cipher_list_to_bytes() is gated on the same
++     * condition so exactly one of the two is ever sent.
++     */
++    if (!s->renegotiate
++            && (SSL_CONNECTION_IS_DTLS(s)
++                || s->min_proto_version < TLS1_2_VERSION))
+         return EXT_RETURN_NOT_SENT;
+ 
+     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_renegotiate)
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -4063,9 +4063,14 @@
+ {
+     int i;
+     size_t totlen = 0, len, maxlen, maxverok = 0;
++    /*
++     * Send the SCSV only when the renegotiation_info extension is not being
++     * sent. tls_construct_ctos_renegotiate() is gated on the same version
++     * test, so support is signalled exactly once, one way or the other.
++     */
+     int empty_reneg_info_scsv = !s->renegotiate
+                                 && (SSL_CONNECTION_IS_DTLS(s)
+-                                    || s->min_proto_version < TLS1_3_VERSION);
++                                    || s->min_proto_version < TLS1_2_VERSION);
+     SSL *ssl = SSL_CONNECTION_GET_SSL(s);
+ 
+     /* Set disabled masks for this session */

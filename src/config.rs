@@ -28,6 +28,17 @@ pub struct RequestConfig {
     /// `corp`), single IPs, CIDR ranges (`10.0.0.0/8`), or `*` for all.
     #[serde(default)]
     pub no_proxy: Vec<String>,
+    /// Browser profile to impersonate, e.g. `"chrome"`. Applies a matching
+    /// TLS configuration, HTTP/2 settings and default headers together.
+    ///
+    /// Applied as a unit on purpose. A profile whose layers disagree is worse
+    /// than none: a client claiming to be Chrome whose handshake says
+    /// otherwise has stated something checkably false.
+    ///
+    /// An explicit `cipher_string`, `min_tls_version` or `max_tls_version`
+    /// overrides the profile's value for that field, on the grounds that a
+    /// caller naming something specific means it.
+    pub profile: Option<String>,
     pub cipher_string: Option<String>,
     pub min_tls_version: Option<String>,
     pub max_tls_version: Option<String>,
@@ -70,6 +81,7 @@ impl RequestConfig {
             verify_certs: None,
             proxy: None,
             no_proxy: Vec::new(),
+            profile: None,
             cipher_string: None,
             min_tls_version: None,
             max_tls_version: None,
@@ -81,6 +93,89 @@ impl RequestConfig {
             resolve_ip: None,
             alpn_protocols: None,
             verbosity: 0,
+        }
+    }
+
+    /// The connection profile this request should use.
+    ///
+    /// Infallible, because every request has a profile now: naming none means
+    /// the default rather than "no profile", and the code that applies one no
+    /// longer has an absent case to branch on. An unrecognised name falls back
+    /// to the default here; `validate_profile` is what turns it into an error,
+    /// so a typo is caught once at the edge rather than silently changing
+    /// behaviour deep in the connector.
+    pub fn resolved_profile(&self) -> &'static crate::profile::ConnectionProfile {
+        if let Some(name) = self.profile.as_deref() {
+            return crate::profile::by_name(name)
+                .unwrap_or_else(|_| crate::profile::default_profile());
+        }
+        // Asking for a pre-TLS1.2 floor is asking for the legacy profile,
+        // whether or not the caller said so. The default offers only modern
+        // ciphers, none of which exist in SSLv3 or TLS 1.0, so honouring the
+        // version alone produces "no ciphers available": a request that names
+        // a protocol, and is told that protocol is impossible.
+        //
+        // The ladder cannot rescue this, because naming a version pins the
+        // configuration and pinning is what stops the ladder moving.
+        if self.wants_legacy_protocol() {
+            return crate::profile::by_name("compatibility")
+                .unwrap_or_else(|_| crate::profile::default_profile());
+        }
+        crate::profile::default_profile()
+    }
+
+    /// Did the caller ask to speak something older than TLS 1.2?
+    fn wants_legacy_protocol(&self) -> bool {
+        let is_legacy = |v: &str| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "3.0"
+                    | "ssl3"
+                    | "sslv3"
+                    | "ssl3.0"
+                    | "1.0"
+                    | "tls1.0"
+                    | "tlsv1.0"
+                    | "1.1"
+                    | "tls1.1"
+                    | "tlsv1.1"
+            )
+        };
+        self.min_tls_version.as_deref().is_some_and(is_legacy)
+            || self.max_tls_version.as_deref().is_some_and(is_legacy)
+    }
+
+    /// This config with a different profile selected.
+    ///
+    /// Used by the ladder to retry a hop differently. A clone rather than a
+    /// parameter threaded through the connector because `TlsKey`, and so the
+    /// cached-client lookup, is derived from the config: changing the profile
+    /// anywhere else would key the cache on one profile while building the
+    /// connector from another.
+    pub fn with_profile(&self, name: &str) -> RequestConfig {
+        let mut c = self.clone();
+        c.profile = Some(name.to_string());
+        c
+    }
+
+    /// Whether the caller pinned TLS settings themselves.
+    ///
+    /// When they did, the ladder must not move: naming a cipher string, a TLS
+    /// version or a profile means they meant it, and silently substituting
+    /// another profile would send something they did not ask for.
+    /// `tests/tls_integration.rs` depends on this.
+    pub fn tls_is_pinned(&self) -> bool {
+        self.profile.is_some()
+            || self.cipher_string.is_some()
+            || self.min_tls_version.is_some()
+            || self.max_tls_version.is_some()
+    }
+
+    /// Reject an unknown profile name.
+    pub fn validate_profile(&self) -> Result<(), String> {
+        match self.profile.as_deref() {
+            Some(name) => crate::profile::by_name(name).map(|_| ()),
+            None => Ok(()),
         }
     }
 
