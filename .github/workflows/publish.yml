@@ -30,6 +30,7 @@ jobs:
       # scripts/build-openssl.sh builds on Linux only.
       targets: '{"linux": ["x86_64", "x86", "aarch64", "armv7", "s390x", "ppc64le"], "musllinux": ["x86_64", "x86", "aarch64", "armv7"]}'
       before-script-linux: scripts/wheel-container-setup.sh
+      env: '{"PYO3_USE_ABI3_FORWARD_COMPATIBILITY": "1"}'
 
   crates:
     needs: wheels
