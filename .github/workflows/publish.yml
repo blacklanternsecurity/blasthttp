@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   check:
-    uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@e532142ee9e7322888f6edc80d9a89e2f8c0d96d # feat/shared-workflows
+    uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
 
   tests:
     needs: check
@@ -25,7 +25,7 @@ jobs:
 
   wheels:
     needs: [tests, rust-tests]
-    uses: blacklanternsecurity/CLA/.github/workflows/maturin-wheels.yml@e532142ee9e7322888f6edc80d9a89e2f8c0d96d # feat/shared-workflows
+    uses: blacklanternsecurity/CLA/.github/workflows/maturin-wheels.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
     with:
       # scripts/build-openssl.sh builds on Linux only.
       targets: '{"linux": ["x86_64", "x86", "aarch64", "armv7", "s390x", "ppc64le"], "musllinux": ["x86_64", "x86", "aarch64", "armv7"]}'
@@ -33,7 +33,7 @@ jobs:
 
   crates:
     needs: wheels
-    uses: blacklanternsecurity/CLA/.github/workflows/crates.yml@e532142ee9e7322888f6edc80d9a89e2f8c0d96d # feat/shared-workflows
+    uses: blacklanternsecurity/CLA/.github/workflows/crates.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
     with:
       setup-script: scripts/build-openssl.sh
     secrets:
@@ -62,7 +62,7 @@ jobs:
     needs: [check, wheels, crates, pypi]
     permissions:
       contents: write
-    uses: blacklanternsecurity/CLA/.github/workflows/publish.yml@e532142ee9e7322888f6edc80d9a89e2f8c0d96d # feat/shared-workflows
+    uses: blacklanternsecurity/CLA/.github/workflows/publish.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
     with:
       version: ${{ needs.check.outputs.version }}
       prerelease: ${{ needs.check.outputs.prerelease }}
