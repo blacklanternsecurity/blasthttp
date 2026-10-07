@@ -7,6 +7,7 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read;
@@ -56,6 +57,60 @@ fn sanitize_uri(url: &str) -> String {
         }
     }
     out
+}
+
+/// Cipher list used when the caller doesn't name one.
+///
+/// This has to be set explicitly. `SslConnector::builder` installs its own
+/// list first, `DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`,
+/// and `set_security_level(0)` does NOT undo it. The security level governs
+/// how weak a cipher may be; the cipher list governs which ones are offered at
+/// all. Leaving the list alone means RC4, DES, 3DES and SEED never reach the
+/// wire whatever the security level says, so a server speaking only one of
+/// them is unreachable, which is the whole reason this project builds its own
+/// OpenSSL.
+///
+/// `ALL` is every suite the build provides except the eNULL (no encryption)
+/// ones. Null *encryption* stays opt-in through `cipher_string`, because
+/// negotiating it by default would hand back a connection that looks like TLS
+/// and encrypts nothing.
+///
+/// `ALL` does include the aNULL suites, which carry no certificate at all.
+/// Those are worth reaching when nobody asked us to check identities, which is
+/// this client's default. They must not be offered once somebody has, and that
+/// is what [`verified_cipher_list`] is for.
+const DEFAULT_CIPHER_LIST: &str = "ALL";
+
+/// The cipher list to offer, given what the caller asked for.
+///
+/// Certificate verification is off by default here, and while it is off the
+/// anonymous suites cost nothing: there is no identity being checked for them
+/// to slip past. Turning verification on changes that. An anonymous suite
+/// sends no certificate, and OpenSSL ignores verify-peer when no certificate
+/// arrives, so the handshake succeeds, the verify result reads OK, and the
+/// hostname check attached to it never runs. Anyone in the path can answer
+/// with an anonymous suite and be believed. Offering them would quietly cancel
+/// the setting instead of honoring it.
+///
+/// So when verification is on, `!aNULL` goes on the end of whatever list is in
+/// effect, including one the caller named. Two settings are in conflict there
+/// and this resolves it toward checking identities, because the alternative is
+/// to skip the check without saying so. Reaching anonymous suites is still a
+/// matter of leaving verification off, which is the honest way to ask.
+///
+/// Nothing else needs excluding. PSK and SRP are the only other suites that
+/// finish without a certificate, and both need a secret this client never
+/// configures, so neither can complete.
+fn verified_cipher_list(config: &RequestConfig) -> Cow<'_, str> {
+    let base = config
+        .cipher_string
+        .as_deref()
+        .unwrap_or(DEFAULT_CIPHER_LIST);
+    if config.should_verify_certs() {
+        Cow::Owned(format!("{}:!aNULL", base))
+    } else {
+        Cow::Borrowed(base)
+    }
 }
 
 // Load the OpenSSL legacy provider once (for RC4, DES, etc.).
@@ -275,12 +330,13 @@ fn encode_alpn_protocols(protos: &[String]) -> Result<Vec<u8>, ClientError> {
 
 fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
     match s.to_lowercase().as_str() {
+        "3.0" | "ssl3" | "sslv3" | "ssl3.0" => Ok(openssl::ssl::SslVersion::SSL3),
         "1.0" | "tls1.0" | "tlsv1.0" => Ok(openssl::ssl::SslVersion::TLS1),
         "1.1" | "tls1.1" | "tlsv1.1" => Ok(openssl::ssl::SslVersion::TLS1_1),
         "1.2" | "tls1.2" | "tlsv1.2" => Ok(openssl::ssl::SslVersion::TLS1_2),
         "1.3" | "tls1.3" | "tlsv1.3" => Ok(openssl::ssl::SslVersion::TLS1_3),
         _ => Err(ClientError::other(format!(
-            "unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)",
+            "unknown TLS version '{}' (use 3.0 for SSLv3, or 1.0, 1.1, 1.2, 1.3)",
             s
         ))),
     }
@@ -378,17 +434,23 @@ impl OpenSslConnector {
         // This is an offensive-first tool — we need to connect to anything.
         builder.set_security_level(0);
 
+        // `SslConnector::builder` sets NO_SSLV3 for us. Clear it, or a server
+        // that speaks nothing newer stays unreachable even when the caller
+        // asks for SSLv3 by name. Clearing the option only permits the
+        // protocol; which versions actually get offered is still decided by
+        // the min/max proto version below.
+        builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
+
         if !config.should_verify_certs() {
             builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
         } else {
             load_system_ca_certs(&mut builder)?;
         }
 
-        if let Some(ref ciphers) = config.cipher_string {
-            builder.set_cipher_list(ciphers).map_err(|e| {
-                ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
-            })?;
-        }
+        let ciphers = verified_cipher_list(config);
+        builder
+            .set_cipher_list(&ciphers)
+            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
 
         if let Some(ref min_ver) = config.min_tls_version {
             let version = parse_tls_version(min_ver)?;
@@ -1048,17 +1110,19 @@ pub(crate) async fn connect_stream(
             .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
     ssl_builder.set_security_level(0);
+    // Same reason as the pooled path: openssl-rs sets NO_SSLV3 and an SSLv3
+    // server is unreachable until it is cleared.
+    ssl_builder.clear_options(openssl::ssl::SslOptions::NO_SSLV3);
 
     if !config.should_verify_certs() {
         ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
     } else {
         load_system_ca_certs(&mut ssl_builder)?;
     }
-    if let Some(ref ciphers) = config.cipher_string {
-        ssl_builder
-            .set_cipher_list(ciphers)
-            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
-    }
+    let ciphers = verified_cipher_list(config);
+    ssl_builder
+        .set_cipher_list(&ciphers)
+        .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
     if let Some(ref min_ver) = config.min_tls_version {
         let version = parse_tls_version(min_ver)?;
         ssl_builder
@@ -3110,6 +3174,60 @@ mod tests {
         assert!(!cut);
     }
 
+    // ── verified_cipher_list ──────────────────────────────────────
+
+    fn cfg_with(verify: Option<bool>, ciphers: Option<&str>) -> RequestConfig {
+        let mut c = RequestConfig::new("https://example.com".to_string());
+        c.verify_certs = verify;
+        c.cipher_string = ciphers.map(str::to_string);
+        c
+    }
+
+    #[test]
+    fn default_offers_everything_including_anonymous_suites() {
+        // The default path has to stay exactly as it was: `ALL`, untouched.
+        assert_eq!(verified_cipher_list(&cfg_with(None, None)), "ALL");
+        assert_eq!(verified_cipher_list(&cfg_with(Some(false), None)), "ALL");
+    }
+
+    #[test]
+    fn default_path_passes_a_caller_list_through_unchanged() {
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(false), Some("RC4-SHA"))),
+            "RC4-SHA"
+        );
+    }
+
+    #[test]
+    fn verifying_drops_the_anonymous_suites() {
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(true), None)),
+            "ALL:!aNULL"
+        );
+    }
+
+    #[test]
+    fn verifying_drops_them_from_a_caller_list_too() {
+        // Otherwise `verify_certs` plus an explicit list is a way back to a
+        // handshake with no certificate in it.
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(true), Some("ALL"))),
+            "ALL:!aNULL"
+        );
+        assert_eq!(
+            verified_cipher_list(&cfg_with(Some(true), Some("ADH-AES128-SHA"))),
+            "ADH-AES128-SHA:!aNULL"
+        );
+    }
+
+    #[test]
+    fn default_path_allocates_nothing() {
+        // Borrowed when off, owned only when verifying.
+        assert!(matches!(
+            verified_cipher_list(&cfg_with(Some(false), None)),
+            Cow::Borrowed(_)
+        ));
+    }
     /// The pooled path and `raw_connect` have to land on the same proxy, so
     /// the endpoint the connector dials must match what `parse_proxy_url`
     /// resolved. Portless URLs are where these used to disagree: handing the

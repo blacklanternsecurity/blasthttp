@@ -25,7 +25,7 @@ cargo add blasthttp
 - **Batch connection reuse** — connections are pooled and reused within a batch, dramatically reducing overhead when scanning many URLs on the same hosts
 - **Rust performance** — async I/O, zero-copy where possible, and native concurrency give significant speed improvements over pure Python HTTP clients
 - **SSL cert info on every request** — extracts CN, SANs, emails, issuer, validity dates, and fingerprint during the TLS handshake that's already happening, eliminating the need for a separate connection to gather this information
-- **All TLS ciphers available by default** — custom-compiled OpenSSL 3.3.2 with legacy provider baked in (RC4, 3DES, export ciphers, SSLv3) so you can connect to anything
+- **Legacy TLS offered by default**: custom-compiled OpenSSL 3.3.2 with the legacy provider baked in, so a server that speaks only RC4, 3DES, SEED, Camellia or anonymous DH is reachable without naming the cipher yourself. SSLv3, TLS 1.0 and TLS 1.1 are offered too. Null-encryption suites are the one exception, available through `cipher_string` but never offered by default. Anonymous suites carry no certificate, so they are dropped whenever certificate verification is on
 - **No cert validation by default** — offensive-first: connects to self-signed, expired, and misconfigured TLS without extra config
 - **HTTP/2 support** — automatic via ALPN negotiation, falls back to HTTP/1.1
 - **Low-level primitives** — `RawConnection` for byte-level TCP/TLS I/O (bypasses HTTP framing entirely) and `blasthttp.h2` for manual H2 frame construction (includes a permissive HPACK encoder that emits bytes a strict encoder refuses, the building block for H2 smuggling / CRLF-injection tooling)
@@ -115,9 +115,9 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `--verify` | Enable TLS cert validation | off |
 | `-x, --proxy` | HTTP/SOCKS proxy URL | |
 | `--no-proxy` | Host that bypasses the proxy: `host`, `*.suffix`, IP, CIDR, or `*` (repeatable) | |
-| `--ciphers` | OpenSSL cipher string | all |
-| `--min-tls` | Minimum TLS version (1.0–1.3) | |
-| `--max-tls` | Maximum TLS version (1.0–1.3) | |
+| `--ciphers` | OpenSSL cipher string | `ALL` (every suite except null-encryption; `ALL:!aNULL` under `--verify`) |
+| `--min-tls` | Minimum TLS version (`3.0` for SSLv3, or 1.0–1.3) | |
+| `--max-tls` | Maximum TLS version (`3.0` for SSLv3, or 1.0–1.3) | |
 | `-v, --verbose` | Verbose output (-vv includes body) | |
 
 ## Python API
@@ -239,9 +239,9 @@ All parameters except `url` are optional:
 | `verify_certs` | `bool` | Enable TLS cert validation (default `False`) |
 | `proxy` | `str` | HTTP/SOCKS proxy URL |
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
-| `cipher_string` | `str` | OpenSSL cipher string |
-| `min_tls_version` | `str` | Minimum TLS version (`"1.0"`–`"1.3"`) |
-| `max_tls_version` | `str` | Maximum TLS version (`"1.0"`–`"1.3"`) |
+| `cipher_string` | `str` | OpenSSL cipher string (default `ALL`: every suite the build provides except null-encryption). `:!aNULL` is appended whenever `verify_certs` is on, since an anonymous suite would skip the check |
+| `min_tls_version` | `str` | Minimum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
+| `max_tls_version` | `str` | Maximum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
 | `retries` | `int` | Number of retries on failure |
 | `retry_wait_min_ms` | `int` | Minimum backoff between retries (ms) |
 | `retry_wait_max_ms` | `int` | Maximum backoff between retries (ms) |
@@ -574,7 +574,9 @@ def http_mock():
 
 ### 1. Build custom OpenSSL
 
-blasthttp ships a script that downloads OpenSSL 3.3.2, compiles it with weak cipher support (`RC4`, `DES`, `3DES`, export ciphers, `SSLv3`), and installs it to `vendor/openssl/install/`. This only needs to be run once — the result is cached and reused.
+blasthttp ships a script that downloads OpenSSL 3.3.2, compiles it with weak cipher support (`RC4`, `DES`, `3DES`, `SEED`) and `SSLv3`, and installs it to `vendor/openssl/install/`. The result is cached, keyed on the OpenSSL version, the target, and the feature flags, so changing any of those triggers a rebuild on the next run.
+
+Export ciphers are the one thing the build cannot provide: OpenSSL removed them outright in 1.1.0, so no build flag brings them back.
 
 ```bash
 ./scripts/build-openssl.sh
