@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   python:
-    uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
+    uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
     with:
       setup-script: scripts/build-openssl.sh
       env: '{"PYO3_USE_ABI3_FORWARD_COMPATIBILITY": "1"}'
