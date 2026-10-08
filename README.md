@@ -128,19 +128,20 @@ All request methods are async — they return native Python coroutines via `pyo3
 import asyncio
 import blasthttp
 
+
 async def main():
     client = blasthttp.BlastHTTP()
 
     # Single request — Response is httpx-style
     r = await client.request("https://example.com")
-    print(r.status_code, r.is_success)            # 200, True
-    print(r.headers["Content-Type"])              # case-insensitive
-    print(r.peer_ip)                              # actual TCP peer IP
-    print(r.text[:80])                            # UTF-8 body (lazy)
-    print(r.hash.body_md5)                        # md5/sha256/mmh3 (lazy)
-    print(r.cookies)                              # Set-Cookie parsed (lazy)
-    print(r.request.url, r.request.method)        # original (pre-redirect)
-    r.raise_for_status()                          # raises HTTPStatusError on 4xx/5xx
+    print(r.status_code, r.is_success)  # 200, True
+    print(r.headers["Content-Type"])  # case-insensitive
+    print(r.peer_ip)  # actual TCP peer IP
+    print(r.text[:80])  # UTF-8 body (lazy)
+    print(r.hash.body_md5)  # md5/sha256/mmh3 (lazy)
+    print(r.cookies)  # Set-Cookie parsed (lazy)
+    print(r.request.url, r.request.method)  # original (pre-redirect)
+    r.raise_for_status()  # raises HTTPStatusError on 4xx/5xx
 
     # Batch requests — full result list at the end
     configs = [
@@ -160,6 +161,7 @@ async def main():
 
     # Download to file
     await client.download("https://example.com/file.zip", "/tmp/file.zip")
+
 
 asyncio.run(main())
 ```
@@ -201,11 +203,12 @@ A response whose body won't decode is still returned: the status line and header
 
 ```python
 from blasthttp import HTTPStatusError
+
 try:
     r = await client.request("https://example.com/404")
     r.raise_for_status()
 except HTTPStatusError as e:
-    print(e.response.status_code)   # the failing Response is attached
+    print(e.response.status_code)  # the failing Response is attached
 ```
 
 `Response`, `BatchResult`, `RedirectHop`, and `Headers` all have Python constructors so test code can synthesize them from canned data — `blasthttp.Response(url=..., status=200, headers=[...], body=b"...", ...)`. Useful when building fixtures by hand; the `blasthttp.mock` submodule below uses them under the hood.
@@ -339,20 +342,17 @@ Pass `redirect_cookies=False` (or `--no-redirect-cookies` on the CLI) to turn it
 
 ```python
 # On by default.
-r = await client.request("https://example.com/login", method="POST",
-                         body="user=x&pass=y", follow_redirects=True)
+r = await client.request("https://example.com/login", method="POST", body="user=x&pass=y", follow_redirects=True)
 
 # Off: every hop gets only the headers you supplied.
-r = await client.request("https://example.com/login", follow_redirects=True,
-                         redirect_cookies=False)
+r = await client.request("https://example.com/login", follow_redirects=True, redirect_cookies=False)
 ```
 
 **A cookie you set yourself always wins.** If your request carries `Cookie: session=mine`, every hop of that chain sends `session=mine`. A `Set-Cookie` naming a cookie you set is ignored: it can't replace your value, an expiry on it can't delete your value, and the two never go out together as a duplicate pair. Sites reset cookies mid-redirect routinely, and servers disagree about which value to read when a name appears twice (some take the first, some the last), so the only rule that behaves the same everywhere is that what you wrote is what lands on the wire. Cookies the chain sets under *other* names are merged into your `Cookie` header, yours first.
 
 ```python
 # Every hop sends session=mine, whatever the site tries to set.
-r = await client.request("https://example.com/start", follow_redirects=True,
-                         headers=[("Cookie", "session=mine")])
+r = await client.request("https://example.com/start", follow_redirects=True, headers=[("Cookie", "session=mine")])
 ```
 
 Run with `-v` to see it happen: the debug log records both the cookies each hop is given and any `Set-Cookie` that lost to one of yours.
@@ -417,6 +417,7 @@ The client-level rate limit takes precedence over the per-call `rate_limit` para
 import asyncio
 import blasthttp
 
+
 async def main():
     client = blasthttp.BlastHTTP()
 
@@ -429,15 +430,14 @@ async def main():
     print("TLS cert CN:", conn.cert_info.common_name if conn.cert_info else None)
 
     # Send arbitrary bytes — no Content-Length / framing added for you.
-    await conn.send_bytes(
-        b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
-    )
+    await conn.send_bytes(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
 
     # Read with a per-call deadline. Empty bytes = timeout or peer close.
     data = await conn.read_raw(max_bytes=65536, timeout_ms=2000)
     print(data[:200])
 
     await conn.close()
+
 
 asyncio.run(main())
 ```
@@ -454,18 +454,22 @@ asyncio.run(main())
 from blasthttp import h2
 
 # Encode a header block with HPACK.
-block = h2.encode_headers([
-    h2.Header(":method", "GET"),
-    h2.Header(":path", "/"),
-    h2.Header(":authority", "example.com"),
-    h2.Header(":scheme", "https"),
-    # Permissive escape hatch: emit CRLF inside a value for
-    # CRLF-injection testing against H2-to-H1 downgrades.
-    h2.Header(
-        "x-injected", "bogus\r\nX-Smuggled: yes",
-        allow_invalid_value=True, huffman_value=False,
-    ),
-])
+block = h2.encode_headers(
+    [
+        h2.Header(":method", "GET"),
+        h2.Header(":path", "/"),
+        h2.Header(":authority", "example.com"),
+        h2.Header(":scheme", "https"),
+        # Permissive escape hatch: emit CRLF inside a value for
+        # CRLF-injection testing against H2-to-H1 downgrades.
+        h2.Header(
+            "x-injected",
+            "bogus\r\nX-Smuggled: yes",
+            allow_invalid_value=True,
+            huffman_value=False,
+        ),
+    ]
+)
 
 # Build a full probe: preface + SETTINGS + HEADERS (+ optional DATA).
 probe = h2.build_probe(
@@ -512,6 +516,7 @@ import re
 import blasthttp
 from blasthttp.mock import BlasthttpMock, MockResponse
 
+
 async def main():
     mock = BlasthttpMock()
 
@@ -522,18 +527,20 @@ async def main():
     # Programmatic — callback receives a MockRequest, returns a MockResponse
     def echo(req):
         return MockResponse(status_code=201, json={"echoed": req.method})
+
     mock.add_callback(echo, url="https://api.example.com/echo")
 
     # Use it like a real client
     r = await mock.request("https://api.example.com/users")
-    print(r.json())                    # {"users": []}
-    print(isinstance(r, blasthttp.Response))   # True
+    print(r.json())  # {"users": []}
+    print(isinstance(r, blasthttp.Response))  # True
 
     # Batch streaming works the same as the real client
     configs = [blasthttp.BatchConfig(f"https://api.example.com/users/{i}") for i in range(5)]
     mock.add_response(url=re.compile(r"/users/\d+"), json={"id": 0})
     async for r in mock.request_batch_stream(configs):
         ...
+
 
 asyncio.run(main())
 ```
@@ -557,6 +564,7 @@ Pytest integration is intentionally left to the consumer — wrap the mock in a 
 ```python
 import pytest
 from blasthttp.mock import BlasthttpMock
+
 
 @pytest.fixture
 def http_mock():
@@ -606,3 +614,7 @@ This compiles the Rust code with Python bindings enabled and installs the `blast
 - `.cargo/config.toml` sets `OPENSSL_DIR` (relative path to `vendor/openssl/install/`) and `OPENSSL_STATIC=1` so the `openssl-sys` crate links against the custom build statically
 - `build.rs` runs before compilation and verifies the custom OpenSSL headers exist, failing fast with an actionable error if they don't
 - The `[features] python` gate means `cargo build` produces a pure Rust binary, while `maturin build` activates PyO3 and produces a Python-loadable `.so`
+
+## Releasing
+
+Releases are cut by pushing a `vMAJOR.MINOR.PATCH` (or `vMAJOR.MINOR.PATCH-rc.N`) tag with the org's [release.sh](https://github.com/blacklanternsecurity/CLA/blob/40c6e18c0a6e32116eea4f89fc826f53c70889dc/scripts/release.sh), after the version bump is merged. The tag must equal the manifest version. `publish.yml` then tests, builds, publishes, and creates the GitHub release with its SBOM in the same run.
