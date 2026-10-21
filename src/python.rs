@@ -1373,7 +1373,7 @@ impl PyRawConnection {
 
 /// Per-request config for batch operations.
 /// Mirrors send() parameters but as a class for batch input.
-#[pyclass(name = "BatchConfig")]
+#[pyclass(name = "BatchConfig", from_py_object)]
 struct PyBatchConfig {
     #[pyo3(get, set)]
     url: String,
@@ -1575,7 +1575,7 @@ use crate::h2;
 /// Python-side Header with all permissiveness knobs exposed as
 /// optional keyword args. `str` values are UTF-8-encoded to `bytes`;
 /// callers wanting raw non-UTF8 bytes pass `bytes` directly.
-#[pyclass(name = "Header", module = "blasthttp.h2")]
+#[pyclass(name = "Header", module = "blasthttp.h2", from_py_object)]
 #[derive(Clone)]
 struct PyH2Header {
     inner: h2::Header,
