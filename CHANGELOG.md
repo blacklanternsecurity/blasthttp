@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.1
+
+- Python 3.15 support: PyO3 0.30, and 3.15 wheels are published
+- CI tests 3.11 through 3.15; 3.10 wheels are still published but no longer tested
+- Dependency updates (brotli 9, hyper 1.12, tokio 1.53.3, and others)
+
 ## 0.10.0
 
 - Cookies set on a redirect hop are applied to the hops that follow it, the way a browser does. What a chain collects lives for that one request, so nothing carries between requests

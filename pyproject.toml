@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "blasthttp"
-version = "0.10.0"
+version = "0.10.1"
 description = "Offensive-first HTTP library"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 requires-python = ">=3.10"
 
 [tool.maturin]
@@ -20,7 +20,7 @@ managed = false
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
-    "ruff==0.16.9",
+    "ruff==0.17.0",
 ]
 
 [tool.pytest.ini_options]
