@@ -1533,6 +1533,24 @@ async fn parse_response(
     } else {
         let decoded = decompress(&content_encoding, &raw_bytes, max_body);
         match decoded.decode_error {
+            // Neither deflate flavor ends in a trailer the decoder insists
+            // on, so a deflate stream cut short by the cap can read as a
+            // clean finish. The read stopping at the cap is enough to know
+            // the body isn't all there.
+            None if cut_by_cap => {
+                let cause = "body hit the max_body cap mid-stream".to_string();
+                debug_record(
+                    log,
+                    v,
+                    1,
+                    &format!(
+                        "   Body not fully decoded, {} bytes: {}",
+                        decoded.body.len(),
+                        cause
+                    ),
+                );
+                (decoded.body, Some(cause))
+            }
             None => {
                 debug_record(
                     log,
@@ -1611,12 +1629,33 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
+/// Give an absolute URL with no path (`https://host?q=1`) the path `/`, as
+/// curl and browsers do. hyper builds the HTTP/2 `:path` straight from the
+/// URI's path-and-query, so without this it sends `?q=1` and servers answer
+/// 400.
+fn normalize_empty_path(uri: http::Uri) -> http::Uri {
+    // `Uri::path()` already reports "/" for an empty path, so look at the raw
+    // path-and-query, which is what hyper puts on the wire.
+    let raw = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("");
+    if uri.authority().is_none() || raw.starts_with('/') {
+        return uri;
+    }
+    let mut parts = uri.clone().into_parts();
+    match format!("/{}", raw).parse() {
+        Ok(pq) => {
+            parts.path_and_query = Some(pq);
+            http::Uri::from_parts(parts).unwrap_or(uri)
+        }
+        Err(_) => uri,
+    }
+}
+
 fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, ClientError> {
     let sanitized = sanitize_uri(location);
     if let Ok(uri) = sanitized.parse::<http::Uri>()
         && uri.scheme().is_some()
     {
-        return Ok(uri);
+        return Ok(normalize_empty_path(uri));
     }
 
     let scheme = current.scheme_str().unwrap_or("https");
@@ -1628,9 +1667,12 @@ fn resolve_redirect(current: &http::Uri, location: &str) -> Result<http::Uri, Cl
     })?;
 
     let absolute = format!("{}://{}{}", scheme, authority, sanitized);
-    absolute.parse().map_err(|e: http::uri::InvalidUri| {
-        ClientError::invalid_url(format!("invalid redirect URL '{}': {}", absolute, e))
-    })
+    absolute
+        .parse()
+        .map(normalize_empty_path)
+        .map_err(|e: http::uri::InvalidUri| {
+            ClientError::invalid_url(format!("invalid redirect URL '{}': {}", absolute, e))
+        })
 }
 
 // ── HttpClient implementation ─────────────────────────────────────
@@ -1724,9 +1766,9 @@ impl HyperClient {
         let start = Instant::now();
 
         let sanitized_url = sanitize_uri(&config.url);
-        let mut uri: http::Uri = sanitized_url.parse().map_err(|e: http::uri::InvalidUri| {
-            ClientError::invalid_url(format!("invalid URL: {}", e))
-        })?;
+        let mut uri: http::Uri = sanitized_url.parse().map(normalize_empty_path).map_err(
+            |e: http::uri::InvalidUri| ClientError::invalid_url(format!("invalid URL: {}", e)),
+        )?;
 
         debug_record(log, v, 1, &format!("-> {} {}", config.method(), uri));
         if let Some(proxy) = config.effective_proxy(uri.host().unwrap_or("")) {
@@ -2005,6 +2047,10 @@ impl HyperClient {
 /// `encoding` is the whole header value, which is an ordered list of the
 /// codings applied to the body, so undoing it means walking them in reverse.
 /// The caller lowercases it.
+/// The most `Content-Encoding` layers `decompress` will undo. See the note
+/// where it's applied.
+const MAX_CONTENT_CODINGS: usize = 3;
+
 fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
     if data.is_empty() {
         return Decoded::content(Vec::new());
@@ -2034,7 +2080,11 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
     }
 
     let declared = codecs.len();
-    let mut remaining = codecs.into_iter().rev();
+    // Each layer's output is capped at `max_size`, but the number of layers
+    // comes from the header, and nested deflate can make every one of them a
+    // near full-size pass with nothing to interrupt it. Real servers stack
+    // two at most (the `gzip, gzip` case below), so stop at a few.
+    let mut remaining = codecs.into_iter().rev().take(MAX_CONTENT_CODINGS);
     let Some(outermost) = remaining.next() else {
         // Nothing but `identity`.
         return Decoded::content(data.to_vec());
@@ -2087,6 +2137,15 @@ fn decompress(encoding: &str, data: &[u8], max_size: usize) -> Decoded {
                 );
             }
         }
+    }
+
+    if declared > peeled {
+        // Same rule as above: an outer layer's complaint says more about the
+        // bytes that arrived, so it wins if there is one.
+        incomplete.get_or_insert(format!(
+            "{} of {} content-encoding layers came off: stopped at the limit of {}",
+            peeled, declared, MAX_CONTENT_CODINGS
+        ));
     }
 
     match incomplete {
@@ -2966,6 +3025,32 @@ mod tests {
         // did come off, but never applied.
         let (body, _) = undecoded("br, gzip", &gz, NO_LIMIT);
         assert_eq!(body, SAMPLE);
+    }
+
+    #[test]
+    fn test_decompress_stops_after_three_layers() {
+        // The layer count comes from the header, so it can't be allowed to
+        // decide how many full decode passes a response costs. Past three,
+        // what came off so far is kept and flagged.
+        let mut body = SAMPLE.to_vec();
+        for _ in 0..5 {
+            body = gzip_bytes(&body);
+        }
+        let two_left = gzip_bytes(&gzip_bytes(SAMPLE));
+        let (out, reason) = undecoded("gzip, gzip, gzip, gzip, gzip", &body, NO_LIMIT);
+        assert_eq!(out, two_left);
+        assert!(
+            reason.starts_with("3 of 5 content-encoding layers came off"),
+            "reason should say how far it got: {}",
+            reason
+        );
+
+        // Three is still decoded in full.
+        let mut three = SAMPLE.to_vec();
+        for _ in 0..3 {
+            three = gzip_bytes(&three);
+        }
+        assert_eq!(decoded("gzip, gzip, gzip", &three, NO_LIMIT), SAMPLE);
     }
 
     #[test]

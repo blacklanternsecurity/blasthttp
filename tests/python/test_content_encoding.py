@@ -119,6 +119,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(200, "gzip, br", gzip.compress(PAYLOAD))
         elif kind == "incompressible":
             self._respond(200, "gzip", gzip.compress(INCOMPRESSIBLE))
+        elif kind == "incompressible-deflate":
+            # Neither deflate flavor ends in a trailer the decoder checks,
+            # so a stream cut by the cap can look like a clean finish.
+            body = zlib.compress(INCOMPRESSIBLE) if arg == "zlib" else _raw_deflate(INCOMPRESSIBLE)
+            self._respond(200, "deflate", body)
         elif kind == "incompressible-plain":
             # No encoding, so the only cap that applies is the one on the
             # wire read.
@@ -297,6 +302,21 @@ async def test_max_body_size_truncating_a_compressed_stream(client, server):
     assert "did not decode cleanly" in r.decode_error
 
 
+@pytest.mark.parametrize("flavor", ["zlib", "raw"])
+async def test_max_body_size_truncating_a_deflate_stream_is_flagged(client, server, flavor):
+    """Same as the gzip case above, but deflate has no trailer for the
+    decoder to miss, so only the cap cutting the read says the body is
+    short."""
+    r = await client.request(
+        f"{server}/incompressible-deflate/{flavor}", timeout=20, follow_redirects=False, max_body_size=50_000
+    )
+    assert r.status_code == 200
+    assert len(r.content) < len(INCOMPRESSIBLE)
+    assert INCOMPRESSIBLE.startswith(r.content)
+    assert r.decode_error is not None
+    assert "max_body cap" in r.decode_error
+
+
 async def test_max_body_size_too_small_to_inflate_anything(client, server):
     """A 2-byte cap doesn't even cover the gzip header, so nothing
     inflates. The response survives with the bytes that did arrive, and
@@ -336,3 +356,14 @@ async def test_empty_body_in_batch(client, server):
         assert r.error is None, r.error
         assert r.response.status_code == 302
         assert r.response.content == b""
+
+
+async def test_max_body_size_in_batch(client, server):
+    """`BatchConfig` takes `max_body_size` like `request()` does, so a
+    batch isn't stuck at the 10MB default."""
+    config = blasthttp.BatchConfig(
+        f"{server}/incompressible-plain", timeout=20, follow_redirects=False, max_body_size=1000
+    )
+    [r] = await client.request_batch([config])
+    assert r.error is None, r.error
+    assert r.response.content == INCOMPRESSIBLE[:1000]
