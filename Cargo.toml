@@ -1,9 +1,9 @@
 [package]
 name = "blasthttp"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 description = "Offensive-first HTTP library with Python bindings"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 # CI-only pin. Shipping it would override the toolchain of anyone building from the sdist.
 exclude = ["rust-toolchain.toml"]
 
@@ -64,8 +64,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Python bindings — optional, only when "python" feature is enabled
-pyo3 = { version = "0.27", features = ["extension-module"], optional = true }
-pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"], optional = true }
+pyo3 = { version = "0.30", features = ["extension-module"], optional = true }
+pyo3-async-runtimes = { version = "0.30", features = ["attributes", "tokio-runtime"], optional = true }
 
 [dev-dependencies]
 # TLS test server — uses our custom OpenSSL to serve with weak ciphers
