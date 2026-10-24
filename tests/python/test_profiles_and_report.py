@@ -29,7 +29,8 @@ async def _handler(reader, writer):
 
     /              ordinary 200
     /echo-headers  200 whose body is the request headers it received
-    /cf-challenge  403 shaped like a Cloudflare managed challenge
+    /cf-challenge  403 shaped like a Cloudflare managed challenge, unless the
+                   request carries the cookie pass=1
     /akamai-block  403 shaped like an Akamai edge refusal
     /plain-403     403 with no product signature at all
     """
@@ -58,7 +59,9 @@ async def _handler(reader, writer):
         if path == "/echo-headers":
             body = "\n".join(received).encode()
             respond(200, [("Content-Type", "text/plain")], body)
-        elif path == "/cf-challenge":
+        elif path == "/cf-challenge" and not any(
+            h.lower().startswith("cookie:") and "pass=1" in h for h in received
+        ):
             # cf-mitigated is the header Cloudflare sets specifically to say it
             # intervened, and is what separates a challenge from a WAF block.
             respond(
@@ -169,6 +172,28 @@ async def test_a_challenge_asks_for_a_browser(server, client):
     assert r.status_code == 403
     assert r.protection == ("challenge", "cloudflare")
     assert r.conclusion == ("needs_browser", "cloudflare")
+
+
+async def test_a_host_that_refuses_every_rung_gets_one_request_after(server, client):
+    """Only success used to be remembered, so a host that refused everything had
+    the whole ladder walked again for every request: two requests where one
+    tells you the same thing, on the hosts most likely to rate-limit or ban."""
+    url = f"{server}/cf-challenge"
+
+    r = await client.request(url)
+    assert [a[0] for a in r.attempts] == ["modern", "chrome131"]
+    assert r.conclusion == ("needs_browser", "cloudflare")
+
+    # recently refused on every rung: one request, and the refusal is the answer
+    r = await client.request(url)
+    assert [a[0] for a in r.attempts] == ["modern"]
+    assert r.conclusion == ("needs_browser", "cloudflare")
+
+    # getting through clears it, so the next refusal walks the ladder again
+    r = await client.request(url, headers=[("cookie", "pass=1")])
+    assert r.conclusion == ("reached", "-")
+    r = await client.request(url)
+    assert [a[0] for a in r.attempts] == ["modern", "chrome131"]
 
 
 async def test_a_block_is_not_a_challenge(server, client):

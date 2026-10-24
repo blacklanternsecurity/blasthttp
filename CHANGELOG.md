@@ -25,6 +25,12 @@ the ladder falling back to `compatibility` on the second handshake.
   any refusal. Most 403s are ordinary authorization failures, and retrying each
   one with different TLS settings would double the request count of any scan
   that touches one
+- A host that refuses every rung is remembered too, for ten minutes: during
+  that time a refusal from it is taken as the answer after one request, rather
+  than walking the ladder again. Only success used to be remembered, so a host
+  that refused everything cost two requests for every one a scan sent it, on
+  exactly the hosts most likely to rate-limit or ban. Getting through clears
+  it, and it expires because a refusal is a judgement that changes
 - **`Response.protection`** reports what a bot-management product did:
   `(outcome, vendor)` where outcome is ok, present, challenge, blocked or error
 - **`Response.conclusion`** reduces that to one verdict: reached, blocked,

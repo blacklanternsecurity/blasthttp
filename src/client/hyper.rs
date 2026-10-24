@@ -1018,6 +1018,11 @@ enum ConnMode {
     Socks5 { proxy_url: String, tls: TlsKey },
 }
 
+/// How long a host that refused every rung keeps getting one request instead of
+/// the whole ladder. Long enough to stop doubling a scan's requests to it, short
+/// enough that a host which relents is noticed. See `ladder_exhausted`.
+const EXHAUSTED_TTL: Duration = Duration::from_secs(600);
+
 pub struct HyperClient {
     // Clients cached by connection mode. A scan using an HTTP proxy may need
     // both a ForwardProxy client (for HTTP targets) and a Tunnel client (for
@@ -1027,6 +1032,10 @@ pub struct HyperClient {
     // the ladder on every request. Written only on success; see
     // `remember_profile`.
     host_profiles: Mutex<HashMap<String, &'static crate::profile::ConnectionProfile>>,
+    // When each host last refused every rung of the ladder. For a while after,
+    // a refusal from it is taken as the answer instead of walking the ladder
+    // again; see `ladder_exhausted`.
+    host_exhausted: Mutex<HashMap<String, Instant>>,
     // Why the last handshake to each host failed.
     //
     // Deliberately on the client rather than on `CachedClient`: a retry with
@@ -1047,6 +1056,7 @@ impl HyperClient {
         HyperClient {
             cached: Mutex::new(std::collections::HashMap::new()),
             host_profiles: Mutex::new(HashMap::new()),
+            host_exhausted: Mutex::new(HashMap::new()),
             tls_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2406,6 +2416,44 @@ impl HyperClient {
         crate::profile::next_rung(current, failure, tried)
     }
 
+    /// Whether this host recently refused every rung, so a refusal from it now
+    /// should be taken as the answer rather than spending another request on
+    /// the next rung.
+    ///
+    /// Without this, only success was remembered, so a host that refuses
+    /// everything had the whole ladder walked again for every request to it:
+    /// two requests where one tells you the same thing, on exactly the hosts
+    /// most likely to rate-limit or ban. It expires, unlike the success memory,
+    /// because a refusal is a judgement the product makes from things that
+    /// change (rate, reputation, its own rules), and what it refused ten minutes
+    /// ago it may let through now.
+    fn ladder_exhausted(&self, config: &RequestConfig, uri: &http::Uri) -> bool {
+        if config.tls_is_pinned() {
+            return false;
+        }
+        peer_slot_key(uri).is_some_and(|key| self.exhausted_within_ttl(&key))
+    }
+
+    fn exhausted_within_ttl(&self, key: &str) -> bool {
+        self.host_exhausted
+            .lock()
+            .ok()
+            .and_then(|map| map.get(key).copied())
+            .is_some_and(|at| at.elapsed() < EXHAUSTED_TTL)
+    }
+
+    /// Record that a host refused every rung of the ladder.
+    fn remember_exhausted(&self, config: &RequestConfig, uri: &http::Uri) {
+        if config.tls_is_pinned() {
+            return;
+        }
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(mut map) = self.host_exhausted.lock()
+        {
+            map.insert(key, Instant::now());
+        }
+    }
+
     /// Record that a profile worked against a host.
     ///
     /// Only ever called after an attempt got through. A failure alone is a
@@ -2431,10 +2479,14 @@ impl HyperClient {
         if config.tls_is_pinned() {
             return;
         }
-        if let Some(key) = peer_slot_key(uri)
-            && let Ok(mut map) = self.host_profiles.lock()
-        {
-            map.insert(key, profile);
+        if let Some(key) = peer_slot_key(uri) {
+            if let Ok(mut map) = self.host_profiles.lock() {
+                map.insert(key.clone(), profile);
+            }
+            // whatever it refused before, it lets us through now
+            if let Ok(mut map) = self.host_exhausted.lock() {
+                map.remove(&key);
+            }
         }
     }
 
@@ -2582,7 +2634,14 @@ impl HyperClient {
                             break (resp, cached);
                         }
 
-                        match self.next_rung_for(config, rung, RungFailure::Refused, &tried) {
+                        // A host that recently refused every rung gets one
+                        // request, not the whole ladder again.
+                        let next = if self.ladder_exhausted(config, &uri) {
+                            None
+                        } else {
+                            self.next_rung_for(config, rung, RungFailure::Refused, &tried)
+                        };
+                        match next {
                             Some(next) => {
                                 debug_record(
                                     log,
@@ -2599,7 +2658,15 @@ impl HyperClient {
                             // back as a response rather than an error, so the
                             // caller can read the status, the headers and
                             // whatever the challenge page said.
-                            None => break (resp, cached),
+                            None => {
+                                // Only a ladder that actually ran out counts; a
+                                // single refusal while already exhausted must not
+                                // keep extending it, or the host is never re-tried.
+                                if tried.len() > 1 {
+                                    self.remember_exhausted(config, &uri);
+                                }
+                                break (resp, cached);
+                            }
                         }
                     }
                     Err(mut e) => {
@@ -3154,6 +3221,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_exhausted_host_expires() {
+        let client = HyperClient::new();
+        assert!(!client.exhausted_within_ttl("example.com:443"));
+
+        client
+            .host_exhausted
+            .lock()
+            .unwrap()
+            .insert("example.com:443".to_string(), Instant::now());
+        assert!(client.exhausted_within_ttl("example.com:443"));
+
+        // a refusal from longer ago than the TTL no longer counts, so the ladder is walked again
+        let long_ago = Instant::now() - EXHAUSTED_TTL - Duration::from_secs(1);
+        client
+            .host_exhausted
+            .lock()
+            .unwrap()
+            .insert("example.com:443".to_string(), long_ago);
+        assert!(!client.exhausted_within_ttl("example.com:443"));
+    }
 
     #[test]
     fn test_backoff_attempt_0() {
