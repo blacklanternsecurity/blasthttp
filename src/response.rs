@@ -534,7 +534,10 @@ mod protection_tests {
             ],
             "<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD></HTML>",
         );
-        assert_eq!(blocked.protection(), Outcome::Blocked(Vendor::Akamai));
+        assert_eq!(
+            blocked.protection(),
+            Outcome::Blocked(Vendor::new("akamai"))
+        );
     }
 
     #[test]
@@ -548,7 +551,7 @@ mod protection_tests {
         );
         assert_eq!(
             challenge.protection(),
-            Outcome::Challenge(Vendor::Cloudflare)
+            Outcome::Challenge(Vendor::new("cloudflare"))
         );
 
         let ordinary = response_with(200, &[("server", "nginx")], "<html>hello</html>");

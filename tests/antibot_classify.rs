@@ -66,7 +66,7 @@ fn test_akamai_access_denied_is_a_block() {
     ]);
     assert_eq!(
         classify(&facts(403, &h, AKAMAI_DENIED)),
-        Outcome::Blocked(Vendor::Akamai)
+        Outcome::Blocked(Vendor::new("akamai"))
     );
 }
 
@@ -80,7 +80,7 @@ fn test_akamai_block_detected_without_a_server_header() {
             &h,
             "<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD></HTML>"
         )),
-        Outcome::Blocked(Vendor::Akamai)
+        Outcome::Blocked(Vendor::new("akamai"))
     );
 }
 
@@ -90,7 +90,7 @@ fn test_entity_encoded_edgesuite_still_matches() {
     let h = hdrs(&[("content-type", "text/html")]);
     assert_eq!(
         classify(&facts(403, &h, AKAMAI_DENIED)),
-        Outcome::Blocked(Vendor::Akamai)
+        Outcome::Blocked(Vendor::new("akamai"))
     );
 }
 
@@ -106,7 +106,7 @@ fn test_akamai_session_cookie_on_success_is_present() {
         ("set-cookie", "bm_sz=8C2...; Path=/"),
     ]);
     let outcome = classify(&facts(200, &h, "<html><body>real content</body></html>"));
-    assert_eq!(outcome, Outcome::Present(Vendor::Akamai));
+    assert_eq!(outcome, Outcome::Present(Vendor::new("akamai")));
     assert!(outcome.got_through());
 }
 
@@ -122,7 +122,7 @@ fn test_cloudflare_managed_challenge() {
     ]);
     assert_eq!(
         classify(&facts(403, &h, "<html>Just a moment...</html>")),
-        Outcome::Challenge(Vendor::Cloudflare)
+        Outcome::Challenge(Vendor::new("cloudflare"))
     );
 }
 
@@ -137,7 +137,7 @@ fn test_cloudflare_waf_block_is_not_a_challenge() {
         "expected a block, got {:?}",
         outcome
     );
-    assert_ne!(outcome, Outcome::Challenge(Vendor::Cloudflare));
+    assert_ne!(outcome, Outcome::Challenge(Vendor::new("cloudflare")));
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn test_cloudflare_bm_cookie_on_success_is_present() {
     ]);
     assert_eq!(
         classify(&facts(200, &h, "<html>content</html>")),
-        Outcome::Present(Vendor::Cloudflare)
+        Outcome::Present(Vendor::new("cloudflare"))
     );
 }
 
@@ -163,7 +163,58 @@ fn test_akamai_sec_cpt_428_is_its_own_outcome() {
     ]);
     assert_eq!(
         classify(&facts(428, &h, r#"{"chlg_duration":30,"difficulty":5}"#)),
-        Outcome::Challenge(Vendor::Akamai)
+        Outcome::Challenge(Vendor::new("akamai"))
+    );
+}
+
+/// The shape of Imperva's incident page, with its identifiers replaced.
+const IMPERVA_INCIDENT: &str = concat!(
+    r#"<html style="height:100%"><head><META NAME="ROBOTS" CONTENT="NOINDEX, NOFOLLOW">"#,
+    r#"<script type="text/javascript" src="/_Incapsula_Resource?SWJIYLWA=0123456789abcdef"></script></head>"#,
+    r#"<body style="margin:0px;height:100%"><iframe id="main-iframe" "#,
+    r#"src="/_Incapsula_Resource?CWUDNSAI=24&xinfo=0&incident_id=0-0&edet=12&cinfo=ffffffff&rpinfo=0&mth=GET" "#,
+    r#"frameborder=0 width="100%" height="100%">Request unsuccessful. Incapsula incident ID: 0-0</iframe></body></html>"#
+);
+
+/// The loader Imperva adds to the end of pages it let through.
+const IMPERVA_LOADER: &str = r#"<script type="text/javascript" src="/_Incapsula_Resource?SWJIYLWA=0123456789abcdef&ns=1&cb=123456789" async></script>"#;
+
+#[test]
+fn test_imperva_incident_page_is_a_challenge() {
+    let h = hdrs(&[("x-cdn", "Imperva")]);
+    for status in [200, 403, 503] {
+        assert_eq!(
+            classify(&facts(status, &h, IMPERVA_INCIDENT)),
+            Outcome::Challenge(Vendor::new("imperva"))
+        );
+    }
+}
+
+#[test]
+fn test_imperva_loader_on_a_page_is_not_a_challenge() {
+    // The origin's own page, a 200 or its own 403, with Imperva's loader
+    // appended.
+    let h = hdrs(&[("x-cdn", "Imperva")]);
+    let page = format!(
+        "<html><title>IIS Windows Server</title><body>welcome{IMPERVA_LOADER}</body></html>"
+    );
+    let refusal = format!("<html><h1>403 Forbidden</h1>{IMPERVA_LOADER}</html>");
+    for (status, body) in [(200, &page), (403, &refusal)] {
+        assert_ne!(
+            classify(&facts(status, &h, body)),
+            Outcome::Challenge(Vendor::new("imperva"))
+        );
+    }
+}
+
+#[test]
+fn test_imperva_script_without_the_loader_form_is_a_challenge() {
+    // Anything else naming the resource still counts, as before.
+    let h = hdrs(&[]);
+    let body = r#"<html><head><script src="/_Incapsula_Resource?SWJIYLWA=0123456789abcdef"></script></head><body></body></html>"#;
+    assert_eq!(
+        classify(&facts(200, &h, body)),
+        Outcome::Challenge(Vendor::new("imperva"))
     );
 }
 
@@ -215,7 +266,7 @@ fn test_reference_number_alone_is_not_akamai() {
         &h,
         "<html><h1>Access Denied</h1><p>Reference #12345</p></html>",
     ));
-    assert_eq!(outcome, Outcome::Blocked(Vendor::Unknown));
+    assert_eq!(outcome, Outcome::Blocked(Vendor::unknown()));
 }
 
 // ── Ordinary responses ────────────────────────────────────────────
@@ -242,7 +293,7 @@ fn test_unidentified_refusal_reports_unknown_vendor() {
     // to guess a vendor.
     let h = hdrs(&[("server", "nginx")]);
     let outcome = classify(&facts(403, &h, "forbidden"));
-    assert_eq!(outcome, Outcome::Blocked(Vendor::Unknown));
+    assert_eq!(outcome, Outcome::Blocked(Vendor::unknown()));
     assert!(!outcome.got_through());
 }
 
@@ -254,7 +305,7 @@ fn test_product_cookie_with_refusal_still_counts_as_blocked() {
         ("set-cookie", "__cf_bm=xyz; Path=/"),
     ]);
     let outcome = classify(&facts(403, &h, "<html>denied</html>"));
-    assert_eq!(outcome, Outcome::Blocked(Vendor::Cloudflare));
+    assert_eq!(outcome, Outcome::Blocked(Vendor::new("cloudflare")));
     assert!(!outcome.got_through());
 }
 
@@ -270,7 +321,7 @@ fn test_aws_waf_captcha_is_a_challenge() {
         ("x-cache", "Error from cloudfront"),
     ]);
     let outcome = classify(&facts(405, &h, ""));
-    assert_eq!(outcome, Outcome::Challenge(Vendor::AwsWaf));
+    assert_eq!(outcome, Outcome::Challenge(Vendor::new("awswaf")));
     assert!(
         outcome.indicates_protection(),
         "the ladder only moves on positive evidence of a product"
@@ -285,7 +336,7 @@ fn test_a_bare_403_is_not_evidence_of_protection() {
     // that touches one.
     let h = hdrs(&[("server", "nginx")]);
     let outcome = classify(&facts(403, &h, "forbidden"));
-    assert_eq!(outcome, Outcome::Blocked(Vendor::Unknown));
+    assert_eq!(outcome, Outcome::Blocked(Vendor::unknown()));
     assert!(!outcome.indicates_protection());
 }
 
@@ -315,6 +366,6 @@ fn test_a_marker_in_a_multibyte_body_is_still_found() {
     let body = format!("{}window._cf_chl_opt", "\u{5ae}".repeat(10));
     assert_eq!(
         classify(&facts(403, &h, &body)),
-        Outcome::Challenge(Vendor::Cloudflare)
+        Outcome::Challenge(Vendor::new("cloudflare"))
     );
 }

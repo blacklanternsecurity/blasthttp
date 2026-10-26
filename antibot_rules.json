@@ -1,0 +1,126 @@
+{
+  "refusal_statuses": [401, 403, 405, 406, 429, 503],
+  "rules": [
+    {
+      "vendor": "cloudflare",
+      "outcome": "challenge",
+      "when": {"header_contains": {"name": "cf-mitigated", "value": "challenge"}},
+      "why": "The unambiguous one, and the only header Cloudflare sets specifically to say it intervened."
+    },
+    {
+      "vendor": "cloudflare",
+      "outcome": "challenge",
+      "when": {"any": [
+        {"body_contains": "/cdn-cgi/challenge-platform/"},
+        {"body_contains": "window._cf_chl_opt"}
+      ]},
+      "why": "The challenge page's own markers, for when cf-mitigated is missing."
+    },
+    {
+      "vendor": "akamai",
+      "outcome": "blocked",
+      "when": {"any": [
+        {"body_contains": "edgesuite"},
+        {"all": [
+          {"any": [
+            {"header_contains": {"name": "server", "value": "akamaighost"}},
+            {"header_present": "akamai-grn"},
+            {"header_present": "x-akam-sw-version"},
+            {"header_present": "x-akamai-transformed"},
+            {"header_contains": {"name": "server-timing", "value": "ak_p"}}
+          ]},
+          {"body_contains": "Access Denied"}
+        ]}
+      ]},
+      "why": "The edge error page. It HTML-entity-encodes its own punctuation, so the body carries errors&#46;edgesuite&#46;net and a search for errors.edgesuite.net never fires; the bare label edgesuite survives that. server: AkamaiGHost is not reliably present either: www.akamai.com's own 403 sends no server header and identifies itself through akamai-grn, x-akam-sw-version and an ak_p server-timing entry instead, so any one of the edge headers will do. Reference # on its own stays insufficient, because plenty of unrelated error pages carry one."
+    },
+    {
+      "vendor": "akamai",
+      "outcome": "challenge",
+      "when": {"all": [
+        {"status": [428]},
+        {"any": [{"cookie_set": "sec_cpt"}, {"body_contains": "sec-cpt"}]}
+      ]},
+      "why": "sec-cpt is an adaptive challenge that fires after _abck already passed, and it answers 428 rather than 403. Its own outcome, not a block."
+    },
+    {
+      "vendor": "datadome",
+      "outcome": "challenge",
+      "when": {"body_contains": "geo.captcha-delivery.com"}
+    },
+    {
+      "vendor": "perimeterx",
+      "outcome": "challenge",
+      "when": {"any": [{"body_contains": "/px/captcha"}, {"body_contains": "px-captcha"}]}
+    },
+    {
+      "vendor": "imperva",
+      "outcome": "challenge",
+      "when": {"any": [
+        {"body_contains": "_Incapsula_Resource?CWUDNSAI="},
+        {"all": [
+          {"body_contains": "_Incapsula_Resource"},
+          {"not": {"body_contains": "&ns=1&cb="}}
+        ]}
+      ]},
+      "why": "The &ns=1&cb= script is the loader Imperva adds to pages it let through, the origin's own error pages included, so on its own it's not an interception. Imperva's incident page frames itself as CWUDNSAI."
+    },
+    {
+      "vendor": "awswaf",
+      "outcome": "challenge",
+      "when": {"header_present": "x-amzn-waf-action"},
+      "why": "The header carries the action, and there is more than one: challenge for the silent JavaScript kind, captcha for the kind wanting a person. Matching only challenge missed wizzair.com, which answers 405 with captcha, so the ladder read a genuine interception as an ordinary refusal and declined to try anything else. Match the header's presence and let the value be detail."
+    },
+    {
+      "vendor": "kasada",
+      "outcome": "blocked",
+      "when": {"all": [
+        {"any": [{"header_present": "x-kpsdk-ct"}, {"body_contains": "KPSDK"}]},
+        {"status": [429]}
+      ]},
+      "why": "Kasada answers 429 rather than 403 for a refusal."
+    },
+    {
+      "vendor": "kasada",
+      "outcome": "present",
+      "when": {"any": [{"header_present": "x-kpsdk-ct"}, {"body_contains": "KPSDK"}]}
+    },
+    {
+      "vendor": "cloudflare",
+      "outcome": "present",
+      "on_refusal": "blocked",
+      "when": {"any": [{"cookie_set": "__cf_bm"}, {"cookie_set": "cf_clearance"}]},
+      "why": "From here on, sightings of a product on a response nothing above matched. One that set its cookie while refusing us is still a block."
+    },
+    {
+      "vendor": "akamai",
+      "outcome": "present",
+      "on_refusal": "blocked",
+      "when": {"any": [{"cookie_set": "_abck"}, {"cookie_set": "ak_bmsc"}, {"cookie_set": "bm_sz"}]}
+    },
+    {
+      "vendor": "datadome",
+      "outcome": "present",
+      "on_refusal": "blocked",
+      "when": {"cookie_set": "datadome"}
+    },
+    {
+      "vendor": "perimeterx",
+      "outcome": "present",
+      "on_refusal": "blocked",
+      "when": {"cookie_prefix": "_px"}
+    },
+    {
+      "vendor": "imperva",
+      "outcome": "present",
+      "on_refusal": "blocked",
+      "when": {"any": [{"cookie_prefix": "visid_incap_"}, {"cookie_prefix": "incap_ses_"}]}
+    },
+    {
+      "vendor": "f5",
+      "outcome": "present",
+      "on_refusal": "blocked",
+      "when": {"header_contains": {"name": "server", "value": "volt-adc"}}
+    }
+  ]
+}

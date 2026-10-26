@@ -59,9 +59,7 @@ async def _handler(reader, writer):
         if path == "/echo-headers":
             body = "\n".join(received).encode()
             respond(200, [("Content-Type", "text/plain")], body)
-        elif path == "/cf-challenge" and not any(
-            h.lower().startswith("cookie:") and "pass=1" in h for h in received
-        ):
+        elif path == "/cf-challenge" and not any(h.lower().startswith("cookie:") and "pass=1" in h for h in received):
             # cf-mitigated is the header Cloudflare sets specifically to say it
             # intervened, and is what separates a challenge from a WAF block.
             respond(
