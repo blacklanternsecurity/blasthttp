@@ -167,6 +167,57 @@ fn test_akamai_sec_cpt_428_is_its_own_outcome() {
     );
 }
 
+/// The shape of Imperva's incident page, with its identifiers replaced.
+const IMPERVA_INCIDENT: &str = concat!(
+    r#"<html style="height:100%"><head><META NAME="ROBOTS" CONTENT="NOINDEX, NOFOLLOW">"#,
+    r#"<script type="text/javascript" src="/_Incapsula_Resource?SWJIYLWA=0123456789abcdef"></script></head>"#,
+    r#"<body style="margin:0px;height:100%"><iframe id="main-iframe" "#,
+    r#"src="/_Incapsula_Resource?CWUDNSAI=24&xinfo=0&incident_id=0-0&edet=12&cinfo=ffffffff&rpinfo=0&mth=GET" "#,
+    r#"frameborder=0 width="100%" height="100%">Request unsuccessful. Incapsula incident ID: 0-0</iframe></body></html>"#
+);
+
+/// The loader Imperva adds to the end of pages it let through.
+const IMPERVA_LOADER: &str = r#"<script type="text/javascript" src="/_Incapsula_Resource?SWJIYLWA=0123456789abcdef&ns=1&cb=123456789" async></script>"#;
+
+#[test]
+fn test_imperva_incident_page_is_a_challenge() {
+    let h = hdrs(&[("x-cdn", "Imperva")]);
+    for status in [200, 403, 503] {
+        assert_eq!(
+            classify(&facts(status, &h, IMPERVA_INCIDENT)),
+            Outcome::Challenge(Vendor::Imperva)
+        );
+    }
+}
+
+#[test]
+fn test_imperva_loader_on_a_page_is_not_a_challenge() {
+    // The origin's own page, a 200 or its own 403, with Imperva's loader
+    // appended.
+    let h = hdrs(&[("x-cdn", "Imperva")]);
+    let page = format!(
+        "<html><title>IIS Windows Server</title><body>welcome{IMPERVA_LOADER}</body></html>"
+    );
+    let refusal = format!("<html><h1>403 Forbidden</h1>{IMPERVA_LOADER}</html>");
+    for (status, body) in [(200, &page), (403, &refusal)] {
+        assert_ne!(
+            classify(&facts(status, &h, body)),
+            Outcome::Challenge(Vendor::Imperva)
+        );
+    }
+}
+
+#[test]
+fn test_imperva_script_without_the_loader_form_is_a_challenge() {
+    // Anything else naming the resource still counts, as before.
+    let h = hdrs(&[]);
+    let body = r#"<html><head><script src="/_Incapsula_Resource?SWJIYLWA=0123456789abcdef"></script></head><body></body></html>"#;
+    assert_eq!(
+        classify(&facts(200, &h, body)),
+        Outcome::Challenge(Vendor::Imperva)
+    );
+}
+
 // ── The false positives that caught the first pass ────────────────
 
 #[test]

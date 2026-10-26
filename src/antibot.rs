@@ -215,7 +215,12 @@ pub fn classify(facts: &ResponseFacts) -> Outcome {
     }
 
     // ── Imperva / Incapsula ───────────────────────────────────────
-    if facts.body_contains("_Incapsula_Resource") {
+    // The `&ns=1&cb=` script is the loader Imperva adds to pages it let
+    // through, the origin's own error pages included, so on its own it's not
+    // an interception. Imperva's incident page frames itself as `CWUDNSAI`.
+    if facts.body_contains("_Incapsula_Resource?CWUDNSAI=")
+        || (facts.body_contains("_Incapsula_Resource") && !facts.body_contains("&ns=1&cb="))
+    {
         return Outcome::Challenge(Vendor::Imperva);
     }
 
