@@ -419,7 +419,7 @@ fn conclusion_to_py(c: &crate::report::Conclusion) -> (String, String) {
     (name.to_string(), vendor.unwrap_or_else(|| "-".to_string()))
 }
 
-fn client_error_to_py(e: ClientError) -> PyErr {
+pub(crate) fn client_error_to_py(e: ClientError) -> PyErr {
     let kind = match &e.kind {
         ErrorKind::Connection => "connection",
         ErrorKind::Timeout => "timeout",
@@ -857,6 +857,13 @@ struct PyBatchResult {
     url: String,
     response: Option<Response>,
     error: Option<String>,
+    /// The failure behind `error`, kept so `transport_error` can say more
+    /// than the message. Turned into a Python object only when asked for, so
+    /// a batch doesn't take the GIL for every failed request.
+    client_error: Option<ClientError>,
+    /// A `TransportError` handed to the constructor, which wins over
+    /// `client_error`.
+    transport_error: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -865,15 +872,30 @@ impl PyBatchResult {
     /// fixture mocks. Provide either `response` (a Response instance)
     /// for success, or `error` (a string) for failure. Both default to
     /// None; passing neither yields a degenerate "no response, no error"
-    /// result that `success` reports as False.
+    /// result that `success` reports as False. `transport_error`, if
+    /// given, must be a `TransportError`.
     #[new]
-    #[pyo3(signature = (url, response=None, error=None))]
-    fn new(url: String, response: Option<PyRef<'_, PyResponse>>, error: Option<String>) -> Self {
-        PyBatchResult {
+    #[pyo3(signature = (url, response=None, error=None, transport_error=None))]
+    fn new(
+        url: String,
+        response: Option<PyRef<'_, PyResponse>>,
+        error: Option<String>,
+        transport_error: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if let Some(ref t) = transport_error
+            && !t.is_instance_of::<TransportError>()
+        {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "transport_error must be a TransportError",
+            ));
+        }
+        Ok(PyBatchResult {
             url,
             response: response.map(|r| r.inner.clone()),
             error,
-        }
+            client_error: None,
+            transport_error: transport_error.map(Bound::unbind),
+        })
     }
 
     #[getter]
@@ -897,6 +919,19 @@ impl PyBatchResult {
         self.error.clone()
     }
 
+    /// The `TransportError` that `request()` would have raised for this
+    /// failure, with `kind`, `tls_failure`, `retryable`, `conclusion` and
+    /// `attempts`. None if the request succeeded.
+    #[getter]
+    fn transport_error(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        if let Some(ref t) = self.transport_error {
+            return Some(t.clone_ref(py));
+        }
+        self.client_error
+            .clone()
+            .map(|e| client_error_to_py(e).into_value(py).into_any())
+    }
+
     /// True if the request succeeded
     #[getter]
     fn success(&self) -> bool {
@@ -913,14 +948,16 @@ impl PyBatchResult {
 }
 
 fn to_py_batch_result(r: BatchResult) -> PyBatchResult {
-    let (response, error) = match r.result {
-        Ok(resp) => (Some(resp), None),
-        Err(e) => (None, Some(e.message)),
+    let (response, error, client_error) = match r.result {
+        Ok(resp) => (Some(resp), None, None),
+        Err(e) => (None, Some(e.message.clone()), Some(e)),
     };
     PyBatchResult {
         url: r.url,
         response,
         error,
+        client_error,
+        transport_error: None,
     }
 }
 

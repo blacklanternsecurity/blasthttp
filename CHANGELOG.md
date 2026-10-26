@@ -60,8 +60,15 @@ the ladder falling back to `compatibility` on the second handshake.
 - Connect failures before TLS say why too. A refused connection, a DNS failure
   or a proxy that refuses the tunnel now includes the cause, e.g. "tcp connect
   error: Connection refused (os error 111)", not only "client error
-  (Connect)", and a connect
-  timeout is reported as a timeout instead of a retryable connection error
+  (Connect)", and a connect timeout is reported as a timeout instead of a
+  retryable connection error
+- Batch failures carry the same detail. `BatchResult.transport_error` is the
+  `TransportError` that `request()` would have raised, with `kind`,
+  `retryable`, `conclusion` and the rest. `error` is still the message string
+- `blasthttp.mock` raises `TransportError` where the real client would: for a
+  URL with no mock response (`kind="connection"`) and for too many redirects
+  (`kind="too_many_redirects"`). A mocked batch request for an unmocked URL
+  gets a `transport_error` too
 - Asking for a pre-TLS1.2 version without naming a profile now selects
   `compatibility`, rather than failing with "no ciphers available" because the
   default offers nothing that exists in SSLv3

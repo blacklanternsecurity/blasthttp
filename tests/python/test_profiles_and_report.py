@@ -238,6 +238,28 @@ async def test_transport_error_is_still_a_runtime_error(client):
         await client.request("http://127.0.0.1:1/", timeout=5)
 
 
+async def test_a_failed_batch_request_carries_the_transport_error(client):
+    """A batch used to report only the message, so a caller had to parse it to
+    tell a timeout from a refused connection from a TLS failure."""
+    results = await client.request_batch([blasthttp.BatchConfig("http://127.0.0.1:1/", timeout=5)])
+    r = results[0]
+    assert isinstance(r.transport_error, blasthttp.TransportError)
+    assert r.transport_error.kind == "connection"
+    assert r.transport_error.retryable is True
+    assert r.transport_error.conclusion == "unreachable"
+    assert r.error == str(r.transport_error)
+
+
+async def test_a_successful_batch_request_has_no_transport_error(server, client):
+    results = await client.request_batch([blasthttp.BatchConfig(f"{server}/")])
+    assert results[0].transport_error is None
+
+
+def test_batch_result_takes_only_a_transport_error():
+    with pytest.raises(TypeError):
+        blasthttp.BatchResult("http://x/", error="e", transport_error=ValueError("e"))
+
+
 async def test_batch_results_carry_the_report(server, client):
     cfgs = [
         blasthttp.BatchConfig(f"{server}/"),

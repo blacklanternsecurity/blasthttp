@@ -333,6 +333,64 @@ async def test_batch_unmatched_url_yields_error_result():
     assert "No mock response" in results[0].error
 
 
+# ── errors match the real client ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unmatched_url_raises_transport_error():
+    """The real client raises TransportError for a host it can't reach, so the
+    mock does too. Code written as `except TransportError` that branches on
+    `kind` would otherwise crash under the mock on any URL a test didn't mock."""
+    mock = BlasthttpMock()
+    with pytest.raises(blasthttp.TransportError) as exc:
+        await mock.request("http://nothing/")
+    assert "No mock response" in str(exc.value)
+    assert exc.value.kind == "connection"
+    assert exc.value.conclusion == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_unmatched_url_is_still_a_runtime_error():
+    mock = BlasthttpMock()
+    with pytest.raises(RuntimeError):
+        await mock.request("http://nothing/")
+
+
+@pytest.mark.asyncio
+async def test_redirect_loop_raises_transport_error():
+    mock = BlasthttpMock()
+    mock.add_response(url="http://loop/", status_code=302, headers={"Location": "http://loop/"})
+    with pytest.raises(blasthttp.TransportError) as exc:
+        await mock.request("http://loop/", follow_redirects=True, max_redirects=2)
+    assert exc.value.kind == "too_many_redirects"
+    assert exc.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_batch_unmatched_url_carries_transport_error():
+    mock = BlasthttpMock()
+    results = await mock.request_batch([blasthttp.BatchConfig("http://nothing/")])
+    t = results[0].transport_error
+    assert isinstance(t, blasthttp.TransportError)
+    assert t.kind == "connection"
+    assert results[0].error == str(t)
+
+
+@pytest.mark.asyncio
+async def test_batch_callback_error_has_no_transport_error():
+    """An exception from a test's own callback is not a transport failure, so
+    it keeps the plain error string and nothing more."""
+    mock = BlasthttpMock()
+
+    def boom(request):
+        raise ValueError("callback broke")
+
+    mock.add_callback(boom, url="http://cb/")
+    results = await mock.request_batch([blasthttp.BatchConfig("http://cb/")])
+    assert "callback broke" in results[0].error
+    assert results[0].transport_error is None
+
+
 # ── should_intercept + pass-through ──────────────────────────────
 
 

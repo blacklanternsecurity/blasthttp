@@ -15,7 +15,8 @@
 //   (auth tuple → header, cookies dict → header, raise_error, etc.)
 //   is the consumer's responsibility, not ours.
 
-use crate::python::PyResponse;
+use crate::client::ClientError;
+use crate::python::{PyResponse, TransportError, client_error_to_py};
 use crate::response::Response;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyTypeError};
 use pyo3::prelude::*;
@@ -439,10 +440,12 @@ fn plan_dispatch(
     }
 
     let Some(handler) = pick_handler(py, state, url, method, &req_headers_dict, body)? else {
-        return Err(PyRuntimeError::new_err(format!(
+        // A TransportError like the real client's for an unreachable host,
+        // so `except TransportError` handles both the same way.
+        return Err(client_error_to_py(ClientError::connection(format!(
             "No mock response registered for {} {}",
             method, url
-        )));
+        ))));
     };
 
     match handler.kind {
@@ -801,9 +804,11 @@ impl PyBlasthttpMock {
                     Some(loc) => {
                         hops += 1;
                         if hops > max_hops {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "exceeded {} redirects starting from mock dispatch",
-                                max_hops
+                            return Err(client_error_to_py(ClientError::too_many_redirects(
+                                format!(
+                                    "exceeded {} redirects starting from mock dispatch",
+                                    max_hops
+                                ),
                             )));
                         }
                         current_url = loc;
@@ -1064,7 +1069,7 @@ impl PyMockBatchIterator {
                     return Python::attach(|py| -> PyResult<Py<PyAny>> {
                         match resp_or_err {
                             Ok(resp) => batch_result_obj(py, &entry.url, Some(resp), None),
-                            Err(e) => batch_result_obj(py, &entry.url, None, Some(e.to_string())),
+                            Err(e) => batch_error_obj(py, &entry.url, e),
                         }
                     });
                 }
@@ -1153,6 +1158,23 @@ fn batch_result_obj(
     if let Some(e) = error {
         kwargs.set_item("error", e)?;
     }
+    Ok(cls.call((url,), Some(&kwargs))?.unbind())
+}
+
+/// Build a failed `blasthttp.BatchResult` from a mock dispatch error.
+///
+/// A `TransportError` goes on `transport_error`, with its bare message as
+/// `error` the way a real batch reports it. Anything else, like an exception
+/// from a user's callback, keeps the old `"Type: message"` string.
+fn batch_error_obj(py: Python<'_>, url: &str, e: PyErr) -> PyResult<Py<PyAny>> {
+    let value = e.value(py);
+    if !value.is_instance_of::<TransportError>() {
+        return batch_result_obj(py, url, None, Some(e.to_string()));
+    }
+    let cls = py.import("blasthttp")?.getattr("BatchResult")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("error", value.str()?)?;
+    kwargs.set_item("transport_error", value)?;
     Ok(cls.call((url,), Some(&kwargs))?.unbind())
 }
 
