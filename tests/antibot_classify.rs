@@ -127,6 +127,46 @@ fn test_cloudflare_managed_challenge() {
 }
 
 #[test]
+fn test_cloudflare_script_is_not_a_challenge() {
+    // Turnstile's api.js names the challenge platform, but it's a script that
+    // loaded fine, not an interception.
+    let h = hdrs(&[
+        ("server", "cloudflare"),
+        ("content-type", "application/javascript; charset=UTF-8"),
+    ]);
+    let body = r#"var u="/cdn-cgi/challenge-platform/";function render(){}"#;
+    assert_ne!(
+        classify(&facts(200, &h, body)),
+        Outcome::Challenge(Vendor::new("cloudflare"))
+    );
+}
+
+#[test]
+fn test_cloudflare_javascript_detections_page_is_not_a_challenge() {
+    // Cloudflare injects this script tag into ordinary pages on sites with
+    // JavaScript detections on.
+    let h = hdrs(&[("server", "cloudflare"), ("content-type", "text/html")]);
+    let body = r#"<html><body>welcome<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></body></html>"#;
+    assert_ne!(
+        classify(&facts(200, &h, body)),
+        Outcome::Challenge(Vendor::new("cloudflare"))
+    );
+}
+
+#[test]
+fn test_cloudflare_challenge_body_on_a_refusal_is_a_challenge() {
+    // Without cf-mitigated, the markers still identify the challenge page.
+    let h = hdrs(&[("server", "cloudflare")]);
+    let body = "<html><script>window._cf_chl_opt={};</script></html>";
+    for status in [403, 503] {
+        assert_eq!(
+            classify(&facts(status, &h, body)),
+            Outcome::Challenge(Vendor::new("cloudflare"))
+        );
+    }
+}
+
+#[test]
 fn test_cloudflare_waf_block_is_not_a_challenge() {
     // A plain WAF refusal carries no cf-mitigated header. Calling it a
     // challenge would suggest a JS tier that is not actually there.

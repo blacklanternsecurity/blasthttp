@@ -10,11 +10,14 @@
     {
       "vendor": "cloudflare",
       "outcome": "challenge",
-      "when": {"any": [
-        {"body_contains": "/cdn-cgi/challenge-platform/"},
-        {"body_contains": "window._cf_chl_opt"}
+      "when": {"all": [
+        {"status": "refusal"},
+        {"any": [
+          {"body_contains": "/cdn-cgi/challenge-platform/"},
+          {"body_contains": "window._cf_chl_opt"}
+        ]}
       ]},
-      "why": "The challenge page's own markers, for when cf-mitigated is missing."
+      "why": "The challenge page's own markers, for when cf-mitigated is missing. Only on a refusal: on a 200 they're the vendor's script loading normally, as in Turnstile's api.js and pages carrying Cloudflare's injected JavaScript detections."
     },
     {
       "vendor": "akamai",
