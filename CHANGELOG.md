@@ -42,6 +42,11 @@ the ladder falling back to `compatibility` on the second handshake.
   challenge. Imperva appends it to pages it let through, so ordinary pages and
   the origin's own error pages were judged `needs_browser`. Imperva's incident
   page still counts
+- **The anti-bot rules are data.** What `protection` recognises now lives in
+  `antibot_rules.json` instead of code, and `blasthttp.set_antibot_rules(path)`
+  (`antibot::set_rules` in Rust) replaces them at runtime, so a rule can change
+  without a rebuild. `Vendor` is a name rather than a fixed list, so a rules
+  file can add a product
 - **TLS failures now say why.** The reason used to be destroyed in transit:
   hyper-util's error displays as the literal "client error (Connect)" for every
   connect-time failure, so a cipher mismatch, a rejected certificate, a DNS

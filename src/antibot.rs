@@ -16,38 +16,39 @@
 //! 2. A response that merely *references* a vendor's script is not a challenge
 //!    page. Every page on a protected site carries the loader; only a page
 //!    shaped like an interception is a block.
+//!
+//! The rules themselves are data, in `antibot_rules.json`: the copy built in
+//! is the default, and [`set_rules`] swaps in another at runtime, so a rule
+//! can change without a rebuild.
 
 use std::fmt;
+use std::sync::{Arc, LazyLock, RwLock};
 
-/// Which product answered. Not exhaustive, and deliberately conservative:
-/// guessing a vendor wrong is worse than reporting `Unknown`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Vendor {
-    Cloudflare,
-    Akamai,
-    DataDome,
-    PerimeterX,
-    Imperva,
-    F5,
-    Kasada,
-    AwsWaf,
-    Unknown,
+use serde::Deserialize;
+
+/// Which product answered, named by the rule that matched. Deliberately
+/// conservative: guessing a vendor wrong is worse than reporting unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Vendor(String);
+
+impl Vendor {
+    pub fn new(name: impl Into<String>) -> Self {
+        Vendor(name.into())
+    }
+
+    /// A refusal no rule could put a name to.
+    pub fn unknown() -> Self {
+        Vendor::new("unknown")
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.0 == "unknown"
+    }
 }
 
 impl fmt::Display for Vendor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Vendor::Cloudflare => "cloudflare",
-            Vendor::Akamai => "akamai",
-            Vendor::DataDome => "datadome",
-            Vendor::PerimeterX => "perimeterx",
-            Vendor::Imperva => "imperva",
-            Vendor::F5 => "f5",
-            Vendor::Kasada => "kasada",
-            Vendor::AwsWaf => "awswaf",
-            Vendor::Unknown => "unknown",
-        };
-        f.write_str(s)
+        f.write_str(&self.0)
     }
 }
 
@@ -92,12 +93,12 @@ impl Outcome {
     /// fingerprint. The cost of the alternative is doubling the request count
     /// of every scan that touches a 403, which is most of them.
     pub fn indicates_protection(&self) -> bool {
-        !matches!(self.vendor(), None | Some(Vendor::Unknown))
+        self.vendor().is_some_and(|v| !v.is_unknown())
     }
 
-    pub fn vendor(&self) -> Option<Vendor> {
+    pub fn vendor(&self) -> Option<&Vendor> {
         match self {
-            Outcome::Present(v) | Outcome::Challenge(v) | Outcome::Blocked(v) => Some(*v),
+            Outcome::Present(v) | Outcome::Challenge(v) | Outcome::Blocked(v) => Some(v),
             _ => None,
         }
     }
@@ -161,146 +162,154 @@ impl ResponseFacts<'_> {
     }
 }
 
-/// Classify one response.
+/// The rules a classification runs, as loaded from `antibot_rules.json`.
 ///
-/// Order matters: a challenge outranks a mere sighting of the vendor, and a
-/// block outranks both, because a host that challenges us has still told us
-/// more than one that refuses outright.
+/// Order matters, and the first rule to match decides: a challenge outranks a
+/// mere sighting of the vendor, and a block outranks both, because a host that
+/// challenges us has still told us more than one that refuses outright.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rules {
+    /// Statuses a protection product uses to refuse. 429 belongs because a rate
+    /// limit and a bot block are the same outcome for a scan, whoever sent it.
+    refusal_statuses: Vec<u16>,
+    rules: Vec<Rule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rule {
+    vendor: String,
+    outcome: RuleOutcome,
+    /// What the outcome becomes when the status is a refusal.
+    on_refusal: Option<RuleOutcome>,
+    when: Condition,
+    /// Why the rule is shaped the way it is. Not used, but worth keeping.
+    #[allow(dead_code)]
+    why: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuleOutcome {
+    Present,
+    Challenge,
+    Blocked,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum Condition {
+    All(Vec<Condition>),
+    Any(Vec<Condition>),
+    Not(Box<Condition>),
+    Status(Statuses),
+    HeaderPresent(String),
+    /// Case-insensitive, in both the name and the value.
+    HeaderContains {
+        name: String,
+        value: String,
+    },
+    CookieSet(String),
+    CookiePrefix(String),
+    BodyContains(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Statuses {
+    Codes(Vec<u16>),
+    Named(NamedStatuses),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NamedStatuses {
+    Refusal,
+}
+
+impl Rules {
+    pub fn from_json(json: &str) -> Result<Rules, serde_json::Error> {
+        let rules: Rules = serde_json::from_str(json)?;
+        if rules.rules.iter().any(|r| r.vendor.is_empty()) {
+            return Err(serde::de::Error::custom("every rule needs a vendor"));
+        }
+        Ok(rules)
+    }
+
+    /// Classify one response.
+    pub fn classify(&self, facts: &ResponseFacts) -> Outcome {
+        let refusal = self.is_refusal(facts.status);
+        if let Some(rule) = self.rules.iter().find(|r| self.matches(&r.when, facts)) {
+            let vendor = Vendor::new(&rule.vendor);
+            return match (refusal, rule.on_refusal) {
+                (true, Some(outcome)) => outcome,
+                _ => rule.outcome,
+            }
+            .with(vendor);
+        }
+        // Nothing identifiable
+        if (200..400).contains(&facts.status) {
+            Outcome::Ok
+        } else if refusal {
+            Outcome::Blocked(Vendor::unknown())
+        } else {
+            Outcome::Error
+        }
+    }
+
+    fn is_refusal(&self, status: u16) -> bool {
+        self.refusal_statuses.contains(&status)
+    }
+
+    fn matches(&self, condition: &Condition, facts: &ResponseFacts) -> bool {
+        match condition {
+            Condition::All(conditions) => conditions.iter().all(|c| self.matches(c, facts)),
+            Condition::Any(conditions) => conditions.iter().any(|c| self.matches(c, facts)),
+            Condition::Not(condition) => !self.matches(condition, facts),
+            Condition::Status(Statuses::Codes(codes)) => codes.contains(&facts.status),
+            Condition::Status(Statuses::Named(NamedStatuses::Refusal)) => {
+                self.is_refusal(facts.status)
+            }
+            Condition::HeaderPresent(name) => facts.has_header(name),
+            Condition::HeaderContains { name, value } => {
+                facts.header_matches(name, &value.to_ascii_lowercase())
+            }
+            Condition::CookieSet(name) => facts.sets_cookie(name),
+            Condition::CookiePrefix(prefix) => facts.sets_cookie_prefixed(prefix),
+            Condition::BodyContains(needle) => facts.body_contains(needle),
+        }
+    }
+}
+
+impl RuleOutcome {
+    fn with(self, vendor: Vendor) -> Outcome {
+        match self {
+            RuleOutcome::Present => Outcome::Present(vendor),
+            RuleOutcome::Challenge => Outcome::Challenge(vendor),
+            RuleOutcome::Blocked => Outcome::Blocked(vendor),
+        }
+    }
+}
+
+impl Default for Rules {
+    /// The rules built in from `antibot_rules.json`.
+    fn default() -> Self {
+        Rules::from_json(include_str!("../antibot_rules.json"))
+            .expect("the built-in antibot_rules.json is valid")
+    }
+}
+
+static RULES: LazyLock<RwLock<Arc<Rules>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(Rules::default())));
+
+/// Replace the rules every later classification runs, in this process.
+pub fn set_rules(rules: Rules) {
+    *RULES.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(rules);
+}
+
+/// Classify one response with the current rules.
 pub fn classify(facts: &ResponseFacts) -> Outcome {
-    // ── Cloudflare ────────────────────────────────────────────────
-    // `cf-mitigated: challenge` is the unambiguous one and the only header
-    // Cloudflare sets specifically to say it intervened.
-    if facts.header_matches("cf-mitigated", "challenge") {
-        return Outcome::Challenge(Vendor::Cloudflare);
-    }
-    if facts.body_contains("/cdn-cgi/challenge-platform/")
-        || facts.body_contains("window._cf_chl_opt")
-    {
-        return Outcome::Challenge(Vendor::Cloudflare);
-    }
-
-    // ── Akamai ────────────────────────────────────────────────────
-    // The edge error page, which is fussier to spot than it looks.
-    //
-    // It HTML-entity-encodes its own punctuation, so the body carries
-    // `errors&#46;edgesuite&#46;net` and a search for `errors.edgesuite.net`
-    // never fires. Matching the bare label `edgesuite` survives that, since
-    // only the dots and slashes get encoded.
-    //
-    // `server: AkamaiGHost` is also not reliably present: www.akamai.com's own
-    // 403 sends no `server` header at all and identifies itself through
-    // `akamai-grn`, `x-akam-sw-version` and an `ak_p` server-timing entry
-    // instead. So the server header is one signal among several rather than a
-    // requirement. `Reference #` on its own stays insufficient, because plenty
-    // of unrelated error pages carry one.
-    if facts.body_contains("edgesuite")
-        || (is_akamai_edge(facts) && facts.body_contains("Access Denied"))
-    {
-        return Outcome::Blocked(Vendor::Akamai);
-    }
-    // sec-cpt is an adaptive challenge that fires after _abck already passed,
-    // and it answers 428 rather than 403. Its own outcome, not a block.
-    if facts.status == 428 && (facts.sets_cookie("sec_cpt") || facts.body_contains("sec-cpt")) {
-        return Outcome::Challenge(Vendor::Akamai);
-    }
-
-    // ── DataDome ──────────────────────────────────────────────────
-    if facts.body_contains("geo.captcha-delivery.com") {
-        return Outcome::Challenge(Vendor::DataDome);
-    }
-
-    // ── PerimeterX / HUMAN ────────────────────────────────────────
-    if facts.body_contains("/px/captcha") || facts.body_contains("px-captcha") {
-        return Outcome::Challenge(Vendor::PerimeterX);
-    }
-
-    // ── Imperva / Incapsula ───────────────────────────────────────
-    // The `&ns=1&cb=` script is the loader Imperva adds to pages it let
-    // through, the origin's own error pages included, so on its own it's not
-    // an interception. Imperva's incident page frames itself as `CWUDNSAI`.
-    if facts.body_contains("_Incapsula_Resource?CWUDNSAI=")
-        || (facts.body_contains("_Incapsula_Resource") && !facts.body_contains("&ns=1&cb="))
-    {
-        return Outcome::Challenge(Vendor::Imperva);
-    }
-
-    // ── AWS WAF ───────────────────────────────────────────────────
-    // The header carries the action, and there is more than one: `challenge`
-    // for the silent JavaScript kind, `captcha` for the kind wanting a person.
-    // Matching only `challenge` missed wizzair.com, which answers 405 with
-    // `captcha`, so the ladder read a genuine interception as an ordinary
-    // refusal and declined to try anything else. Match the header's presence
-    // and let the value be detail.
-    if facts.has_header("x-amzn-waf-action") {
-        return Outcome::Challenge(Vendor::AwsWaf);
-    }
-
-    // ── Kasada ────────────────────────────────────────────────────
-    // Kasada answers 429 rather than 403 for a refusal.
-    if facts.has_header("x-kpsdk-ct") || facts.body_contains("KPSDK") {
-        return if facts.status == 429 {
-            Outcome::Blocked(Vendor::Kasada)
-        } else {
-            Outcome::Present(Vendor::Kasada)
-        };
-    }
-
-    // ── Product present, and we got through ───────────────────────
-    // Reached only when nothing above fired, so these are sightings on a
-    // response that actually carried content.
-    let present = if facts.sets_cookie("__cf_bm") || facts.sets_cookie("cf_clearance") {
-        Some(Vendor::Cloudflare)
-    } else if facts.sets_cookie("_abck")
-        || facts.sets_cookie("ak_bmsc")
-        || facts.sets_cookie("bm_sz")
-    {
-        Some(Vendor::Akamai)
-    } else if facts.sets_cookie("datadome") {
-        Some(Vendor::DataDome)
-    } else if facts.sets_cookie_prefixed("_px") {
-        Some(Vendor::PerimeterX)
-    } else if facts.sets_cookie_prefixed("visid_incap_") || facts.sets_cookie_prefixed("incap_ses_")
-    {
-        Some(Vendor::Imperva)
-    } else if facts.header_matches("server", "volt-adc") {
-        Some(Vendor::F5)
-    } else {
-        None
-    };
-
-    if let Some(vendor) = present {
-        // A product that set its cookie while refusing us is still a block.
-        return if is_refusal(facts.status) {
-            Outcome::Blocked(vendor)
-        } else {
-            Outcome::Present(vendor)
-        };
-    }
-
-    // ── Nothing identifiable ──────────────────────────────────────
-    if (200..400).contains(&facts.status) {
-        Outcome::Ok
-    } else if is_refusal(facts.status) {
-        Outcome::Blocked(Vendor::Unknown)
-    } else {
-        Outcome::Error
-    }
-}
-
-/// Statuses a protection product uses to refuse. 429 is in here because a rate
-/// limit and a bot block are the same outcome for a scan, whoever sent it.
-fn is_refusal(status: u16) -> bool {
-    matches!(status, 401 | 403 | 405 | 406 | 429 | 503)
-}
-
-/// Is this response coming off Akamai's edge at all?
-///
-/// Any one of these is enough. They are the headers the edge attaches to its
-/// own responses regardless of whether it is serving content or refusing.
-fn is_akamai_edge(facts: &ResponseFacts) -> bool {
-    facts.header_matches("server", "akamaighost")
-        || facts.has_header("akamai-grn")
-        || facts.has_header("x-akam-sw-version")
-        || facts.has_header("x-akamai-transformed")
-        || facts.header_matches("server-timing", "ak_p")
+    let rules = RULES.read().unwrap_or_else(|e| e.into_inner()).clone();
+    rules.classify(facts)
 }

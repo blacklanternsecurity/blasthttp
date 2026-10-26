@@ -2193,6 +2193,27 @@ fn register_h2_submodule<'py>(parent: &Bound<'py, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Replace the anti-bot rules every response in this process is classified
+/// with, from a JSON file shaped like the built-in `antibot_rules.json`.
+/// `None` restores the built-in rules. Raises ValueError on a bad file.
+#[pyfunction]
+#[pyo3(signature = (path=None))]
+fn set_antibot_rules(path: Option<std::path::PathBuf>) -> PyResult<()> {
+    let rules = match path {
+        None => crate::antibot::Rules::default(),
+        Some(path) => {
+            let json = std::fs::read_to_string(&path).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("{}: {e}", path.display()))
+            })?;
+            crate::antibot::Rules::from_json(&json).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("{}: {e}", path.display()))
+            })?
+        }
+    };
+    crate::antibot::set_rules(rules);
+    Ok(())
+}
+
 // ── Module registration ───────────────────────────────────────────
 
 #[pymodule]
@@ -2211,6 +2232,7 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHeaders>()?;
     m.add_class::<PyRequest>()?;
     m.add_class::<PyRawConnection>()?;
+    m.add_function(wrap_pyfunction!(set_antibot_rules, m)?)?;
     m.add("HTTPStatusError", m.py().get_type::<HTTPStatusError>())?;
     m.add("TransportError", m.py().get_type::<TransportError>())?;
     register_h2_submodule(m)?;

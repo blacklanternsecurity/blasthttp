@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::antibot::{Outcome, Vendor};
+use crate::antibot::Outcome;
 
 /// What one rung of the ladder produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +62,7 @@ impl Attempt {
     pub fn from_outcome(profile: &str, status: u16, outcome: &Outcome) -> Self {
         let vendor = outcome
             .vendor()
-            .filter(|v| !matches!(v, Vendor::Unknown))
+            .filter(|v| !v.is_unknown())
             .map(|v| v.to_string());
         let o = match outcome {
             Outcome::Ok | Outcome::Present(_) => AttemptOutcome::Reached { status },
@@ -111,7 +111,7 @@ impl Conclusion {
     pub fn from_attempts(last: &Outcome, attempts: &[Attempt]) -> Self {
         let vendor = last
             .vendor()
-            .filter(|v| !matches!(v, Vendor::Unknown))
+            .filter(|v| !v.is_unknown())
             .map(|v| v.to_string());
         match last {
             Outcome::Ok | Outcome::Present(_) => Conclusion::Reached,
@@ -132,13 +132,15 @@ impl Conclusion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::antibot::Vendor;
 
     #[test]
     fn test_a_challenge_asks_for_a_browser_and_a_block_does_not() {
         // The distinction the whole escalation path rests on. A block might
         // yield to different settings; a challenge needs JavaScript and never
         // will, so only one of these justifies starting a browser.
-        let challenge = Conclusion::from_attempts(&Outcome::Challenge(Vendor::Cloudflare), &[]);
+        let challenge =
+            Conclusion::from_attempts(&Outcome::Challenge(Vendor::new("cloudflare")), &[]);
         assert!(challenge.needs_browser());
         assert_eq!(
             challenge,
@@ -147,7 +149,7 @@ mod tests {
             }
         );
 
-        let blocked = Conclusion::from_attempts(&Outcome::Blocked(Vendor::Akamai), &[]);
+        let blocked = Conclusion::from_attempts(&Outcome::Blocked(Vendor::new("akamai")), &[]);
         assert!(!blocked.needs_browser());
     }
 
@@ -155,13 +157,13 @@ mod tests {
     fn test_an_unnamed_vendor_is_left_unnamed() {
         // Reporting "unknown" as though it were a product would invite a
         // consumer to branch on it. An absent vendor is the honest answer.
-        let blocked = Conclusion::from_attempts(&Outcome::Blocked(Vendor::Unknown), &[]);
+        let blocked = Conclusion::from_attempts(&Outcome::Blocked(Vendor::unknown()), &[]);
         assert_eq!(blocked, Conclusion::Blocked { vendor: None });
     }
 
     #[test]
     fn test_reaching_it_is_not_an_escalation() {
-        for outcome in [Outcome::Ok, Outcome::Present(Vendor::Akamai)] {
+        for outcome in [Outcome::Ok, Outcome::Present(Vendor::new("akamai"))] {
             let c = Conclusion::from_attempts(&outcome, &[]);
             assert_eq!(c, Conclusion::Reached);
             assert!(!c.needs_browser());
@@ -171,7 +173,11 @@ mod tests {
     #[test]
     fn test_attempts_record_the_profile_that_produced_them() {
         // The log is only useful if it says which rung did what.
-        let a = Attempt::from_outcome("modern", 403, &Outcome::Challenge(Vendor::PerimeterX));
+        let a = Attempt::from_outcome(
+            "modern",
+            403,
+            &Outcome::Challenge(Vendor::new("perimeterx")),
+        );
         assert_eq!(a.profile, "modern");
         assert_eq!(
             a.outcome,
