@@ -57,6 +57,11 @@ the ladder falling back to `compatibility` on the second handshake.
 - Fixes a consequence of that: TLS failures were being retried, because they
   were misclassified as connection errors, contradicting the rule that says
   they should not be
+- Connect failures before TLS say why too. A refused connection, a DNS failure
+  or a proxy that refuses the tunnel now includes the cause, e.g. "tcp connect
+  error: Connection refused (os error 111)", not only "client error
+  (Connect)", and a connect
+  timeout is reported as a timeout instead of a retryable connection error
 - Asking for a pre-TLS1.2 version without naming a profile now selects
   `compatibility`, rather than failing with "no ciphers available" because the
   default offers nothing that exists in SSLv3

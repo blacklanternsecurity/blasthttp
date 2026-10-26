@@ -1233,8 +1233,8 @@ async fn dispatch_request(
 /// `test_tls_error_is_not_retryable` says they should not be.
 ///
 /// The real reason was recorded by the connector on its way out, so look it up
-/// by host. Absent an entry, the failure happened before TLS and connection is
-/// the honest answer.
+/// by host. Absent an entry, the failure happened before TLS, and the cause is
+/// further down the error's `source()` chain.
 fn classify_dispatch_error(
     e: &hyper_util::client::legacy::Error,
     uri: &http::Uri,
@@ -1252,7 +1252,38 @@ fn classify_dispatch_error(
             format!("TLS handshake failed: {}", describe_tls_failure(&failure)),
             failure,
         ),
-        None => ClientError::connection(format!("request failed: {}", e)),
+        None => error_from_chain("request failed", e),
+    }
+}
+
+/// Build a `ClientError` from every error in `e`'s `source()` chain.
+///
+/// hyper and hyper-util keep the cause below the top-level error. hyper-util's
+/// top level reads "client error (Connect)" whatever went wrong, the
+/// connector's error under it says "tcp connect error", and only the
+/// `io::Error` under that says "Connection refused". So the message is the
+/// whole chain, and a timeout anywhere in it makes this a timeout rather than
+/// a connection error, which is what the direct path reports for the same
+/// failure.
+fn error_from_chain(context: &str, e: &(dyn std::error::Error + 'static)) -> ClientError {
+    let mut parts = Vec::new();
+    let mut timed_out = false;
+    let mut current = Some(e);
+    while let Some(err) = current {
+        if let Some(io) = err.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::TimedOut
+        {
+            timed_out = true;
+        }
+        parts.push(err.to_string());
+        current = err.source();
+    }
+
+    let message = format!("{}: {}", context, parts.join(": "));
+    if timed_out {
+        ClientError::timeout(message)
+    } else {
+        ClientError::connection(message)
     }
 }
 
@@ -1730,15 +1761,13 @@ async fn dispatch_direct(
     }
     debug_record(log, v, 1, "   Sending request via dispatch_direct...");
 
-    let hyper_response = sender.send_request(request).await.map_err(|e| {
-        let msg = format!("dispatch_direct request failed: {}", e);
-        let err_str = e.to_string().to_lowercase();
-        if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
-            ClientError::tls(msg)
-        } else {
-            ClientError::connection(msg)
-        }
-    })?;
+    // TLS is already done by this point, and a failure there was reported
+    // with its reason by `connect_stream`, so whatever fails here is the
+    // connection.
+    let hyper_response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| error_from_chain("dispatch_direct request failed", &e))?;
 
     let resp = parse_response(hyper_response, config, log).await?;
 
@@ -3221,6 +3250,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stands in for hyper-util's errors: says nothing itself, and keeps the
+    /// cause in `source()`.
+    #[derive(Debug)]
+    struct Wrapper(&'static str, std::io::Error);
+
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.1)
+        }
+    }
+
+    #[test]
+    fn test_error_from_chain_includes_the_cause() {
+        let e = Wrapper(
+            "tcp connect error",
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        );
+        let err = error_from_chain("request failed", &e);
+        assert_eq!(err.kind, super::super::ErrorKind::Connection);
+        assert!(
+            err.message
+                .starts_with("request failed: tcp connect error: "),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.to_lowercase().contains("refused"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_error_from_chain_finds_a_timeout_below_the_top() {
+        let e = Wrapper(
+            "client error (Connect)",
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy tunnel timed out"),
+        );
+        let err = error_from_chain("request failed", &e);
+        assert_eq!(err.kind, super::super::ErrorKind::Timeout);
+        assert!(
+            err.message.contains("proxy tunnel timed out"),
+            "{}",
+            err.message
+        );
+    }
 
     #[test]
     fn test_exhausted_host_expires() {
