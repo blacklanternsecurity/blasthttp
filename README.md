@@ -117,7 +117,7 @@ Output is JSON (one object per response), including status, headers, redirect ch
 | `-x, --proxy` | HTTP/SOCKS proxy URL | |
 | `--no-proxy` | Host that bypasses the proxy: `host`, `*.suffix`, IP, CIDR, or `*` (repeatable) | |
 | `--profile` | Connection profile: `modern`, `compatibility`, `chrome` | `modern` |
-| `--ciphers` | OpenSSL cipher string | from the profile |
+| `--ciphers` | OpenSSL cipher string (`:!aNULL` is appended under `--verify`) | from the profile |
 | `--min-tls` | Minimum TLS version (`3.0` for SSLv3, or 1.0–1.3) | |
 | `--max-tls` | Maximum TLS version (`3.0` for SSLv3, or 1.0–1.3) | |
 | `-v, --verbose` | Verbose output (-vv includes body) | |
@@ -245,7 +245,7 @@ All parameters except `url` are optional:
 | `proxy` | `str` | HTTP/SOCKS proxy URL |
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
 | `profile` | `str` | Connection profile: `modern` (default), `compatibility`, `chrome` |
-| `cipher_string` | `str` | OpenSSL cipher string. Overrides the profile's, and pins it so the ladder will not move |
+| `cipher_string` | `str` | OpenSSL cipher string. Overrides the profile's, and pins it so the ladder will not move. `:!aNULL` is appended whenever `verify_certs` is on, since an anonymous suite would skip the check |
 | `min_tls_version` | `str` | Minimum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
 | `max_tls_version` | `str` | Maximum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
 | `retries` | `int` | Number of retries on failure |

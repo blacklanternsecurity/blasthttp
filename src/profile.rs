@@ -227,8 +227,8 @@ pub const COMPATIBILITY: ConnectionProfile = ConnectionProfile {
         ciphersuites: None,
         // Every suite the build provides except the eNULL ones. Includes the
         // aNULL suites, which skip authentication: worth reaching for a
-        // scanner, and this client already does not verify certificates by
-        // default, so they give up nothing that was being enforced.
+        // scanner while verification is off, and dropped whenever it is on
+        // (see `verified_cipher_list`).
         cipher_list: "ALL",
         sigalgs: None,
         groups: None,

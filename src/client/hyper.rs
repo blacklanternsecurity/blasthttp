@@ -8,6 +8,7 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read;
@@ -192,6 +193,21 @@ pub(crate) fn bisect_disabled(layer: &str) -> bool {
 /// Precedence is: an explicit setting beats the profile, and the profile beats
 /// the default. A caller who names a cipher string means it, and several
 /// existing tests depend on that still being true.
+/// The cipher list to offer: `base` untouched when verification is off, with
+/// `!aNULL` appended when it is on.
+///
+/// An anonymous suite sends no certificate, and OpenSSL skips verify-peer (and
+/// the hostname check with it) when none arrives, so offering one to a caller
+/// who set `verify_certs` would report a verified handshake that checked
+/// nothing. This applies to a caller's own `cipher_string` too.
+fn verified_cipher_list(base: &str, verify: bool) -> Cow<'_, str> {
+    if verify {
+        Cow::Owned(format!("{base}:!aNULL"))
+    } else {
+        Cow::Borrowed(base)
+    }
+}
+
 fn apply_tls_settings(
     builder: &mut openssl::ssl::SslConnectorBuilder,
     config: &RequestConfig,
@@ -275,12 +291,15 @@ fn apply_tls_settings(
     // reach the wire whatever the security level says, so a server speaking
     // only one of them is unreachable, which is the whole reason this project
     // builds its own OpenSSL.
-    let ciphers = config
-        .cipher_string
-        .as_deref()
-        .unwrap_or(profile.tls.cipher_list);
+    let ciphers = verified_cipher_list(
+        config
+            .cipher_string
+            .as_deref()
+            .unwrap_or(profile.tls.cipher_list),
+        config.should_verify_certs(),
+    );
     builder
-        .set_cipher_list(ciphers)
+        .set_cipher_list(&ciphers)
         .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
 
     let min_version = config
@@ -4082,5 +4101,38 @@ mod tests {
     fn test_tunnel_proxy_rejects_what_the_parser_rejects() {
         assert!(TunnelProxy::from_url("ftp://proxy:21").is_err());
         assert!(TunnelProxy::from_url("http://:8080").is_err());
+    }
+
+    // ── verified_cipher_list ──────────────────────────────────────
+
+    #[test]
+    fn test_unverified_list_is_untouched() {
+        assert_eq!(verified_cipher_list("ALL", false), "ALL");
+        assert_eq!(verified_cipher_list("RC4-SHA", false), "RC4-SHA");
+        assert_eq!(
+            verified_cipher_list("ADH-AES128-SHA", false),
+            "ADH-AES128-SHA"
+        );
+    }
+
+    #[test]
+    fn test_unverified_list_is_borrowed() {
+        assert!(matches!(
+            verified_cipher_list("ALL", false),
+            Cow::Borrowed("ALL")
+        ));
+    }
+
+    #[test]
+    fn test_verifying_drops_anonymous_suites() {
+        assert_eq!(verified_cipher_list("ALL", true), "ALL:!aNULL");
+    }
+
+    #[test]
+    fn test_verifying_drops_them_from_a_caller_list_too() {
+        assert_eq!(
+            verified_cipher_list("ADH-AES128-SHA", true),
+            "ADH-AES128-SHA:!aNULL"
+        );
     }
 }

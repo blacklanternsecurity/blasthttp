@@ -486,3 +486,142 @@ async fn test_a_pinned_request_does_not_teach_the_host_memory() {
 
     server.shutdown().await;
 }
+
+// ── Anonymous suites must not survive turning verification on ─────
+//
+// The other half of `test_anon_dh_reachable_by_default`: with verification off
+// anonymous suites stay reachable, and with it on they are never offered, since
+// a suite with no certificate would make the check pass while checking nothing.
+
+/// An anonymous-DH-only server. These suites only exist at TLS 1.2 and below.
+async fn anon_dh_server() -> TlsTestServer {
+    TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("ADH-AES128-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await
+}
+
+/// Ask for verification against an anonymous-DH server and assert we do not
+/// reach it. `cipher_string` is whatever the caller would have set.
+async fn assert_unreachable_with_verification(cipher_string: Option<&str>) {
+    let server = anon_dh_server().await;
+
+    let mut config = default_config(&server.url());
+    config.verify_certs = Some(true);
+    config.cipher_string = cipher_string.map(str::to_string);
+
+    let result = HyperClient::new().send(&config).await;
+    assert!(
+        result.is_err(),
+        "verify_certs was on, so a server with no certificate must be out of \
+         reach, but the request succeeded with status {:?}",
+        result.as_ref().ok().map(|r| r.status)
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_unreachable_when_verifying() {
+    // No pin, so this walks the ladder: `compatibility` must not bring the
+    // anonymous suites back either.
+    assert_unreachable_with_verification(None).await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_unreachable_when_verifying_with_explicit_ciphers() {
+    // `ALL` admits the anonymous suites. The caller also asked for
+    // verification, and that is the half we honor.
+    assert_unreachable_with_verification(Some("ALL")).await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_unreachable_when_verifying_on_direct_path() {
+    // `resolve_ip` builds its TLS context through `connect_stream`, not the
+    // pooled connector, so cover that path too.
+    let server = anon_dh_server().await;
+
+    let mut config = default_config(&server.url());
+    config.verify_certs = Some(true);
+    config.resolve_ip = Some("127.0.0.1".to_string());
+
+    let result = HyperClient::new().send(&config).await;
+    assert!(
+        result.is_err(),
+        "the direct path must exclude anonymous suites too, but got status {:?}",
+        result.as_ref().ok().map(|r| r.status)
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_anon_dh_reachable_on_direct_path_without_verification() {
+    // With verification off the same path still reaches it.
+    let server = anon_dh_server().await;
+
+    let mut config = default_config(&server.url());
+    config.resolve_ip = Some("127.0.0.1".to_string());
+
+    let result = HyperClient::new().send(&config).await;
+    assert!(
+        result.is_ok(),
+        "verification is off, so the direct path should still reach an \
+         anonymous-DH server: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
+/// The cipher suites `compatibility` offers, with verification on or off.
+async fn compatibility_hello_ciphers(verify: bool) -> Vec<u16> {
+    let server = TlsTestServer::start(TlsServerConfig::default()).await;
+
+    let mut config = default_config(&server.url());
+    config.profile = Some("compatibility".to_string());
+    config.verify_certs = Some(verify);
+    // The self-signed cert fails verification; only the hello matters here.
+    let _ = HyperClient::new().send(&config).await;
+
+    let hello = server
+        .hello
+        .lock()
+        .expect("hello slot poisoned")
+        .clone()
+        .expect("server recorded no ClientHello");
+    server.shutdown().await;
+    hello.ciphers
+}
+
+#[tokio::test]
+async fn test_verification_removes_only_anonymous_suites() {
+    // TLS_DH_anon_WITH_AES_128_CBC_SHA (ADH-AES128-SHA).
+    const ADH_AES128_SHA: u16 = 0x0034;
+
+    let unverified = compatibility_hello_ciphers(false).await;
+    let verified = compatibility_hello_ciphers(true).await;
+
+    assert!(
+        unverified.contains(&ADH_AES128_SHA),
+        "with verification off, compatibility must still offer anonymous suites"
+    );
+    assert!(
+        !verified.contains(&ADH_AES128_SHA),
+        "with verification on, anonymous suites must not be offered"
+    );
+    // Removing them must cost nothing else: what remains is the unverified
+    // offer, in the same order, minus the anonymous suites.
+    let mut remaining = unverified.iter().filter(|c| verified.contains(c));
+    assert!(
+        verified.iter().all(|c| remaining.next() == Some(c)),
+        "verification should only remove suites, not add or reorder them"
+    );
+    assert!(
+        verified.len() < unverified.len(),
+        "expected fewer suites with verification on"
+    );
+}

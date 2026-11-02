@@ -110,6 +110,7 @@ the ladder falling back to `compatibility` on the second handshake.
 - SSLv3 works. `min_tls_version` / `max_tls_version` / `--min-tls` / `--max-tls` accept `3.0` (also `ssl3`, `sslv3`), and an SSLv3-only server is reachable without asking for it
 - The OpenSSL build cache is keyed on the feature flags and version as well as the target, so changing what the build asks for triggers a rebuild. The first run after upgrading rebuilds once
 - Export ciphers are not supported. OpenSSL removed them outright in 1.1.0, so no build flag brings them back
+- With `verify_certs` on, anonymous (aNULL) suites are never offered, including from an explicit `cipher_string`. They send no certificate, so verification would report success while checking nothing. With verification off, nothing is excluded
 
 ## 0.10.1
 
