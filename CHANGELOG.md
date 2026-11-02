@@ -2,14 +2,13 @@
 
 ## 1.0.0
 
-Breaking: a request that names no profile no longer offers 105 cipher suites
-and every protocol version back to SSLv3. It sends `modern` instead, which is
-11 suites and TLS 1.2 or 1.3. A server too old for that is still reached, by
+Breaking: a request that names no profile now sends `modern`, which is 11
+suites and TLS 1.2 or 1.3. A server too old for that is still reached, by
 the ladder falling back to `compatibility` on the second handshake.
 
-- **Connection profiles.** Three of them. `compatibility` is a faithful
-  transcription of what 0.10 sent by default, kept byte-identical and verified
-  by the existing tests. `modern` is new. `chrome131` imitates Chrome's TLS,
+- **Connection profiles.** Three of them. `compatibility` offers every suite
+  the build provides and every protocol version back to SSLv3. `modern` offers
+  11 current suites and claims nothing. `chrome131` imitates Chrome's TLS,
   HTTP/2 settings and headers together. Select one with `profile=`; an unknown
   name is now an error rather than silently falling back
 - **Automatic shifting between them.** A handshake failure that suggests the
@@ -89,11 +88,8 @@ the ladder falling back to `compatibility` on the second handshake.
   discovery cannot be overlapped with anything
 - `raw_connect`, and requests using `resolve_ip` or `request_target`, widen
   their cipher offer and retry on a handshake the peer could not negotiate,
-  the same as an ordinary request. These bypass the pooled client, so they
-  bypassed the ladder too, and when the default narrowed from 105 suites to 11
-  they quietly lost the legacy reach the custom OpenSSL build exists to give
-  them. They stop at that rung: the other one reacts to a refusal by changing
-  what the client claims to be, and these are the callers who asked for exact
+  the same as an ordinary request. They stop at that rung: the other one
+  reacts to a refusal by changing what the client claims to be, and these are the callers who asked for exact
   control over one request
 - `download()` takes `profile`, `cipher_string`, `min_tls_version`,
   `max_tls_version` and `redirect_cookies`. It hardcoded no profile with no
@@ -108,17 +104,18 @@ the ladder falling back to `compatibility` on the second handshake.
   did not, so one deliberate `profile="chrome"` request turned every later
   request to that host into a browser claim, and made the outcome depend on
   the order two unrelated requests ran in
+- Legacy ciphers are reachable, which is what the custom OpenSSL build has always been for. `compatibility` offers every suite the build provides, so a server speaking only RC4, RC4-MD5, 3DES, SEED, Camellia or anonymous DH is reachable without passing `cipher_string` yourself
+- Null-encryption suites are the deliberate exception. They stay reachable through an explicit `cipher_string` but are never offered by any profile, since negotiating one by accident returns a connection that looks like TLS and encrypts nothing
+- The profile's cipher list applies on both TLS paths, the pooled client and the `resolve_ip` / `request_target` / `raw_connect` path, which build their SSL contexts separately
+- SSLv3 works. `min_tls_version` / `max_tls_version` / `--min-tls` / `--max-tls` accept `3.0` (also `ssl3`, `sslv3`), and an SSLv3-only server is reachable without asking for it
+- The OpenSSL build cache is keyed on the feature flags and version as well as the target, so changing what the build asks for triggers a rebuild. The first run after upgrading rebuilds once
+- Export ciphers are not supported. OpenSSL removed them outright in 1.1.0, so no build flag brings them back
 
 ## 0.10.1
 
-- Legacy ciphers are offered by default, which is what the custom OpenSSL build has always been for. A server speaking only RC4, RC4-MD5, 3DES, SEED, Camellia or anonymous DH is now reachable without passing `cipher_string` yourself. Previously `SslConnector::builder` installed its own list (`DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`) and nothing replaced it, so those suites never reached the wire and such a server was unreachable at any setting. `set_security_level(0)` did not help: the security level governs how weak a negotiated cipher may be, not which ones are offered
-- Null-encryption suites are the deliberate exception. They stay reachable through an explicit `cipher_string` but are never offered by default, since negotiating one by accident returns a connection that looks like TLS and encrypts nothing
-- The default applies on both TLS paths, the pooled client and the `resolve_ip` / `request_target` / `raw_connect` path, which build their SSL contexts separately
-- This widens the ClientHello from 31 cipher suites to 105, which changes the client's TLS fingerprint. Anything matching on JA3/JA4 will see a different value than it did on 0.10.0
-- SSLv3 works, for the first time. It had never been reachable in any build: `scripts/build-openssl.sh` passed `enable-ssl3`, but OpenSSL's Configure has a disable cascade reading "if `ssl3-method` is off, turn `ssl3` off too", and `ssl3-method` is off by default. The flag was silently undone, so every shipped build had `OPENSSL_NO_SSL3` defined and no `SSLv3_method` symbols. The script now passes `enable-ssl3-method` as well
-- `SslConnector::builder` also sets `NO_SSLV3`, which nothing cleared, and `parse_tls_version` only understood 1.0 through 1.3, so SSLv3 had no spelling even if the build had provided it. Both are fixed: the option is cleared on both TLS paths, and `min_tls_version` / `max_tls_version` / `--min-tls` / `--max-tls` now accept `3.0` (also `ssl3`, `sslv3`). An SSLv3-only server is reachable without asking for it
-- The OpenSSL build cache is keyed on the feature flags and version as well as the target, so changing what the build asks for now triggers a rebuild instead of silently reusing a build made a different way. The first run after upgrading rebuilds once
-- README no longer claims export ciphers work. OpenSSL removed them outright in 1.1.0, so no build flag brings them back
+- Python 3.15 support: PyO3 0.30, and 3.15 wheels are published
+- CI tests 3.11 through 3.15; 3.10 wheels are still published but no longer tested
+- Dependency updates (brotli 9, hyper 1.12, tokio 1.53.3, and others)
 
 ## 0.10.0
 
