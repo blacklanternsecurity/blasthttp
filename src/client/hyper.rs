@@ -359,20 +359,29 @@ type CertSlot = Arc<Mutex<Option<CertInfo>>>;
 /// will lag, but the value will always be an IP that *was* used).
 type PeerSlot = Arc<Mutex<HashMap<String, IpAddr>>>;
 
-/// Where the connector leaves the reason a TLS handshake failed, keyed the
-/// same way as `PeerSlot`.
+/// A failed TLS handshake, as the connector hands it to hyper-util.
 ///
-/// This exists because the reason is destroyed on the way out. The connector
-/// hands hyper-util a `Box<dyn Error>`, hyper-util wraps it in an error whose
-/// `Display` is the literal string "client error (Connect)", and nothing ever
-/// calls `.source()` to get back down to it. So by the time a failure reaches
-/// the caller, a cipher mismatch, a rejected certificate, a DNS failure and a
-/// refused connection are indistinguishable.
-///
-/// Keyed per host rather than held in a single slot because a cached client
-/// serves many hosts concurrently, and `CertSlot` already demonstrates what
-/// last-writer-wins does to a shared slot under load.
-type TlsFailureSlot = Arc<Mutex<HashMap<String, TlsFailure>>>;
+/// hyper-util wraps it in an error whose `Display` is just "client error
+/// (Connect)", but keeps it as that error's `source()`, so
+/// `classify_dispatch_error` finds it again by walking the chain. The reason
+/// travels with the error of the request it belongs to.
+#[derive(Debug)]
+struct TlsHandshakeError {
+    failure: TlsFailure,
+    inner: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for TlsHandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl std::error::Error for TlsHandshakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.inner)
+    }
+}
 
 /// Build the lookup key for `PeerSlot` from a URI's host and port.
 /// HTTPS defaults to 443, everything else to 80 — matches what
@@ -492,8 +501,6 @@ struct OpenSslConnector {
     // opened, read after each redirect hop so the right IP gets stamped
     // on the `RedirectHop` (or final `Response`).
     peer_slot: PeerSlot,
-    // Why the last handshake to a given host failed. See `TlsFailureSlot`.
-    tls_failure_slot: TlsFailureSlot,
     connect_timeout: Duration,
     // Set when requests go through a CONNECT or SOCKS5 proxy. The connector
     // opens the tunnel itself, so that TLS is with the target, inside it.
@@ -656,7 +663,6 @@ impl OpenSslConnector {
         config: &RequestConfig,
         cert_slot: CertSlot,
         peer_slot: PeerSlot,
-        tls_failure_slot: TlsFailureSlot,
     ) -> Result<Self, ClientError> {
         // Ensure legacy ciphers (RC4, DES, etc.) are available
         ensure_legacy_provider();
@@ -703,7 +709,6 @@ impl OpenSslConnector {
             ssl,
             cert_slot,
             peer_slot,
-            tls_failure_slot,
             connect_timeout,
             proxy: None,
         })
@@ -832,7 +837,6 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
         let ssl_connector = self.ssl.clone();
         let profile_active = self.profile_active;
         let cert_slot = self.cert_slot.clone();
-        let tls_failure_slot = self.tls_failure_slot.clone();
         let peer_slot = self.peer_slot.clone();
         let connect_timeout = self.connect_timeout;
 
@@ -926,32 +930,27 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
             let mut stream = tokio_openssl::SslStream::new(ssl_conf, tcp_stream)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
-            // Record why, then box the error away as hyper-util requires.
-            // This is the only point where the reason still exists.
-            let record = |failure: TlsFailure| {
-                if let Some(ref key) = slot_key
-                    && let Ok(mut slot) = tls_failure_slot.lock()
-                {
-                    slot.insert(key.clone(), failure);
-                }
-            };
-
+            // Attach why, so it survives being boxed away as hyper-util requires.
             tokio::time::timeout(connect_timeout, Pin::new(&mut stream).connect())
                 .await
                 .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                    record(TlsFailure::Timeout);
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "TLS handshake with {} timed out after {}s",
-                            host,
-                            connect_timeout.as_secs()
-                        ),
-                    ))
+                    Box::new(TlsHandshakeError {
+                        failure: TlsFailure::Timeout,
+                        inner: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "TLS handshake with {} timed out after {}s",
+                                host,
+                                connect_timeout.as_secs()
+                            ),
+                        )),
+                    })
                 })?
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    record(TlsFailure::from_openssl(&e));
-                    Box::new(e)
+                    Box::new(TlsHandshakeError {
+                        failure: TlsFailure::from_openssl(&e),
+                        inner: Box::new(e),
+                    })
                 })?;
 
             // Extract cert info after successful handshake
@@ -1055,13 +1054,6 @@ pub struct HyperClient {
     // a refusal from it is taken as the answer instead of walking the ladder
     // again; see `ladder_exhausted`.
     host_exhausted: Mutex<HashMap<String, Instant>>,
-    // Why the last handshake to each host failed.
-    //
-    // Deliberately on the client rather than on `CachedClient`: a retry with
-    // different TLS settings builds a *different* cached client, and it still
-    // needs to read why the previous attempt failed. Per-cached-client would
-    // partition this map by exactly the thing it exists to inform.
-    tls_failures: TlsFailureSlot,
 }
 
 impl Default for HyperClient {
@@ -1076,7 +1068,6 @@ impl HyperClient {
             cached: Mutex::new(std::collections::HashMap::new()),
             host_profiles: Mutex::new(HashMap::new()),
             host_exhausted: Mutex::new(HashMap::new()),
-            tls_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1143,12 +1134,7 @@ impl HyperClient {
 
         let cert_slot: CertSlot = Arc::new(Mutex::new(None));
         let peer_slot: PeerSlot = Arc::new(Mutex::new(HashMap::new()));
-        let connector = OpenSslConnector::new(
-            config,
-            cert_slot.clone(),
-            peer_slot.clone(),
-            self.tls_failures.clone(),
-        )?;
+        let connector = OpenSslConnector::new(config, cert_slot.clone(), peer_slot.clone())?;
         let mut builder = Client::builder(TokioExecutor::new());
 
         // Shape the HTTP/2 SETTINGS and connection window to the profile.
@@ -1212,7 +1198,6 @@ async fn dispatch_request(
     config: &RequestConfig,
     log: &DebugLog,
     redirect_cookies: Option<&str>,
-    tls_failures: &TlsFailureSlot,
 ) -> Result<SingleResponse, ClientError> {
     // The pooled high-level client populates Host / :authority from the URI
     // itself, so we don't add a Host header here. Adding it would cause
@@ -1238,7 +1223,7 @@ async fn dispatch_request(
     let hyper_response = client
         .request(request)
         .await
-        .map_err(|e| classify_dispatch_error(&e, uri, tls_failures))?;
+        .map_err(|e| classify_dispatch_error(&e))?;
 
     parse_response(hyper_response, config, log).await
 }
@@ -1251,28 +1236,24 @@ async fn dispatch_request(
 /// connection error. That also meant TLS failures were being retried, which
 /// `test_tls_error_is_not_retryable` says they should not be.
 ///
-/// The real reason was recorded by the connector on its way out, so look it up
-/// by host. Absent an entry, the failure happened before TLS, and the cause is
-/// further down the error's `source()` chain.
-fn classify_dispatch_error(
-    e: &hyper_util::client::legacy::Error,
-    uri: &http::Uri,
-    tls_failures: &TlsFailureSlot,
-) -> ClientError {
-    let recorded = peer_slot_key(uri).and_then(|key| {
-        tls_failures
-            .lock()
-            .ok()
-            .and_then(|slot| slot.get(&key).cloned())
-    });
-
-    match recorded {
-        Some(failure) => ClientError::tls_detailed(
-            format!("TLS handshake failed: {}", describe_tls_failure(&failure)),
-            failure,
-        ),
-        None => error_from_chain("request failed", e),
+/// The connector attaches a failed handshake's reason as a `TlsHandshakeError`
+/// somewhere down the `source()` chain. Without one, the failure happened
+/// before TLS, and `error_from_chain` reports the cause.
+fn classify_dispatch_error(e: &hyper_util::client::legacy::Error) -> ClientError {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(tls) = err.downcast_ref::<TlsHandshakeError>() {
+            return ClientError::tls_detailed(
+                format!(
+                    "TLS handshake failed: {}",
+                    describe_tls_failure(&tls.failure)
+                ),
+                tls.failure.clone(),
+            );
+        }
+        current = err.source();
     }
+    error_from_chain("request failed", e)
 }
 
 /// Build a `ClientError` from every error in `e`'s `source()` chain.
@@ -2414,7 +2395,6 @@ impl HyperClient {
                 config,
                 log,
                 hop_cookies,
-                &self.tls_failures,
             )
             .await?
         };
