@@ -3092,6 +3092,7 @@ enum Codec {
     Gzip,
     Deflate,
     Brotli,
+    Zstd,
     Identity,
 }
 
@@ -3103,6 +3104,7 @@ impl Codec {
             "gzip" | "x-gzip" => Some(Codec::Gzip),
             "deflate" => Some(Codec::Deflate),
             "br" => Some(Codec::Brotli),
+            "zstd" => Some(Codec::Zstd),
             "identity" => Some(Codec::Identity),
             _ => None,
         }
@@ -3113,6 +3115,7 @@ impl Codec {
             Codec::Gzip => "gzip",
             Codec::Deflate => "deflate",
             Codec::Brotli => "brotli",
+            Codec::Zstd => "zstd",
             Codec::Identity => "identity",
         }
     }
@@ -3125,6 +3128,7 @@ fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Inflated {
         Codec::Gzip => read_bounded(flate2::read::GzDecoder::new(data), max_size, codec),
         Codec::Deflate => decode_deflate(data, max_size),
         Codec::Brotli => read_bounded(brotli::Decompressor::new(data, 4096), max_size, codec),
+        Codec::Zstd => decode_zstd(data, max_size),
         Codec::Identity => Inflated::Whole(data.to_vec()),
     }
 }
@@ -3173,6 +3177,56 @@ fn decode_deflate(data: &[u8], max_size: usize) -> Inflated {
         },
         settled => settled,
     }
+}
+
+/// RFC 9659's window limit for `Content-Encoding: zstd`. A frame asking for
+/// more is refused rather than allowed to make us allocate it.
+const ZSTD_MAX_WINDOW: u64 = 8 * 1024 * 1024;
+
+/// Undo `Content-Encoding: zstd`, which may hold several frames back to back,
+/// including skippable ones. The decoder reads one frame at a time, so this
+/// walks them, stopping at `max_size` bytes of output.
+fn decode_zstd(data: &[u8], max_size: usize) -> Inflated {
+    use ruzstd::decoding::StreamingDecoder;
+    use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+
+    let fail = |out: Vec<u8>, e: String| {
+        if out.is_empty() {
+            Inflated::Failed(format!("zstd decompression failed: {}", e))
+        } else {
+            Inflated::Partial(out, format!("zstd stream did not decode cleanly: {}", e))
+        }
+    };
+
+    let mut src = data;
+    let mut out = Vec::new();
+    loop {
+        let decoder = match StreamingDecoder::new_with_max_window_size(&mut src, ZSTD_MAX_WINDOW) {
+            Ok(d) => d,
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                let Some(rest) = src.get(length as usize..) else {
+                    return fail(out, "skippable frame runs past the end".to_string());
+                };
+                src = rest;
+                if src.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            Err(e) => return fail(out, e.to_string()),
+        };
+        let room = (max_size - out.len()) as u64;
+        if let Err(e) = decoder.take(room).read_to_end(&mut out) {
+            return fail(out, e.to_string());
+        }
+        if out.len() >= max_size || src.is_empty() {
+            break;
+        }
+    }
+    Inflated::Whole(out)
 }
 
 /// Whether `data` starts with something that reads as a zlib header (RFC 1950
@@ -3540,11 +3594,16 @@ mod tests {
         out
     }
 
+    fn zstd_bytes(data: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
     fn each_codec() -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("gzip", gzip_bytes(SAMPLE)),
             ("deflate", deflate_bytes(SAMPLE)),
             ("br", brotli_bytes(SAMPLE)),
+            ("zstd", zstd_bytes(SAMPLE)),
         ]
     }
 
@@ -3909,6 +3968,68 @@ mod tests {
         // backend produces.
         let twice = gzip_bytes(&gzip_bytes(SAMPLE));
         assert_eq!(decoded("gzip,gzip", &twice, NO_LIMIT), SAMPLE);
+    }
+
+    // ── zstd ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_zstd_reads_every_frame() {
+        // A body may be several frames back to back; all of them are content.
+        let mut two = zstd_bytes(b"first ");
+        two.extend(zstd_bytes(b"second"));
+        assert_eq!(decoded("zstd", &two, NO_LIMIT), b"first second");
+    }
+
+    #[test]
+    fn test_zstd_skips_skippable_frames() {
+        // Magic 0x184D2A50, a little-endian length, then that many bytes.
+        let mut body = vec![0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, b'x', b'y', b'z'];
+        body.extend(zstd_bytes(SAMPLE));
+        assert_eq!(decoded("zstd", &body, NO_LIMIT), SAMPLE);
+    }
+
+    #[test]
+    fn test_zstd_output_is_bounded() {
+        let zeros = vec![0u8; 200_000];
+        assert_eq!(decoded("zstd", &zstd_bytes(&zeros), 4096).len(), 4096);
+        // The cap spans frames too.
+        let mut two = zstd_bytes(&zeros);
+        two.extend(zstd_bytes(&zeros));
+        assert_eq!(decoded("zstd", &two, 250_000).len(), 250_000);
+    }
+
+    #[test]
+    fn test_zstd_refuses_an_oversized_window() {
+        // A frame header asking for a 16 MiB window, over RFC 9659's 8 MiB.
+        // Refused before anything is allocated, and the body comes back raw.
+        let body = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 14 << 3];
+        let (raw, reason) = undecoded("zstd", &body, NO_LIMIT);
+        assert_eq!(raw, body);
+        assert!(
+            reason.contains("zstd"),
+            "reason should name the codec: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_zstd_flags_a_corrupt_stream() {
+        let big = SAMPLE.repeat(400);
+        let mut z = zstd_bytes(&big);
+        let mid = z.len() / 2;
+        z[mid] ^= 0xff;
+        let out = decompress("zstd", &z, NO_LIMIT);
+        assert!(
+            out.decode_error.is_some(),
+            "a corrupted zstd body must be flagged"
+        );
+        assert_ne!(out.body, big);
+    }
+
+    #[test]
+    fn test_zstd_stacks_with_other_codings() {
+        let stacked = zstd_bytes(&gzip_bytes(SAMPLE));
+        assert_eq!(decoded("gzip, zstd", &stacked, NO_LIMIT), SAMPLE);
     }
 
     #[test]

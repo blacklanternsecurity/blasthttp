@@ -45,6 +45,7 @@ http = "1"
 # Decompression
 flate2 = "1"
 brotli = "9"
+ruzstd = "0.9.1"
 
 # Public Suffix List — decides where a cookie's `Domain` stops being allowed
 # to widen. Without it `Domain=com` or `Domain=github.io` is accepted and the
