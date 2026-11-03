@@ -115,9 +115,14 @@ impl RequestConfig {
         // version alone produces "no ciphers available": a request that names
         // a protocol, and is told that protocol is impossible.
         //
-        // The ladder cannot rescue this, because naming a version pins the
-        // configuration and pinning is what stops the ladder moving.
-        if self.wants_legacy_protocol() {
+        // Naming a cipher string is the same request from the other side: the
+        // caller wants exactly those ciphers, and the default's TLS 1.2 floor
+        // would make RC4 or 3DES against a TLS 1.0 server impossible. Under
+        // `compatibility` the string replaces its list and no floor applies.
+        //
+        // The ladder cannot rescue either, because both pin the configuration
+        // and pinning is what stops the ladder moving.
+        if self.wants_legacy_protocol() || self.cipher_string.is_some() {
             return crate::profile::by_name("compatibility")
                 .unwrap_or_else(|_| crate::profile::default_profile());
         }
@@ -365,6 +370,27 @@ fn ip_in_cidr(ip: IpAddr, net: IpAddr, prefix_len: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile_of(c: &RequestConfig) -> &'static str {
+        c.resolved_profile().name
+    }
+
+    #[test]
+    fn a_cipher_string_alone_selects_compatibility() {
+        let mut c = RequestConfig::new("https://example.com".to_string());
+        assert_eq!(profile_of(&c), "modern");
+        c.cipher_string = Some("RC4-MD5".to_string());
+        assert_eq!(profile_of(&c), "compatibility");
+    }
+
+    #[test]
+    fn a_named_profile_wins_over_a_cipher_string() {
+        // Asking for both means the profile's version floor applies too.
+        let mut c = RequestConfig::new("https://example.com".to_string());
+        c.cipher_string = Some("RC4-MD5".to_string());
+        c.profile = Some("modern".to_string());
+        assert_eq!(profile_of(&c), "modern");
+    }
 
     fn pats(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

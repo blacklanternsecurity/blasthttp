@@ -625,3 +625,58 @@ async fn test_verification_removes_only_anonymous_suites() {
         "expected fewer suites with verification on"
     );
 }
+
+// ── A cipher string alone carries no version floor ────────────────
+//
+// Naming ciphers is asking for exactly those, and it pins the configuration,
+// so the ladder will not widen it. If the default's TLS 1.2 floor came along,
+// RC4 against a TLS 1.0 server would be impossible to ask for.
+
+/// A server that speaks only TLS 1.0 with RC4-MD5.
+async fn rc4_md5_tls10_server() -> TlsTestServer {
+    TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("RC4-MD5".to_string()),
+        min_tls_version: Some(SslVersion::TLS1),
+        max_tls_version: Some(SslVersion::TLS1),
+        ..Default::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_cipher_string_alone_reaches_a_tls10_server() {
+    let server = rc4_md5_tls10_server().await;
+
+    let mut config = default_config(&server.url());
+    config.cipher_string = Some("RC4-MD5".to_string());
+
+    let result = HyperClient::new().send(&config).await;
+    assert!(
+        result.is_ok(),
+        "cipher_string with no version set should reach a TLS 1.0 RC4-MD5 \
+         server: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_cipher_string_alone_reaches_a_tls10_server_on_direct_path() {
+    let server = rc4_md5_tls10_server().await;
+
+    let mut config = default_config(&server.url());
+    config.cipher_string = Some("RC4-MD5".to_string());
+    config.resolve_ip = Some("127.0.0.1".to_string());
+
+    let result = HyperClient::new().send(&config).await;
+    assert!(
+        result.is_ok(),
+        "the direct path should honour a bare cipher_string the same way: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}

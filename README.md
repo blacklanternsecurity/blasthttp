@@ -245,7 +245,7 @@ All parameters except `url` are optional:
 | `proxy` | `str` | HTTP/SOCKS proxy URL |
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
 | `profile` | `str` | Connection profile: `modern` (default), `compatibility`, `chrome` |
-| `cipher_string` | `str` | OpenSSL cipher string. Overrides the profile's, and pins it so the ladder will not move. `:!aNULL` is appended whenever `verify_certs` is on, since an anonymous suite would skip the check |
+| `cipher_string` | `str` | OpenSSL cipher string. Overrides the profile's, and pins it so the ladder will not move. With no `profile` named it selects `compatibility`, so no TLS version floor applies. `:!aNULL` is appended whenever `verify_certs` is on, since an anonymous suite would skip the check |
 | `min_tls_version` | `str` | Minimum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
 | `max_tls_version` | `str` | Maximum TLS version (`"3.0"` for SSLv3, or `"1.0"`–`"1.3"`) |
 | `retries` | `int` | Number of retries on failure |
