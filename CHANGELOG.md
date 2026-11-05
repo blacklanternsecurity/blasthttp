@@ -114,6 +114,7 @@ the ladder falling back to `compatibility` on the second handshake.
 - A `cipher_string` with no `profile` named selects `compatibility`, the same as asking for a pre-1.2 TLS version, so no TLS 1.2 floor applies and `cipher_string="RC4-MD5"` reaches a TLS 1.0 server. Naming a profile as well keeps that profile's floor
 - `Content-Encoding: zstd` is decoded, including bodies of several frames. `chrome131` advertises it, as Chrome does, and Cloudflare answers with it. A frame asking for a window over 8 MiB (RFC 9659's limit) is refused and the body returned undecoded, so a response can't make the client allocate an arbitrary window
 - With `verify_certs` on, anonymous (aNULL) suites are never offered, including from an explicit `cipher_string`. They send no certificate, so verification would report success while checking nothing. With verification off, nothing is excluded
+- A refusal that sends the ladder to another profile is kept. If that next attempt gets no response at all (a failed handshake, a reset, a refused connection), the caller gets the refusal, with the failed attempt listed in `attempts`, rather than the error
 
 ## 0.10.1
 

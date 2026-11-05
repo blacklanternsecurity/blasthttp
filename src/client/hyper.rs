@@ -2626,6 +2626,9 @@ impl HyperClient {
             let mut rung = self.starting_profile(config, &uri);
             let mut tried: Vec<&'static str> = Vec::new();
             let mut attempts: Vec<crate::report::Attempt> = Vec::new();
+            // The last refusal received, so an escalation that then fails
+            // outright cannot turn a real response into an error.
+            let mut refusal = None;
             let (resp, cached) = loop {
                 tried.push(rung.name);
                 let rung_config = config.with_profile(rung.name);
@@ -2680,6 +2683,7 @@ impl HyperClient {
                                         resp.status, rung.name, next.name
                                     ),
                                 );
+                                refusal = Some((resp, cached));
                                 rung = next;
                             }
                             // Out of rungs: the refusal is the answer. Hand it
@@ -2727,11 +2731,14 @@ impl HyperClient {
                                 );
                                 rung = next;
                             }
-                            // Nothing else to try, or the failure says nothing
-                            // about our offer. Report the error we actually
-                            // got, carrying what was tried so the caller can
-                            // see the ladder ran and where it stopped.
+                            // Nothing else to try. An earlier rung's refusal is
+                            // still the answer; otherwise report the error,
+                            // carrying what was tried.
                             None => {
+                                if let Some(kept) = refusal.take() {
+                                    self.remember_exhausted(config, &uri);
+                                    break kept;
+                                }
                                 e.attempts = attempts;
                                 return Err(e);
                             }
