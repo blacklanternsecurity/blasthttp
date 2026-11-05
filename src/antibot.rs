@@ -240,13 +240,17 @@ impl Rules {
     /// Classify one response.
     pub fn classify(&self, facts: &ResponseFacts) -> Outcome {
         let refusal = self.is_refusal(facts.status);
-        if let Some(rule) = self.rules.iter().find(|r| self.matches(&r.when, facts)) {
-            let vendor = Vendor::new(&rule.vendor);
-            return match (refusal, rule.on_refusal) {
+        for rule in self.rules.iter().filter(|r| self.matches(&r.when, facts)) {
+            let outcome = match (refusal, rule.on_refusal) {
                 (true, Some(outcome)) => outcome,
                 _ => rule.outcome,
+            };
+            // A sighting means the product let us through, which a refusal
+            // isn't, and it is no evidence the product is what refused.
+            if refusal && matches!(outcome, RuleOutcome::Present) {
+                continue;
             }
-            .with(vendor);
+            return outcome.with(Vendor::new(&rule.vendor));
         }
         // Nothing identifiable. A 404 or a 500 is still the server answering.
         if refusal {

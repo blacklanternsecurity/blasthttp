@@ -13,11 +13,20 @@
       "when": {"all": [
         {"status": "refusal"},
         {"any": [
-          {"body_contains": "/cdn-cgi/challenge-platform/"},
+          {"body_contains": "/cdn-cgi/challenge-platform/h/"},
           {"body_contains": "window._cf_chl_opt"}
         ]}
       ]},
-      "why": "The challenge page's own markers, for when cf-mitigated is missing. Only on a refusal: on a 200 they're the vendor's script loading normally, as in Turnstile's api.js and pages carrying Cloudflare's injected JavaScript detections."
+      "why": "The challenge page's own markers, for when cf-mitigated is missing. Only on a refusal: on a 200 they're the vendor's script loading normally, as in Turnstile's api.js. The /h/ path is the challenge orchestrator; the bare /cdn-cgi/challenge-platform/ prefix also matches the JavaScript detections script Cloudflare injects into every HTML page, origin error pages included."
+    },
+    {
+      "vendor": "cloudflare",
+      "outcome": "blocked",
+      "when": {"all": [
+        {"status": "refusal"},
+        {"body_contains": "cf-error-details"}
+      ]},
+      "why": "Cloudflare's own error page, as served for a firewall rule block (1020). It carries no cf-mitigated header."
     },
     {
       "vendor": "akamai",
@@ -94,38 +103,32 @@
     {
       "vendor": "cloudflare",
       "outcome": "present",
-      "on_refusal": "blocked",
       "when": {"any": [{"cookie_set": "__cf_bm"}, {"cookie_set": "cf_clearance"}]},
-      "why": "From here on, sightings of a product on a response nothing above matched. One that set its cookie while refusing us is still a block."
+      "why": "From here on, sightings of a product on a response nothing above matched. Only a sighting, even on a refusal: these products set their cookies on every response, the origin's own 401s and 403s included, so a cookie is no evidence the product is what refused."
     },
     {
       "vendor": "akamai",
       "outcome": "present",
-      "on_refusal": "blocked",
       "when": {"any": [{"cookie_set": "_abck"}, {"cookie_set": "ak_bmsc"}, {"cookie_set": "bm_sz"}]}
     },
     {
       "vendor": "datadome",
       "outcome": "present",
-      "on_refusal": "blocked",
       "when": {"cookie_set": "datadome"}
     },
     {
       "vendor": "perimeterx",
       "outcome": "present",
-      "on_refusal": "blocked",
       "when": {"cookie_prefix": "_px"}
     },
     {
       "vendor": "imperva",
       "outcome": "present",
-      "on_refusal": "blocked",
       "when": {"any": [{"cookie_prefix": "visid_incap_"}, {"cookie_prefix": "incap_ses_"}]}
     },
     {
       "vendor": "f5",
       "outcome": "present",
-      "on_refusal": "blocked",
       "when": {"header_contains": {"name": "server", "value": "volt-adc"}}
     }
   ]

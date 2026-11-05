@@ -199,6 +199,52 @@ fn test_cloudflare_waf_block_is_not_a_challenge() {
 }
 
 #[test]
+fn test_cloudflare_challenge_orchestrator_on_a_refusal_is_a_challenge() {
+    let h = hdrs(&[("server", "cloudflare")]);
+    let body = r#"<html><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=0"></script></html>"#;
+    assert_eq!(
+        classify(&facts(403, &h, body)),
+        Outcome::Challenge(Vendor::new("cloudflare"))
+    );
+}
+
+#[test]
+fn test_cloudflare_error_page_is_a_cloudflare_block() {
+    let h = hdrs(&[("server", "cloudflare")]);
+    let body = r#"<html><div id="cf-error-details" class="cf-error-details-wrapper"><h1>Error 1020</h1></div></html>"#;
+    assert_eq!(
+        classify(&facts(403, &h, body)),
+        Outcome::Blocked(Vendor::new("cloudflare"))
+    );
+}
+
+#[test]
+fn test_origin_refusal_behind_a_bot_product_is_not_vendor_evidence() {
+    // Bot products set their cookies and inject their scripts on every
+    // response, the origin's own refusals included. Those alone must not name
+    // the product as what refused, or every ordinary 401/403 walks the ladder.
+    let jsd = r#"<html><h1>401 Unauthorized</h1><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></html>"#;
+    for (cookie, body) in [
+        ("__cf_bm=xyz; Path=/", jsd),
+        ("_abck=A7F1~0~YAAQ; Path=/", "<html>forbidden</html>"),
+        ("datadome=abc; Path=/", "<html>forbidden</html>"),
+        ("_px3=abc; Path=/", "<html>forbidden</html>"),
+        ("incap_ses_123=abc; Path=/", "<html>forbidden</html>"),
+    ] {
+        let h = hdrs(&[("set-cookie", cookie)]);
+        for status in [401, 403, 405] {
+            let outcome = classify(&facts(status, &h, body));
+            assert_eq!(
+                outcome,
+                Outcome::Blocked(Vendor::unknown()),
+                "{cookie} at {status}"
+            );
+            assert!(!outcome.indicates_protection());
+        }
+    }
+}
+
+#[test]
 fn test_cloudflare_bm_cookie_on_success_is_present() {
     // www.cloudflare.com sets __cf_bm on an ordinary 200.
     let h = hdrs(&[
@@ -362,18 +408,6 @@ fn test_unidentified_refusal_reports_unknown_vendor() {
     let h = hdrs(&[("server", "nginx")]);
     let outcome = classify(&facts(403, &h, "forbidden"));
     assert_eq!(outcome, Outcome::Blocked(Vendor::unknown()));
-    assert!(!outcome.got_through());
-}
-
-#[test]
-fn test_product_cookie_with_refusal_still_counts_as_blocked() {
-    // Setting a session cookie while refusing is still a refusal.
-    let h = hdrs(&[
-        ("server", "cloudflare"),
-        ("set-cookie", "__cf_bm=xyz; Path=/"),
-    ]);
-    let outcome = classify(&facts(403, &h, "<html>denied</html>"));
-    assert_eq!(outcome, Outcome::Blocked(Vendor::new("cloudflare")));
     assert!(!outcome.got_through());
 }
 

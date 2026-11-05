@@ -117,6 +117,7 @@ the ladder falling back to `compatibility` on the second handshake.
 - With `verify_certs` on, anonymous (aNULL) suites are never offered, including from an explicit `cipher_string`. They send no certificate, so verification would report success while checking nothing. With verification off, nothing is excluded
 - A refusal that sends the ladder to another profile is kept. If that next attempt gets no response at all (a failed handshake, a reset, a refused connection), the caller gets the refusal, with the failed attempt listed in `attempts`, rather than the error
 - Akamai's block rule only fires on a refusal status. edgesuite.net also serves customer assets, so a 200 page loading one was classified as blocked and re-sent
+- A product's cookie or injected script on a refusal no longer names it as what refused. Bot-management products set their cookies and Cloudflare injects its JavaScript detections script on every response, the origin's own 401s and 403s included, so an ordinary auth failure behind a CDN walked the ladder and could report `needs_browser`. Cloudflare's own error page (a firewall-rule block such as 1020) is recognised as a Cloudflare block instead
 
 ## 0.10.1
 
