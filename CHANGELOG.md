@@ -31,7 +31,8 @@ the ladder falling back to `compatibility` on the second handshake.
   exactly the hosts most likely to rate-limit or ban. Getting through clears
   it, and it expires because a refusal is a judgement that changes
 - **`Response.protection`** reports what a bot-management product did:
-  `(outcome, vendor)` where outcome is ok, present, challenge, blocked or error
+  `(outcome, vendor)` where outcome is ok, present, challenge or blocked. A
+  404 or a 500 is ok: the server answered and no product intervened
 - **`Response.conclusion`** reduces that to one verdict: reached, blocked,
   needs_browser, needs_legacy_tls or unreachable. `needs_browser` means a
   JavaScript challenge, which no HTTP client passes, so the URL should go to a

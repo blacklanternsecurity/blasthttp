@@ -248,13 +248,11 @@ impl Rules {
             }
             .with(vendor);
         }
-        // Nothing identifiable
-        if (200..400).contains(&facts.status) {
-            Outcome::Ok
-        } else if refusal {
+        // Nothing identifiable. A 404 or a 500 is still the server answering.
+        if refusal {
             Outcome::Blocked(Vendor::unknown())
         } else {
-            Outcome::Error
+            Outcome::Ok
         }
     }
 

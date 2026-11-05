@@ -342,7 +342,17 @@ fn test_ordinary_404_is_not_a_block() {
     // A missing page is a real answer from the origin, and counting it as a
     // block would make an ordinary scan look like it was being refused.
     let h = hdrs(&[("server", "nginx")]);
-    assert_eq!(classify(&facts(404, &h, "not found")), Outcome::Error);
+    assert_eq!(classify(&facts(404, &h, "not found")), Outcome::Ok);
+}
+
+#[test]
+fn test_server_errors_are_answers() {
+    // A 500 or a 502 is the server answering, not a failure to reach it.
+    let h = hdrs(&[("server", "nginx")]);
+    for status in [400, 410, 500, 502, 504] {
+        let outcome = classify(&facts(status, &h, "error"));
+        assert_eq!(outcome, Outcome::Ok, "status {status}");
+    }
 }
 
 #[test]

@@ -51,7 +51,7 @@ fn test_a_rules_file_can_name_a_new_vendor() {
     // the same body on a status the file doesn't call a refusal
     assert_eq!(
         rules.classify(&facts(503, &none, "<html>example-challenge</html>")),
-        Outcome::Error
+        Outcome::Ok
     );
 }
 
