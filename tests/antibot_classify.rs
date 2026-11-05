@@ -95,6 +95,24 @@ fn test_entity_encoded_edgesuite_still_matches() {
 }
 
 #[test]
+fn test_akamai_markers_on_a_page_that_loaded_are_not_a_block() {
+    // edgesuite.net also hosts customer assets, and a page can say "Access
+    // Denied" without being refused. Neither is a block on a 200.
+    let assets = r#"<html><img src="https://a1.g.akamai.net.edgesuite.net/logo.png"></html>"#;
+    let article = "<html><h1>Fixing Access Denied errors</h1></html>";
+    for (h, body) in [
+        (hdrs(&[("content-type", "text/html")]), assets),
+        (
+            hdrs(&[("akamai-grn", "0.6d551702.1790644996.315f62a4")]),
+            article,
+        ),
+    ] {
+        let outcome = classify(&facts(200, &h, body));
+        assert!(outcome.got_through(), "{body} classified as {outcome:?}");
+    }
+}
+
+#[test]
 fn test_akamai_session_cookie_on_success_is_present() {
     // The other half of the same comparison: through, and handed a session.
     let h = hdrs(&[
