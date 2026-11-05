@@ -24,6 +24,27 @@ SOURCE_DIR="${VENDOR_DIR}/openssl-${OPENSSL_VERSION}"
 INSTALL_DIR="${VENDOR_DIR}/install"
 TARBALL="${VENDOR_DIR}/openssl-${OPENSSL_VERSION}.tar.gz"
 MARKER="${INSTALL_DIR}/.blasthttp-built"
+PATCH_DIR="${SCRIPT_DIR}/openssl-patches"
+
+# The features that make this build different from a stock OpenSSL.
+#
+# `enable-ssl3` and `enable-ssl3-method` both have to be here. OpenSSL's
+# Configure has a disable cascade that reads "if ssl3-method is off, turn ssl3
+# off too", and ssl3-method is off by default. So enable-ssl3 on its own gets
+# cascaded straight back to no-ssl3, which is exactly what happened here for
+# a long time: the flag was passed, configdata.pm recorded both `enable-ssl3`
+# and `no-ssl3`, and the build came out with OPENSSL_NO_SSL3 defined and no
+# SSLv3_method symbols.
+FEATURE_FLAGS=(
+    enable-weak-ssl-ciphers
+    enable-ssl3
+    enable-ssl3-method
+    no-shared
+    no-module
+    no-tests
+    -fPIC
+)
+
 
 # --- Cross-compilation support ---
 TARGET="${CARGO_BUILD_TARGET:-}"
@@ -48,15 +69,30 @@ case "$TARGET" in
         ;;
 esac
 
-# Skip if already built for the same target
+# Identifies what the cached build actually is. Both the target and the
+# feature flags belong in here: an existing checkout whose flags changed needs
+# a rebuild just as much as one whose target changed, and keying on the target
+# alone means a flag change is silently ignored until someone deletes the
+# install directory by hand.
+# Patches are part of the recipe too: editing one has to invalidate the cached
+# build exactly as changing a flag does, or the change silently does nothing.
+PATCH_HASH="none"
+if [ -d "$PATCH_DIR" ] && compgen -G "$PATCH_DIR/*.patch" > /dev/null; then
+    PATCH_HASH=$(cat "$PATCH_DIR"/*.patch | sha256sum | cut -c1-16)
+fi
+BUILD_RECIPE="${TARGET:-native}|${OPENSSL_VERSION}|${FEATURE_FLAGS[*]}|patches=${PATCH_HASH}"
+
+# Skip only if the cached build was made the same way
 if [ -f "$MARKER" ]; then
-    BUILT_TARGET=$(cat "$MARKER" 2>/dev/null || true)
-    if [ "$BUILT_TARGET" = "$TARGET" ]; then
+    BUILT_RECIPE=$(cat "$MARKER" 2>/dev/null || true)
+    if [ "$BUILT_RECIPE" = "$BUILD_RECIPE" ]; then
         echo "=== OpenSSL ${OPENSSL_VERSION} already built for '${TARGET:-native}' at ${INSTALL_DIR} ==="
         echo "=== Delete ${INSTALL_DIR} to force rebuild ==="
         exit 0
     fi
-    echo "=== Rebuilding OpenSSL: target changed from '${BUILT_TARGET:-native}' to '${TARGET:-native}' ==="
+    echo "=== Rebuilding OpenSSL: build recipe changed ==="
+    echo "===   was: ${BUILT_RECIPE:-(unknown)}"
+    echo "===   now: ${BUILD_RECIPE}"
     rm -rf "$INSTALL_DIR"
 fi
 
@@ -90,6 +126,25 @@ if [ -d "$SOURCE_DIR" ]; then
 fi
 echo "Extracting..."
 tar xzf "$TARBALL" -C "$VENDOR_DIR"
+
+# --- Apply our patches ---
+#
+# Applied to a freshly extracted tree every time, so the patches never stack
+# and a failure is always a real conflict rather than a second application.
+# Every patch is required: a silent skip would produce a build that looks fine
+# and behaves differently, which is the failure mode that hid the SSLv3
+# problem for months.
+if [ -d "$PATCH_DIR" ]; then
+    for patch in "$PATCH_DIR"/*.patch; do
+        [ -e "$patch" ] || continue
+        echo "Applying $(basename "$patch")"
+        if ! patch -p1 -d "$SOURCE_DIR" -s < "$patch"; then
+            echo "ERROR: failed to apply $(basename "$patch")" >&2
+            echo "The patch probably needs rebasing onto OpenSSL ${OPENSSL_VERSION}." >&2
+            exit 1
+        fi
+    done
+fi
 
 # --- Find cross-compiler if needed ---
 find_cross_cc() {
@@ -147,12 +202,7 @@ cd "$SOURCE_DIR"
 
 COMMON_ARGS=(
     --prefix="$INSTALL_DIR"
-    enable-weak-ssl-ciphers
-    enable-ssl3
-    no-shared
-    no-module
-    no-tests
-    -fPIC
+    "${FEATURE_FLAGS[@]}"
 )
 
 if [ -n "$openssl_target" ]; then
@@ -186,9 +236,9 @@ make -j"$NUM_JOBS"
 echo "Installing..."
 make install_sw
 
-# Mark as complete (store target for cache invalidation)
+# Mark as complete (store the full recipe so a flag or target change invalidates)
 mkdir -p "$INSTALL_DIR"
-echo "$TARGET" > "$MARKER"
+echo "$BUILD_RECIPE" > "$MARKER"
 
 echo ""
 echo "=== OpenSSL ${OPENSSL_VERSION} built successfully ==="

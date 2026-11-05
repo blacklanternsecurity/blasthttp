@@ -87,12 +87,13 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "blasthttp"
-version = "0.10.2"
+version = "1.0.0"
 dependencies = [
  "brotli",
  "bytes",
  "clap",
  "flate2",
+ "foreign-types-shared",
  "futures",
  "http",
  "http-body-util",
@@ -100,9 +101,11 @@ dependencies = [
  "hyper-util",
  "murmur3",
  "openssl",
+ "openssl-sys",
  "psl",
  "pyo3",
  "pyo3-async-runtimes",
+ "ruzstd",
  "serde",
  "serde_json",
  "thiserror",
@@ -705,6 +708,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -937,6 +949,12 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "unicode-ident"

@@ -75,6 +75,8 @@ impl HttpClient for ErrorKindMockClient {
         Err(ClientError {
             message: self.message.clone(),
             kind: self.kind.clone(),
+            tls_failure: None,
+            attempts: Vec::new(),
         })
     }
 }
@@ -117,6 +119,8 @@ impl HttpClient for SequenceMockClient {
             return Err(ClientError {
                 message: format!("mock error on call {}", call),
                 kind: self.fail_kind.clone(),
+                tls_failure: None,
+                attempts: Vec::new(),
             });
         }
 
@@ -126,6 +130,7 @@ impl HttpClient for SequenceMockClient {
             status: self.success_status,
             headers: Vec::new(),
             body_bytes,
+            attempts: Vec::new(),
             elapsed_ms: 0,
             redirect_chain: Vec::new(),
             cert_info: None,
@@ -178,6 +183,7 @@ impl HttpClient for MockClient {
             status: self.status,
             headers: self.headers.clone(),
             body_bytes,
+            attempts: Vec::new(),
             elapsed_ms: 0,
             redirect_chain: Vec::new(),
             cert_info: None,
