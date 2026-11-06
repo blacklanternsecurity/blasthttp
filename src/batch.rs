@@ -290,15 +290,19 @@ impl Scheduler {
     /// field: the stream driver needs the concurrency limit, `send_batch`
     /// needs no limit and passes the batch size.
     fn new(configs: &[RequestConfig], aside_limit: usize) -> Arc<Self> {
+        // Pinned requests never consult the per-host memory, so they take no
+        // part in discovering it and `await_turn` lets them straight through.
         let mut remaining_by_host: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for c in configs {
+        let mut remaining_total = 0;
+        for c in configs.iter().filter(|c| !c.tls_is_pinned()) {
             *remaining_by_host.entry(host_key(&c.url)).or_insert(0) += 1;
+            remaining_total += 1;
         }
         Arc::new(Scheduler {
             state: std::sync::Mutex::new(SchedulerState {
                 gates: std::collections::HashMap::new(),
-                remaining_total: configs.len(),
+                remaining_total,
                 remaining_by_host,
                 aside: 0,
                 aside_limit: aside_limit.max(1),
@@ -388,6 +392,9 @@ async fn await_turn(
     Option<LeaderGuard>,
     Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
+    if config.tls_is_pinned() {
+        return (None, permit);
+    }
     match sched.dispatch(host, true) {
         Dispatch::Lead(g) => (Some(g), permit),
         Dispatch::Go => (None, permit),
@@ -744,12 +751,34 @@ mod tests {
     /// Records when each send happened.
     struct Recording {
         inner: MockClient,
-        sends: std::sync::Mutex<Vec<Instant>>,
+        sends: std::sync::Mutex<Vec<(String, Instant)>>,
+    }
+
+    impl Recording {
+        fn new(delay: Duration) -> Self {
+            Recording {
+                inner: MockClient::new(200, "ok".to_string()).with_delay(delay),
+                sends: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sent_at(&self, url: &str) -> Instant {
+            self.sends
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(u, _)| u == url)
+                .unwrap()
+                .1
+        }
     }
 
     impl HttpClient for Recording {
         async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
-            self.sends.lock().unwrap().push(Instant::now());
+            self.sends
+                .lock()
+                .unwrap()
+                .push((config.url.clone(), Instant::now()));
             self.inner.send(config).await
         }
     }
@@ -758,10 +787,7 @@ mod tests {
     async fn test_requests_that_stood_aside_still_keep_the_rate() {
         // Followers of a slow host stand aside while its first request runs.
         // When it finishes they must go at the configured rate, not at once.
-        let client = Arc::new(Recording {
-            inner: MockClient::new(200, "ok".to_string()).with_delay(Duration::from_secs(2)),
-            sends: std::sync::Mutex::new(Vec::new()),
-        });
+        let client = Arc::new(Recording::new(Duration::from_secs(2)));
         let configs: Vec<RequestConfig> = (0..8)
             .map(|i| format!("https://a.com/{i}"))
             .chain((0..8).map(|i| format!("https://b.com/{i}")))
@@ -770,7 +796,7 @@ mod tests {
 
         send_batch(client.clone(), configs, 50, Some(5.0), None).await;
 
-        let sends = client.sends.lock().unwrap().clone();
+        let sends: Vec<Instant> = client.sends.lock().unwrap().iter().map(|s| s.1).collect();
         assert_eq!(sends.len(), 16);
         let busiest = sends
             .iter()
@@ -786,6 +812,53 @@ mod tests {
         assert!(
             busiest <= 6,
             "{busiest} sends inside one second at a rate of 5"
+        );
+    }
+
+    fn pinned(url: &str) -> RequestConfig {
+        let mut c = RequestConfig::new(url.to_string());
+        c.profile = Some("chrome131".to_string());
+        c
+    }
+
+    #[tokio::test]
+    async fn test_pinned_requests_do_not_stand_aside() {
+        // Pinned requests learn nothing from a host's first request, so
+        // waiting for it is pure latency.
+        let client = Arc::new(Recording::new(Duration::from_millis(500)));
+        let configs: Vec<RequestConfig> = ["a", "a", "a", "b", "b", "b"]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| pinned(&format!("https://{h}.com/{i}")))
+            .collect();
+
+        send_batch(client.clone(), configs, 50, None, None).await;
+
+        let sends: Vec<Instant> = client.sends.lock().unwrap().iter().map(|s| s.1).collect();
+        let spread = *sends.iter().max().unwrap() - *sends.iter().min().unwrap();
+        assert!(
+            spread < Duration::from_millis(200),
+            "sends spread over {spread:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_pinned_request_does_not_lead_a_host() {
+        // A pinned first request never records what the host wants, so the
+        // unpinned requests behind it must not wait on it.
+        let client = Arc::new(Recording::new(Duration::from_millis(500)));
+        let configs = vec![
+            pinned("https://a.com/pinned"),
+            RequestConfig::new("https://a.com/open".to_string()),
+            RequestConfig::new("https://b.com/other".to_string()),
+        ];
+
+        send_batch(client.clone(), configs, 50, None, None).await;
+
+        let waited = client.sent_at("https://a.com/open") - client.sent_at("https://a.com/pinned");
+        assert!(
+            waited < Duration::from_millis(200),
+            "waited {waited:?} on a pinned request"
         );
     }
 
