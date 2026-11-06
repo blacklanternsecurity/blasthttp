@@ -120,6 +120,7 @@ the ladder falling back to `compatibility` on the second handshake.
 - Akamai's block rule only fires on a refusal status. edgesuite.net also serves customer assets, so a 200 page loading one was classified as blocked and re-sent
 - A product's cookie or injected script on a refusal no longer names it as what refused. Bot-management products set their cookies and Cloudflare injects its JavaScript detections script on every response, the origin's own 401s and 403s included, so an ordinary auth failure behind a CDN walked the ladder and could report `needs_browser`. Cloudflare's own error page (a firewall-rule block such as 1020) is recognised as a Cloudflare block instead
 - A handshake failure concludes `needs_legacy_tls` only when `compatibility` wasn't tried, such as when a pin stopped the ladder. Once the widest offer has failed too, as with a server wanting a client certificate, the conclusion is `unreachable`
+- A connection reset during the TLS handshake is a `connection` error and retried, as before 1.0, rather than a non-retryable `tls` one. `tls_failure` still reads `reset`
 
 ## 0.10.1
 

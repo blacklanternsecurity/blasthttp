@@ -252,10 +252,18 @@ impl ClientError {
     /// A TLS failure that knows why. Prefer this over `tls` wherever an
     /// `openssl::ssl::Error` is in hand, since the reason is what the profile
     /// ladder branches on and it cannot be recovered from the message text.
+    ///
+    /// A reset is a connection failure and a timeout is a timeout, whichever
+    /// stage they hit; `tls_failure` still says it was during the handshake.
     pub fn tls_detailed(message: String, failure: TlsFailure) -> Self {
+        let kind = match failure {
+            TlsFailure::Reset => ErrorKind::Connection,
+            TlsFailure::Timeout => ErrorKind::Timeout,
+            _ => ErrorKind::Tls,
+        };
         ClientError {
             message,
-            kind: ErrorKind::Tls,
+            kind,
             tls_failure: Some(failure),
             attempts: Vec::new(),
         }
@@ -577,5 +585,17 @@ mod tls_failure_tests {
         let detailed = ClientError::tls_detailed("x".into(), TlsFailure::NoSharedCipher);
         assert_eq!(detailed.kind, ErrorKind::Tls);
         assert_eq!(detailed.tls_failure, Some(TlsFailure::NoSharedCipher));
+    }
+
+    #[test]
+    fn test_a_handshake_reset_or_timeout_keeps_its_own_kind() {
+        let reset = ClientError::tls_detailed("x".into(), TlsFailure::Reset);
+        assert_eq!(reset.kind, ErrorKind::Connection);
+        assert!(reset.kind.is_retryable());
+        assert_eq!(reset.tls_failure, Some(TlsFailure::Reset));
+
+        let timeout = ClientError::tls_detailed("x".into(), TlsFailure::Timeout);
+        assert_eq!(timeout.kind, ErrorKind::Timeout);
+        assert_eq!(timeout.tls_failure, Some(TlsFailure::Timeout));
     }
 }
