@@ -2302,8 +2302,10 @@ impl HttpClient for HyperClient {
                 tokio::time::sleep(backoff).await;
             }
 
-            match tokio::time::timeout(timeout_duration, self.send_inner(config, &log)).await {
-                Ok(Ok(response)) => {
+            // One deadline for the whole request, redirects and ladder included.
+            let deadline = tokio::time::Instant::now() + timeout_duration;
+            match self.send_inner(config, &log, deadline).await {
+                Ok(response) => {
                     let status = response.status;
                     if super::ErrorKind::Status(status).is_retryable() && attempt < max_retries {
                         debug_record(
@@ -2320,7 +2322,7 @@ impl HttpClient for HyperClient {
                     }
                     return Ok(response);
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if e.kind.is_retryable() && attempt < max_retries {
                         debug_record(
                             &log,
@@ -2332,12 +2334,6 @@ impl HttpClient for HyperClient {
                         continue;
                     }
                     return Err(e);
-                }
-                Err(_) => {
-                    return Err(ClientError::timeout(format!(
-                        "request timed out after {}s",
-                        config.timeout()
-                    )));
                 }
             }
         }
@@ -2522,9 +2518,12 @@ impl HyperClient {
         &self,
         config: &RequestConfig,
         log: &DebugLog,
+        deadline: tokio::time::Instant,
     ) -> Result<Response, ClientError> {
         let v = config.verbosity;
         let start = Instant::now();
+        let timed_out =
+            || ClientError::timeout(format!("request timed out after {}s", config.timeout()));
 
         let sanitized_url = sanitize_uri(&config.url);
         let mut uri: http::Uri = sanitized_url.parse().map(normalize_empty_path).map_err(
@@ -2558,7 +2557,10 @@ impl HyperClient {
         // Bypasses the cached connection pool — opens a fresh TCP connection.
         if config.resolve_ip.is_some() || config.request_target.is_some() {
             let redirect_chain: Vec<RedirectHop> = Vec::new();
-            let (resp, cert_info, peer_ip, attempts) = dispatch_direct(&uri, config, log).await?;
+            let (resp, cert_info, peer_ip, attempts) =
+                tokio::time::timeout_at(deadline, dispatch_direct(&uri, config, log))
+                    .await
+                    .map_err(|_| timed_out())??;
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
@@ -2633,9 +2635,10 @@ impl HyperClient {
                 tried.push(rung.name);
                 let rung_config = config.with_profile(rung.name);
 
-                match self
-                    .attempt_hop(&rung_config, &uri, log, hop_cookies.as_deref())
+                let hop = self.attempt_hop(&rung_config, &uri, log, hop_cookies.as_deref());
+                match tokio::time::timeout_at(deadline, hop)
                     .await
+                    .unwrap_or_else(|_| Err(timed_out()))
                 {
                     Ok((resp, cached)) => {
                         let outcome = crate::antibot::classify(&crate::antibot::ResponseFacts {
@@ -2736,7 +2739,11 @@ impl HyperClient {
                             // carrying what was tried.
                             None => {
                                 if let Some(kept) = refusal.take() {
-                                    self.remember_exhausted(config, &uri);
+                                    // Running out of time says nothing about
+                                    // the host, so it doesn't count as exhausted.
+                                    if e.kind != super::ErrorKind::Timeout {
+                                        self.remember_exhausted(config, &uri);
+                                    }
                                     break kept;
                                 }
                                 e.attempts = attempts;
