@@ -265,12 +265,20 @@ impl ClientError {
     ///
     /// A peer that could not negotiate with us is reported separately from one
     /// we never reached: the first is alive and wants cryptography we declined
-    /// or cannot do, which is actionable, and the second is not.
+    /// or cannot do, which is actionable, and the second is not. Once
+    /// `compatibility`, the widest offer, has failed too, legacy TLS is not
+    /// what is missing.
     pub fn conclusion(&self) -> crate::report::Conclusion {
+        let widest_tried = self
+            .attempts
+            .iter()
+            .any(|a| a.profile == crate::profile::COMPATIBILITY.name);
         match &self.tls_failure {
-            Some(f) if f.suggests_wider_offer() => crate::report::Conclusion::NeedsLegacyTls {
-                reason: self.message.clone(),
-            },
+            Some(f) if f.suggests_wider_offer() && !widest_tried => {
+                crate::report::Conclusion::NeedsLegacyTls {
+                    reason: self.message.clone(),
+                }
+            }
             _ => crate::report::Conclusion::Unreachable {
                 reason: self.message.clone(),
             },

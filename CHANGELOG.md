@@ -118,6 +118,7 @@ the ladder falling back to `compatibility` on the second handshake.
 - A refusal that sends the ladder to another profile is kept. If that next attempt gets no response at all (a failed handshake, a reset, a refused connection), the caller gets the refusal, with the failed attempt listed in `attempts`, rather than the error. The same holds when the timeout runs out during that next attempt: `timeout` still bounds the whole request, redirects and ladder included, but a refusal already received is returned instead of a timeout error
 - Akamai's block rule only fires on a refusal status. edgesuite.net also serves customer assets, so a 200 page loading one was classified as blocked and re-sent
 - A product's cookie or injected script on a refusal no longer names it as what refused. Bot-management products set their cookies and Cloudflare injects its JavaScript detections script on every response, the origin's own 401s and 403s included, so an ordinary auth failure behind a CDN walked the ladder and could report `needs_browser`. Cloudflare's own error page (a firewall-rule block such as 1020) is recognised as a Cloudflare block instead
+- A handshake failure concludes `needs_legacy_tls` only when `compatibility` wasn't tried, such as when a pin stopped the ladder. Once the widest offer has failed too, as with a server wanting a client certificate, the conclusion is `unreachable`
 
 ## 0.10.1
 

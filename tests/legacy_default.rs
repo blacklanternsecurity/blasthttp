@@ -17,6 +17,7 @@ mod support;
 use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
 use blasthttp::config::RequestConfig;
+use blasthttp::report::Conclusion;
 use openssl::ssl::SslVersion;
 use support::tls_server::{TlsServerConfig, TlsTestServer};
 
@@ -677,6 +678,57 @@ async fn test_cipher_string_alone_reaches_a_tls10_server_on_direct_path() {
         result.as_ref().err()
     );
     assert_eq!(result.unwrap().status, 200);
+
+    server.shutdown().await;
+}
+
+// ── What a failure concludes ──────────────────────────────────────
+
+#[tokio::test]
+async fn test_a_failure_after_the_widest_offer_does_not_ask_for_legacy_tls() {
+    // No profile offers a NULL cipher, so modern and compatibility both fail.
+    // Legacy TLS was offered and refused; asking for it again helps nothing.
+    let server = TlsTestServer::start(TlsServerConfig {
+        cipher_list: Some("NULL-SHA".to_string()),
+        max_tls_version: Some(SslVersion::TLS1_2),
+        ..Default::default()
+    })
+    .await;
+
+    let err = HyperClient::new()
+        .send(&default_config(&server.url()))
+        .await
+        .unwrap_err();
+
+    let profiles: Vec<&str> = err.attempts.iter().map(|a| a.profile.as_str()).collect();
+    assert_eq!(profiles, ["modern", "compatibility"]);
+    assert!(
+        matches!(err.conclusion(), Conclusion::Unreachable { .. }),
+        "got {:?}",
+        err.conclusion()
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_a_pin_that_stops_the_ladder_still_asks_for_legacy_tls() {
+    // The pin is why nothing wider was tried, so unpinning is the answer.
+    let server = TlsTestServer::start(TlsServerConfig {
+        max_tls_version: Some(SslVersion::TLS1),
+        ..Default::default()
+    })
+    .await;
+    let mut config = default_config(&server.url());
+    config.min_tls_version = Some("1.2".to_string());
+
+    let err = HyperClient::new().send(&config).await.unwrap_err();
+
+    assert!(
+        matches!(err.conclusion(), Conclusion::NeedsLegacyTls { .. }),
+        "got {:?}",
+        err.conclusion()
+    );
 
     server.shutdown().await;
 }
