@@ -421,15 +421,11 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
     let mut handles = Vec::new();
 
     for config in configs {
-        // Rate limit: pace dispatch before spawning the task
-        if let Some(ref limiter) = limiter {
-            limiter.acquire().await;
-        }
-
         let client = client.clone();
         let permit = semaphore.clone();
         let url = config.url.clone();
         let sched = sched.clone();
+        let limiter = limiter.clone();
 
         let handle = tokio::spawn(async move {
             // Stand aside before taking a permit rather than after, so the
@@ -439,6 +435,11 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
             let (_lead, _) = await_turn(&sched, &host, &config, None).await;
 
             let _permit = permit.acquire().await.unwrap();
+            // Paced at the send, not the spawn, so a request that stood aside
+            // pays when it actually goes instead of bursting with the rest.
+            if let Some(limiter) = limiter {
+                limiter.acquire().await;
+            }
             let result = client.send(&config).await;
             BatchResult { url, result }
         });
@@ -483,9 +484,8 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
 /// `__anext__` (a `future_into_py` block running on the tokio runtime).
 ///
 /// Concurrency is gated *before* spawn by a semaphore acquire on the driver,
-/// so at most `concurrency` requests are in-flight at any time. Rate-limit
-/// acquire happens before the semaphore so dispatch pacing matches
-/// `send_batch`. In-flight tasks are NOT cancelled if the consumer drops
+/// so at most `concurrency` requests are in-flight at any time. The rate
+/// limit is taken just before each send, as in `send_batch`. In-flight tasks are NOT cancelled if the consumer drops
 /// the stream — they run to completion and their sends fail silently. This
 /// also matches `send_batch`.
 pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
@@ -506,9 +506,6 @@ pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
 
         tokio::spawn(async move {
             for config in configs {
-                if let Some(ref l) = limiter {
-                    l.acquire().await;
-                }
                 let permit = match semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => break,
@@ -517,6 +514,7 @@ pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
                 let tx = tx.clone();
                 let sched = sched.clone();
                 let semaphore = semaphore.clone();
+                let limiter = limiter.clone();
                 tokio::spawn(async move {
                     let host = host_key(&config.url);
                     // The driver holds the permit here, unlike `send_batch`,
@@ -532,6 +530,10 @@ pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
                     };
 
                     let _permit = permit;
+                    // Paced at the send, as in `send_batch`.
+                    if let Some(limiter) = limiter {
+                        limiter.acquire().await;
+                    }
                     let url = config.url.clone();
                     let result = client.send(&config).await;
                     let _ = tx.unbounded_send(BatchResult { url, result });
@@ -736,6 +738,54 @@ mod tests {
             elapsed >= Duration::from_millis(1800),
             "1/sec batch took {:?}, expected >= 1800ms",
             elapsed
+        );
+    }
+
+    /// Records when each send happened.
+    struct Recording {
+        inner: MockClient,
+        sends: std::sync::Mutex<Vec<Instant>>,
+    }
+
+    impl HttpClient for Recording {
+        async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
+            self.sends.lock().unwrap().push(Instant::now());
+            self.inner.send(config).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_requests_that_stood_aside_still_keep_the_rate() {
+        // Followers of a slow host stand aside while its first request runs.
+        // When it finishes they must go at the configured rate, not at once.
+        let client = Arc::new(Recording {
+            inner: MockClient::new(200, "ok".to_string()).with_delay(Duration::from_secs(2)),
+            sends: std::sync::Mutex::new(Vec::new()),
+        });
+        let configs: Vec<RequestConfig> = (0..8)
+            .map(|i| format!("https://a.com/{i}"))
+            .chain((0..8).map(|i| format!("https://b.com/{i}")))
+            .map(RequestConfig::new)
+            .collect();
+
+        send_batch(client.clone(), configs, 50, Some(5.0), None).await;
+
+        let sends = client.sends.lock().unwrap().clone();
+        assert_eq!(sends.len(), 16);
+        let busiest = sends
+            .iter()
+            .map(|t| {
+                sends
+                    .iter()
+                    .filter(|u| **u >= *t && **u < *t + Duration::from_secs(1))
+                    .count()
+            })
+            .max()
+            .unwrap();
+        // 5 a second, plus one for the bucket's first token.
+        assert!(
+            busiest <= 6,
+            "{busiest} sends inside one second at a rate of 5"
         );
     }
 
