@@ -736,7 +736,7 @@ impl PyResponse {
     ///
     /// Returns a tuple of `(outcome, vendor)`, both lowercase strings:
     ///
-    ///   outcome  ok | present | challenge | blocked | error
+    ///   outcome  ok | present | challenge | blocked
     ///   vendor   cloudflare | akamai | datadome | perimeterx | imperva |
     ///            f5 | kasada | unknown | "-" when nothing was detected
     ///
@@ -751,15 +751,21 @@ impl PyResponse {
     /// What this request amounts to, as a single verdict a caller can branch
     /// on. Returns `(conclusion, vendor)`:
     ///
-    ///   reached          got the page
-    ///   blocked          a product refused us
+    ///   reached          got the page, or the server's own answer such as
+    ///                    a 404 or a 500
+    ///   blocked          refused. vendor names the product when one was
+    ///                    recognised; "-" is an ordinary refusal (auth,
+    ///                    forbidden path, method not allowed) that a
+    ///                    different connection shape won't change
     ///   needs_browser    a JavaScript challenge; hand this URL to a real
     ///                    browser, because no HTTP client passes this tier
     ///   needs_legacy_tls the peer wants cryptography we declined or cannot do
     ///   unreachable      never got a response
     ///
     /// `needs_browser` is the one worth acting on. It means retrying with
-    /// different settings cannot help, which is the opposite of `blocked`.
+    /// different settings cannot help. A `blocked` with a named vendor is
+    /// the only refusal the ladder tries other settings against, so by the
+    /// time it is reported they have been tried.
     #[getter]
     fn conclusion(&self) -> (String, String) {
         conclusion_to_py(&self.inner.conclusion())

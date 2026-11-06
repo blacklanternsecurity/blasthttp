@@ -36,7 +36,8 @@ the ladder falling back to `compatibility` on the second handshake.
 - **`Response.conclusion`** reduces that to one verdict: reached, blocked,
   needs_browser, needs_legacy_tls or unreachable. `needs_browser` means a
   JavaScript challenge, which no HTTP client passes, so the URL should go to a
-  real browser rather than be retried
+  real browser rather than be retried. A `blocked` with vendor `-` is an
+  ordinary refusal from the origin, not a product
 - **`Response.attempts`** lists what the ladder tried, in order
 - Imperva's `_Incapsula_Resource` loader script no longer counts as a
   challenge. Imperva appends it to pages it let through, so ordinary pages and

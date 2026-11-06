@@ -76,9 +76,11 @@ impl Attempt {
 /// What the whole request amounts to, once every rung has been tried.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Conclusion {
-    /// Got the page.
+    /// Got the page, or the server's own answer such as a 404 or a 500.
     Reached,
-    /// A product refused us and nothing we can change is likely to help.
+    /// Refused. `vendor` names the product when one was recognised, and the
+    /// ladder has already tried what it could; `None` is an ordinary refusal
+    /// from the origin (auth, forbidden path) that no connection shape changes.
     Blocked {
         #[serde(skip_serializing_if = "Option::is_none")]
         vendor: Option<String>,
