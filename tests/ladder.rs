@@ -155,3 +155,100 @@ async fn test_a_server_that_never_answers_still_times_out() {
     assert_eq!(err.kind, ErrorKind::Timeout);
     assert_eq!(err.message, "request timed out after 1s");
 }
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+/// Refuses the first request with a Cloudflare challenge and answers every
+/// later one with a 200, recording each request's headers.
+async fn challenge_first_then_ok() -> (u16, Seen) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: Seen = Default::default();
+    let record = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16384];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let headers: Vec<(String, String)> = head
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            let first = {
+                let mut s = record.lock().unwrap();
+                s.push(headers);
+                s.len() == 1
+            };
+            let reply = if first {
+                "HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            } else {
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+            };
+            let _ = sock.write_all(reply.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (port, seen)
+}
+
+fn values<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    headers
+        .iter()
+        .filter(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+fn caller_headers() -> Vec<(String, String)> {
+    [
+        ("User-Agent", "custom/1.0"),
+        ("Accept", "application/json"),
+        ("X-Added", "1"),
+        ("Cookie", "session=abc"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+#[tokio::test]
+async fn test_a_switch_after_a_denial_claims_one_browser() {
+    // First contact keeps the caller's User-Agent. Once a denial moves the
+    // ladder to chrome131, its browser identity replaces the caller's, and
+    // everything else the caller added stays.
+    let (port, seen) = challenge_first_then_ok().await;
+    let mut config = config(port);
+    config.headers = Some(caller_headers());
+
+    let resp = HyperClient::new().send(&config).await.unwrap();
+    assert_eq!(resp.status, 200);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(values(&seen[0], "user-agent"), ["custom/1.0"]);
+
+    let switched = &seen[1];
+    let ua = values(switched, "user-agent");
+    assert_eq!(ua.len(), 1, "one User-Agent, got {ua:?}");
+    assert!(ua[0].contains("Chrome/131"), "{}", ua[0]);
+    assert!(values(switched, "sec-ch-ua")[0].contains("131"));
+    assert_eq!(values(switched, "accept"), ["application/json"]);
+    assert_eq!(values(switched, "x-added"), ["1"]);
+    assert_eq!(values(switched, "cookie"), ["session=abc"]);
+}
+
+#[tokio::test]
+async fn test_a_profile_the_caller_named_keeps_their_user_agent() {
+    let (port, seen) = challenge_first_then_ok().await;
+    let mut config = config(port);
+    config.headers = Some(caller_headers());
+    config.profile = Some("chrome131".to_string());
+
+    HyperClient::new().send(&config).await.unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(values(&seen[0], "user-agent"), ["custom/1.0"]);
+}

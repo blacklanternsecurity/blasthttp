@@ -64,6 +64,11 @@ pub struct RequestConfig {
     pub alpn_protocols: Option<Vec<String>>,
     #[serde(default)]
     pub verbosity: u8,
+    /// Set when the ladder, not the caller, chose `profile`. The profile's
+    /// browser identity headers then replace the caller's, since a switch
+    /// made because of a denial has to claim one browser consistently.
+    #[serde(skip)]
+    pub profile_from_ladder: bool,
 }
 
 impl RequestConfig {
@@ -93,6 +98,7 @@ impl RequestConfig {
             resolve_ip: None,
             alpn_protocols: None,
             verbosity: 0,
+            profile_from_ladder: false,
         }
     }
 
@@ -159,6 +165,7 @@ impl RequestConfig {
     /// connector from another.
     pub fn with_profile(&self, name: &str) -> RequestConfig {
         let mut c = self.clone();
+        c.profile_from_ladder = !self.tls_is_pinned();
         c.profile = Some(name.to_string());
         c
     }

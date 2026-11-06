@@ -1184,6 +1184,7 @@ impl BlastHTTP {
             resolve_ip,
             alpn_protocols,
             verbosity: 0,
+            profile_from_ladder: false,
         };
 
         let limiter = self.rate_limiter.clone();
@@ -1387,6 +1388,7 @@ impl BlastHTTP {
             resolve_ip: None,
             alpn_protocols: None,
             verbosity: 0,
+            profile_from_ladder: false,
         };
 
         let limiter = self.rate_limiter.clone();
@@ -1775,6 +1777,7 @@ impl PyBatchConfig {
             resolve_ip: self.resolve_ip,
             alpn_protocols: self.alpn_protocols,
             verbosity: 0,
+            profile_from_ladder: false,
         })
     }
 }

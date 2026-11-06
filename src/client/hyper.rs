@@ -1885,6 +1885,14 @@ async fn dispatch_forward_proxy(
     parse_response(hyper_response, config, log).await
 }
 
+/// Headers that say which browser a request claims to be.
+const IDENTITY_HEADERS: [&str; 4] = [
+    "user-agent",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+];
+
 fn build_request(
     uri: &http::Uri,
     config: &RequestConfig,
@@ -1954,8 +1962,9 @@ fn build_request(
     // answers an honest curl with 200 and the same client wearing only a
     // Chrome User-Agent with 403.
     //
-    // A caller's own header still wins over the profile's, since naming one
-    // explicitly means it.
+    // A caller's own header wins over the profile's, since naming one
+    // explicitly means it, except the browser identity once the ladder has
+    // switched profile (below).
     // A profile with no headers of its own means the client's own minimal
     // defaults, which is what `compatibility` and `modern` both want.
     let header_profile = if bisect_disabled("headers") {
@@ -1963,9 +1972,22 @@ fn build_request(
     } else {
         config.resolved_profile()
     };
+    // When the ladder chose the profile, its browser identity replaces the
+    // caller's; every other header the caller set still wins.
+    let profile_owns = |name: &str| {
+        config.profile_from_ladder
+            && IDENTITY_HEADERS
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(name))
+            && header_profile
+                .headers
+                .iter()
+                .any(|(p, _)| p.eq_ignore_ascii_case(name))
+    };
     if !header_profile.headers.is_empty() {
         for (name, value) in header_profile.headers {
-            let already_set = custom.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+            let already_set =
+                !profile_owns(name) && custom.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
             if !already_set {
                 builder = builder.header(*name, *value);
             }
@@ -2012,6 +2034,9 @@ fn build_request(
                     format!("{}; {}", caller, extra)
                 };
                 builder = builder.header(name.as_str(), merged);
+                continue;
+            }
+            if profile_owns(name) {
                 continue;
             }
             builder = builder.header(name.as_str(), value.as_str());
