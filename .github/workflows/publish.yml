@@ -25,14 +25,14 @@ jobs:
     if: needs.check.outputs.release == 'true'
     permissions:
       contents: read
-    uses: ./.github/workflows/tests.yml
+    uses: ./.github/workflows/tests.yml # zizmor: ignore[self-repository]
 
   rust-tests:
     needs: check
     if: needs.check.outputs.release == 'true'
     permissions:
       contents: read
-    uses: ./.github/workflows/rust-tests.yml
+    uses: ./.github/workflows/rust-tests.yml # zizmor: ignore[self-repository]
 
   wheels:
     needs: [tests, rust-tests]
