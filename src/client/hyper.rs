@@ -1663,18 +1663,6 @@ async fn connect_once(
     }
 
     apply_tls_settings(&mut ssl_builder, config)?;
-    if let Some(ref min_ver) = config.min_tls_version {
-        let version = parse_tls_version(min_ver)?;
-        ssl_builder
-            .set_min_proto_version(Some(version))
-            .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
-    }
-    if let Some(ref max_ver) = config.max_tls_version {
-        let version = parse_tls_version(max_ver)?;
-        ssl_builder
-            .set_max_proto_version(Some(version))
-            .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
-    }
     // ALPN: default to http/1.1-only for backward compatibility with
     // existing direct-connection callers (request_target/resolve_ip
     // paths can't meaningfully negotiate h2 anyway). If the caller
