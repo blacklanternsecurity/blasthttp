@@ -7,7 +7,7 @@
 // pair is the clearest single measurement of the problem this effort exists to
 // fix, so it is worth having as a regression fixture.
 
-use blasthttp::antibot::{Outcome, ResponseFacts, Vendor, classify};
+use blasthttp::antibot::{Outcome, ResponseFacts, Vendor, body_window, classify};
 
 fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
@@ -470,4 +470,35 @@ fn test_a_marker_in_a_multibyte_body_is_still_found() {
         classify(&facts(403, &h, &body)),
         Outcome::Challenge(Vendor::new("cloudflare"))
     );
+}
+
+#[test]
+fn test_the_body_window_keeps_a_marker_near_the_top() {
+    let h = hdrs(&[("server", "cloudflare")]);
+    let mut body = b"window._cf_chl_opt".to_vec();
+    body.extend(std::iter::repeat_n(0xffu8, 200_000));
+    let window = body_window(&body);
+    assert!(window.len() < 200_000, "the whole body was converted");
+    assert_eq!(
+        classify(&facts(403, &h, &window)),
+        Outcome::Challenge(Vendor::new("cloudflare"))
+    );
+}
+
+#[test]
+fn test_the_body_window_drops_a_marker_past_64k() {
+    let h = hdrs(&[("server", "cloudflare")]);
+    let body = format!("{}window._cf_chl_opt", " ".repeat(64 * 1024));
+    assert_ne!(
+        classify(&facts(403, &h, &body_window(body.as_bytes()))),
+        Outcome::Challenge(Vendor::new("cloudflare"))
+    );
+}
+
+#[test]
+fn test_the_body_window_survives_a_cut_character() {
+    // the cut lands inside a two-byte character
+    let body = format!("a{}", "\u{5ae}".repeat(40_000));
+    let window = body_window(body.as_bytes());
+    assert!(window.ends_with('\u{fffd}'));
 }

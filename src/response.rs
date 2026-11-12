@@ -179,7 +179,7 @@ impl Response {
         crate::antibot::classify(&crate::antibot::ResponseFacts {
             status: self.status,
             headers: &self.headers,
-            body: self.body(),
+            body: &crate::antibot::body_window(&self.body_bytes),
         })
     }
 
@@ -538,6 +538,21 @@ mod protection_tests {
             blocked.protection(),
             Outcome::Blocked(Vendor::new("akamai"))
         );
+    }
+
+    #[test]
+    fn test_classifying_a_binary_body_does_not_build_its_text() {
+        let mut resp = response_with(403, &[("server", "cloudflare")], "");
+        let mut body = vec![0xffu8; 16];
+        body.extend_from_slice(b"window._cf_chl_opt");
+        body.extend(std::iter::repeat_n(0xfe, 1024 * 1024));
+        resp.body_bytes = body;
+
+        assert_eq!(
+            resp.protection(),
+            Outcome::Challenge(Vendor::new("cloudflare"))
+        );
+        assert!(resp.body_cache.get().is_none(), "protection built body()");
     }
 
     #[test]

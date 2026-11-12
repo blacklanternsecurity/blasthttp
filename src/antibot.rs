@@ -21,6 +21,7 @@
 //! is the default, and [`set_rules`] swaps in another at runtime, so a rule
 //! can change without a rebuild.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -104,6 +105,15 @@ impl Outcome {
     }
 }
 
+/// How much of a body is searched. A challenge marker is always near the top.
+const BODY_WINDOW: usize = 64 * 1024;
+
+/// The part of a raw body a classification reads, as text. Cut before it is
+/// converted, so a large or binary body costs at most the window.
+pub fn body_window(body: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(&body[..body.len().min(BODY_WINDOW)])
+}
+
 /// Everything a classification looks at. Headers and cookies are expected
 /// lowercase-insensitive; `headers` holds `(name, value)` pairs as received,
 /// duplicates and all.
@@ -148,9 +158,7 @@ impl ResponseFacts<'_> {
     }
 
     fn body_contains(&self, needle: &str) -> bool {
-        // Bodies can be large; a challenge marker is always near the top.
-        const WINDOW: usize = 64 * 1024;
-        let mut end = self.body.len().min(WINDOW);
+        let mut end = self.body.len().min(BODY_WINDOW);
         // The cut can land in the middle of a multi-byte character, and
         // slicing a str there panics rather than erring. A body truncated by
         // max_body_size puts arbitrary bytes at the cap, so this is reachable

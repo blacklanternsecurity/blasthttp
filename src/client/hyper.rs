@@ -1875,7 +1875,7 @@ async fn dispatch_direct(
         &crate::antibot::classify(&crate::antibot::ResponseFacts {
             status: resp.status,
             headers: &resp.headers,
-            body: &String::from_utf8_lossy(&resp.body_bytes),
+            body: &crate::antibot::body_window(&resp.body_bytes),
         }),
     ));
 
@@ -2758,7 +2758,7 @@ impl HyperClient {
                         let outcome = crate::antibot::classify(&crate::antibot::ResponseFacts {
                             status: resp.status,
                             headers: &resp.headers,
-                            body: &String::from_utf8_lossy(&resp.body_bytes),
+                            body: &crate::antibot::body_window(&resp.body_bytes),
                         });
 
                         // Only walk the ladder when something recognisable
