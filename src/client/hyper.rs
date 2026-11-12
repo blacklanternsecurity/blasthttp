@@ -1045,19 +1045,109 @@ enum ConnMode {
 /// enough that a host which relents is noticed. See `ladder_exhausted`.
 const EXHAUSTED_TTL: Duration = Duration::from_secs(600);
 
+/// The smallest map size at which expired refusals are swept out.
+const HOST_SWEEP_MIN: usize = 1024;
+
+/// What the ladder has learned about one host.
+#[derive(Default, Clone, Copy)]
+struct HostMemory {
+    /// The profile that last got through, when it was not the default.
+    profile: Option<&'static crate::profile::ConnectionProfile>,
+    /// When the host last refused every rung.
+    exhausted_at: Option<Instant>,
+}
+
+impl HostMemory {
+    fn exhausted(&self) -> bool {
+        self.exhausted_at
+            .is_some_and(|at| at.elapsed() < EXHAUSTED_TTL)
+    }
+}
+
+/// Per-host ladder memory. A host has an entry only while it holds something,
+/// so a scan's memory grows with the hosts that needed a shift or refused,
+/// not with every host it reached.
+struct HostMemories {
+    map: HashMap<String, HostMemory>,
+    /// The size at which the next sweep runs, doubled after each one.
+    sweep_at: usize,
+}
+
+impl HostMemories {
+    fn new() -> Self {
+        HostMemories {
+            map: HashMap::new(),
+            sweep_at: HOST_SWEEP_MIN,
+        }
+    }
+
+    fn profile(&self, key: &str) -> Option<&'static crate::profile::ConnectionProfile> {
+        self.map.get(key).and_then(|m| m.profile)
+    }
+
+    /// Whether the host refused every rung within the TTL. An expired
+    /// refusal is dropped on the way.
+    fn exhausted(&mut self, key: &str) -> bool {
+        let Some(memory) = self.map.get_mut(key) else {
+            return false;
+        };
+        if memory.exhausted() {
+            return true;
+        }
+        memory.exhausted_at = None;
+        if memory.profile.is_none() {
+            self.map.remove(key);
+        }
+        false
+    }
+
+    fn set_exhausted(&mut self, key: String) {
+        self.map.entry(key).or_default().exhausted_at = Some(Instant::now());
+        if self.map.len() >= self.sweep_at {
+            self.map.retain(|_, m| {
+                if !m.exhausted() {
+                    m.exhausted_at = None;
+                }
+                m.profile.is_some() || m.exhausted_at.is_some()
+            });
+            self.sweep_at = (self.map.len() * 2).max(HOST_SWEEP_MIN);
+        }
+    }
+
+    /// Record what got through, which also ends any refusal. `None` means the
+    /// default, which needs no entry.
+    fn set_profile(
+        &mut self,
+        key: String,
+        profile: Option<&'static crate::profile::ConnectionProfile>,
+    ) {
+        match profile {
+            Some(p) => {
+                self.map.insert(
+                    key,
+                    HostMemory {
+                        profile: Some(p),
+                        exhausted_at: None,
+                    },
+                );
+            }
+            None => {
+                self.map.remove(&key);
+            }
+        }
+    }
+}
+
 pub struct HyperClient {
     // Clients cached by connection mode. A scan using an HTTP proxy may need
     // both a ForwardProxy client (for HTTP targets) and a Tunnel client (for
     // HTTPS targets), so we cache per-mode rather than a single client.
     cached: Mutex<std::collections::HashMap<ConnMode, CachedClient>>,
     // Which profile last got through to each host, so a scan does not re-walk
-    // the ladder on every request. Written only on success; see
-    // `remember_profile`.
-    host_profiles: Mutex<HashMap<String, &'static crate::profile::ConnectionProfile>>,
-    // When each host last refused every rung of the ladder. For a while after,
-    // a refusal from it is taken as the answer instead of walking the ladder
-    // again; see `ladder_exhausted`.
-    host_exhausted: Mutex<HashMap<String, Instant>>,
+    // the ladder on every request, and when each host last refused every rung,
+    // so a refusal from it is taken as the answer for a while. See
+    // `remember_profile` and `ladder_exhausted`.
+    hosts: Mutex<HostMemories>,
 }
 
 impl Default for HyperClient {
@@ -1070,8 +1160,7 @@ impl HyperClient {
     pub fn new() -> Self {
         HyperClient {
             cached: Mutex::new(std::collections::HashMap::new()),
-            host_profiles: Mutex::new(HashMap::new()),
-            host_exhausted: Mutex::new(HashMap::new()),
+            hosts: Mutex::new(HostMemories::new()),
         }
     }
 
@@ -2442,8 +2531,8 @@ impl HyperClient {
             return config.resolved_profile();
         }
         if let Some(key) = peer_slot_key(uri)
-            && let Ok(map) = self.host_profiles.lock()
-            && let Some(p) = map.get(&key)
+            && let Ok(hosts) = self.hosts.lock()
+            && let Some(p) = hosts.profile(&key)
         {
             return p;
         }
@@ -2488,11 +2577,9 @@ impl HyperClient {
     }
 
     fn exhausted_within_ttl(&self, key: &str) -> bool {
-        self.host_exhausted
+        self.hosts
             .lock()
-            .ok()
-            .and_then(|map| map.get(key).copied())
-            .is_some_and(|at| at.elapsed() < EXHAUSTED_TTL)
+            .is_ok_and(|mut hosts| hosts.exhausted(key))
     }
 
     /// Record that a host refused every rung of the ladder.
@@ -2501,9 +2588,9 @@ impl HyperClient {
             return;
         }
         if let Some(key) = peer_slot_key(uri)
-            && let Ok(mut map) = self.host_exhausted.lock()
+            && let Ok(mut hosts) = self.hosts.lock()
         {
-            map.insert(key, Instant::now());
+            hosts.set_exhausted(key);
         }
     }
 
@@ -2532,14 +2619,12 @@ impl HyperClient {
         if config.tls_is_pinned() {
             return;
         }
-        if let Some(key) = peer_slot_key(uri) {
-            if let Ok(mut map) = self.host_profiles.lock() {
-                map.insert(key.clone(), profile);
-            }
-            // whatever it refused before, it lets us through now
-            if let Ok(mut map) = self.host_exhausted.lock() {
-                map.remove(&key);
-            }
+        // The default is where an unremembered host starts anyway.
+        let shifted = (profile.name != config.resolved_profile().name).then_some(profile);
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(mut hosts) = self.hosts.lock()
+        {
+            hosts.set_profile(key, shifted);
         }
     }
 
@@ -3400,26 +3485,98 @@ mod tests {
         );
     }
 
+    fn expire(client: &HyperClient, key: &str) {
+        let long_ago = Instant::now() - EXHAUSTED_TTL - Duration::from_secs(1);
+        client
+            .hosts
+            .lock()
+            .unwrap()
+            .map
+            .get_mut(key)
+            .unwrap()
+            .exhausted_at = Some(long_ago);
+    }
+
     #[test]
     fn test_exhausted_host_expires() {
         let client = HyperClient::new();
         assert!(!client.exhausted_within_ttl("example.com:443"));
 
         client
-            .host_exhausted
+            .hosts
             .lock()
             .unwrap()
-            .insert("example.com:443".to_string(), Instant::now());
+            .set_exhausted("example.com:443".to_string());
         assert!(client.exhausted_within_ttl("example.com:443"));
 
         // a refusal from longer ago than the TTL no longer counts, so the ladder is walked again
-        let long_ago = Instant::now() - EXHAUSTED_TTL - Duration::from_secs(1);
+        expire(&client, "example.com:443");
+        assert!(!client.exhausted_within_ttl("example.com:443"));
+        assert!(
+            client.hosts.lock().unwrap().map.is_empty(),
+            "expired entry kept"
+        );
+    }
+
+    #[test]
+    fn test_only_a_shifted_host_is_remembered() {
+        let client = HyperClient::new();
+        let config = RequestConfig::new("https://a.example/".to_string());
+        let a: http::Uri = "https://a.example/".parse().unwrap();
+        let b: http::Uri = "https://b.example/".parse().unwrap();
+        let compat = crate::profile::by_name("compatibility").unwrap();
+
+        client.remember_profile(&config, &a, crate::profile::default_profile());
+        client.remember_profile(&config, &b, compat);
+        let hosts = client.hosts.lock().unwrap();
+        assert_eq!(hosts.map.len(), 1, "the default was stored");
+        assert_eq!(
+            hosts.profile("b.example:443").map(|p| p.name),
+            Some(compat.name)
+        );
+    }
+
+    #[test]
+    fn test_the_default_getting_through_clears_a_refusal() {
+        let client = HyperClient::new();
+        let config = RequestConfig::new("https://a.example/".to_string());
+        let a: http::Uri = "https://a.example/".parse().unwrap();
+
+        client.remember_exhausted(&config, &a);
+        assert!(client.ladder_exhausted(&config, &a));
+        client.remember_profile(&config, &a, crate::profile::default_profile());
+        assert!(!client.ladder_exhausted(&config, &a));
+        assert!(client.hosts.lock().unwrap().map.is_empty());
+    }
+
+    #[test]
+    fn test_expired_refusals_are_swept() {
+        let client = HyperClient::new();
+        let compat = crate::profile::by_name("compatibility").unwrap();
+        {
+            let mut hosts = client.hosts.lock().unwrap();
+            hosts.set_profile("kept:443".to_string(), Some(compat));
+            hosts.set_exhausted("kept:443".to_string());
+        }
+        expire(&client, "kept:443");
+        for i in 0..HOST_SWEEP_MIN - 2 {
+            let key = format!("h{i}:443");
+            client.hosts.lock().unwrap().set_exhausted(key.clone());
+            expire(&client, &key);
+        }
+        // never looked up again, so only a sweep removes them
         client
-            .host_exhausted
+            .hosts
             .lock()
             .unwrap()
-            .insert("example.com:443".to_string(), long_ago);
-        assert!(!client.exhausted_within_ttl("example.com:443"));
+            .set_exhausted("fresh:443".to_string());
+
+        let hosts = client.hosts.lock().unwrap();
+        let mut left: Vec<_> = hosts.map.keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, ["fresh:443", "kept:443"]);
+        assert!(hosts.map["kept:443"].exhausted_at.is_none());
+        assert_eq!(hosts.sweep_at, HOST_SWEEP_MIN);
     }
 
     #[test]

@@ -30,6 +30,10 @@ the ladder falling back to `compatibility` on the second handshake.
   that refused everything cost two requests for every one a scan sent it, on
   exactly the hosts most likely to rate-limit or ban. Getting through clears
   it, and it expires because a refusal is a judgement that changes
+- That memory holds only hosts with something to remember: one that needed a
+  profile other than the default, or one that recently refused every rung.
+  Expired refusals are swept out, so it grows with those hosts rather than
+  with every host a scan reaches
 - **`Response.protection`** reports what a bot-management product did:
   `(outcome, vendor)` where outcome is ok, present, challenge or blocked. A
   404 or a 500 is ok: the server answered and no product intervened
