@@ -181,6 +181,16 @@ pub(crate) fn bisect_disabled(layer: &str) -> bool {
     }
 }
 
+/// The profile the TLS layer follows: the default under a TLS bisect, so the
+/// cipher list and the extensions OpenSSL adds per connection agree.
+fn tls_profile(config: &RequestConfig) -> &'static crate::profile::ConnectionProfile {
+    if bisect_disabled("tls") {
+        crate::profile::default_profile()
+    } else {
+        config.resolved_profile()
+    }
+}
+
 /// Apply the cipher, signature-algorithm, group and version settings to a
 /// connector builder.
 ///
@@ -214,13 +224,7 @@ fn apply_tls_settings(
 ) -> Result<(), ClientError> {
     use openssl::ssl::SslOptions;
 
-    // A bisect of the TLS layer means "what the default would have sent",
-    // which is now a named profile rather than an absence.
-    let profile = if bisect_disabled("tls") {
-        crate::profile::default_profile()
-    } else {
-        config.resolved_profile()
-    };
+    let profile = tls_profile(config);
 
     // Security level 0: allow all ciphers including RC4 and DES. This is an
     // offensive-first tool and needs to connect to anything.
@@ -704,7 +708,7 @@ impl OpenSslConnector {
         http.set_connect_timeout(Some(connect_timeout));
 
         Ok(OpenSslConnector {
-            profile_active: config.resolved_profile().tls.browser_extensions,
+            profile_active: tls_profile(config).tls.browser_extensions,
             http,
             ssl,
             cert_slot,
@@ -1596,7 +1600,7 @@ async fn connect_once(
         .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
     let ssl_connector = ssl_builder.build();
-    let profile_active = config.resolved_profile().tls.browser_extensions;
+    let profile_active = tls_profile(config).tls.browser_extensions;
     let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
         .map_err(|e| ClientError::tls(format!("SSL conf failed: {}", e)))?;
 

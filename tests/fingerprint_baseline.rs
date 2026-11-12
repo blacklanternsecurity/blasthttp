@@ -295,6 +295,17 @@ async fn test_chrome_profile_sends_renegotiation_info() {
 }
 
 #[tokio::test]
+async fn test_chrome_profile_sends_status_request() {
+    // OpenSSL owns 0x0005, so it is set per connection rather than with the
+    // other browser extensions.
+    let hello = capture_profile_hello("chrome").await;
+    assert!(
+        hello.extensions.contains(&0x0005),
+        "status_request missing under the chrome profile"
+    );
+}
+
+#[tokio::test]
 async fn test_chrome_profile_drops_non_browser_extensions() {
     // padding and encrypt_then_mac are OpenSSL habits no browser has.
     let hello = capture_profile_hello("chrome").await;

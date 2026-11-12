@@ -74,7 +74,8 @@ the ladder falling back to `compatibility` on the second handshake.
   `compatibility`, rather than failing with "no ciphers available" because the
   default offers nothing that exists in SSLv3
 - `BLASTHTTP_BISECT=tls,headers,http2` disables profile layers independently,
-  for finding out which one a detector is reacting to
+  for finding out which one a detector is reacting to. Under `tls` the whole
+  ClientHello is the default profile's, extensions included
 - Batches no longer have every request in an opening burst work out the same
   host's profile separately. A request whose host is already being discovered
   stands aside and lets a request for a *different* host take its slot, then
