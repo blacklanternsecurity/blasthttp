@@ -387,10 +387,10 @@ impl std::error::Error for TlsHandshakeError {
     }
 }
 
-/// Build the lookup key for `PeerSlot` from a URI's host and port.
-/// HTTPS defaults to 443, everything else to 80 — matches what
-/// `HttpConnector` uses when it dials the OS resolver.
-fn peer_slot_key(uri: &http::Uri) -> Option<String> {
+/// `host:port` for a URI, the key for everything tracked per host: peer IPs,
+/// the ladder's memory and batch scheduling. HTTPS defaults to 443,
+/// everything else to 80, matching what `HttpConnector` dials.
+pub(crate) fn host_port_key(uri: &http::Uri) -> Option<String> {
     let host = uri.host()?;
     let default_port = if uri.scheme_str() == Some("https") {
         443
@@ -832,7 +832,7 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
         let slot_key = if proxy.is_some() {
             None
         } else {
-            peer_slot_key(&uri)
+            host_port_key(&uri)
         };
         let http_fut = match &proxy {
             Some(p) => self.http.call(p.uri.clone()),
@@ -2518,7 +2518,7 @@ impl HyperClient {
         if config.tls_is_pinned() {
             return config.resolved_profile();
         }
-        if let Some(key) = peer_slot_key(uri)
+        if let Some(key) = host_port_key(uri)
             && let Ok(hosts) = self.hosts.lock()
             && let Some(p) = hosts.profile(&key)
         {
@@ -2561,7 +2561,7 @@ impl HyperClient {
         if config.tls_is_pinned() {
             return false;
         }
-        peer_slot_key(uri).is_some_and(|key| self.exhausted_within_ttl(&key))
+        host_port_key(uri).is_some_and(|key| self.exhausted_within_ttl(&key))
     }
 
     fn exhausted_within_ttl(&self, key: &str) -> bool {
@@ -2575,7 +2575,7 @@ impl HyperClient {
         if config.tls_is_pinned() {
             return;
         }
-        if let Some(key) = peer_slot_key(uri)
+        if let Some(key) = host_port_key(uri)
             && let Ok(mut hosts) = self.hosts.lock()
         {
             hosts.set_exhausted(key);
@@ -2609,7 +2609,7 @@ impl HyperClient {
         }
         // The default is where an unremembered host starts anyway.
         let shifted = (profile.name != config.resolved_profile().name).then_some(profile);
-        if let Some(key) = peer_slot_key(uri)
+        if let Some(key) = host_port_key(uri)
             && let Ok(mut hosts) = self.hosts.lock()
         {
             hosts.set_profile(key, shifted);
@@ -2864,7 +2864,7 @@ impl HyperClient {
             //     authority isn't in the map)
             //   • forward-proxy dispatch (bypasses the connector entirely)
             //   • peer_addr() failed at connect time (vanishingly rare)
-            let hop_peer_ip = peer_slot_key(&uri).and_then(|key| {
+            let hop_peer_ip = host_port_key(&uri).and_then(|key| {
                 let cached = cached.as_ref()?;
                 let map = cached.peer_slot.lock().ok()?;
                 map.get(&key).map(|ip| ip.to_string())

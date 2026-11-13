@@ -269,20 +269,10 @@ impl Drop for AsideGuard {
 /// A URL that will not parse gets a bucket under its own text, which just
 /// means it coordinates with nothing.
 fn host_key(url: &str) -> String {
-    let Ok(uri) = url.parse::<http::Uri>() else {
-        return url.to_string();
-    };
-    match uri.host() {
-        Some(h) => {
-            let default_port = if uri.scheme_str() == Some("https") {
-                443
-            } else {
-                80
-            };
-            format!("{}:{}", h, uri.port_u16().unwrap_or(default_port))
-        }
-        None => url.to_string(),
-    }
+    url.parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| crate::client::hyper::host_port_key(&uri))
+        .unwrap_or_else(|| url.to_string())
 }
 
 impl Scheduler {
@@ -1082,6 +1072,18 @@ mod scheduler_tests {
 
     fn is_aside(d: &Dispatch) -> bool {
         matches!(d, Dispatch::Aside(..))
+    }
+
+    #[test]
+    fn test_host_key_matches_the_client() {
+        for url in ["https://a.test/x", "http://a.test:8080/"] {
+            let uri: http::Uri = url.parse().unwrap();
+            assert_eq!(
+                Some(host_key(url)),
+                crate::client::hyper::host_port_key(&uri)
+            );
+        }
+        assert_eq!(host_key("not a url"), "not a url");
     }
 
     #[test]
