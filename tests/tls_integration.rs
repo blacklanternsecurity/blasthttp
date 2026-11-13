@@ -2,13 +2,13 @@
 // These spin up a real TLS server using our custom OpenSSL build,
 // then connect with blasthttp's HyperClient to verify end-to-end behavior.
 
-mod tls_server;
+mod support;
 
 use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
 use blasthttp::config::RequestConfig;
 use openssl::ssl::SslVersion;
-use tls_server::{TlsServerConfig, TlsTestServer};
+use support::tls_server::{TlsServerConfig, TlsTestServer};
 
 fn make_config(url: &str) -> RequestConfig {
     let mut config = RequestConfig::new(url.to_string());

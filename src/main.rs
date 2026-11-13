@@ -69,6 +69,10 @@ struct Cli {
     #[arg(long = "no-proxy", num_args = 1)]
     no_proxy: Vec<String>,
 
+    /// Browser profile to imitate (e.g. "chrome")
+    #[arg(long)]
+    profile: Option<String>,
+
     /// OpenSSL cipher string (e.g. "ALL", "HIGH", "RC4-SHA")
     #[arg(long)]
     ciphers: Option<String>,
@@ -120,6 +124,7 @@ fn build_config(cli: &Cli, url: String) -> RequestConfig {
     config.max_body_size = cli.max_body_size;
     config.proxy = cli.proxy.clone();
     config.no_proxy = cli.no_proxy.clone();
+    config.profile = cli.profile.clone();
     config.cipher_string = cli.ciphers.clone();
     config.min_tls_version = cli.min_tls.clone();
     config.max_tls_version = cli.max_tls.clone();

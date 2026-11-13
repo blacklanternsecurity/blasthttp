@@ -1,12 +1,14 @@
-use super::{ClientError, HttpClient};
+use super::{ClientError, HttpClient, TlsFailure};
 use crate::config::RequestConfig;
 use crate::debug::{DebugLog, debug_record, new_debug_log};
+use crate::profile::RungFailure;
 use crate::response::{CertInfo, RedirectHop, Response};
 
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read;
@@ -58,6 +60,273 @@ fn sanitize_uri(url: &str) -> String {
     out
 }
 
+/// Add the extensions a browser sends that OpenSSL does not send on its own.
+///
+/// JA4 hashes the list of extension *types*, not their contents, so presence
+/// is what the fingerprint turns on. Payload fidelity still matters to
+/// anything reading the raw hello, and where a payload is cheap to get right
+/// it is written out properly rather than left empty.
+///
+/// `SSL_CTX_add_custom_ext` refuses any extension OpenSSL handles itself, so
+/// this only covers the ones it has never heard of. `status_request` is set
+/// through its own API for that reason, and `renegotiation_info` cannot be
+/// done from out here at all.
+fn add_browser_extensions(
+    builder: &mut openssl::ssl::SslConnectorBuilder,
+) -> Result<(), ClientError> {
+    use openssl::ssl::ExtensionContext;
+
+    // Each extension's payload needs its OWN type, and this is not a style
+    // choice. The `openssl` crate stashes the bytes an add-callback returns in
+    // per-connection ex_data keyed on the payload type:
+    //
+    //     let idx = Ssl::cached_ex_index::<CustomExtAddState<T>>();
+    //
+    // so every custom extension returning `Vec<u8>` shares one slot and
+    // overwrites the others. Registering three that way sends exactly one.
+    // Distinct newtypes give each its own slot.
+    macro_rules! payload_type {
+        ($name:ident) => {
+            struct $name(Vec<u8>);
+            impl AsRef<[u8]> for $name {
+                fn as_ref(&self) -> &[u8] {
+                    &self.0
+                }
+            }
+        };
+    }
+    payload_type!(SignedCertTimestamp);
+
+    // The ClientHello for sending, plus the places a server may answer.
+    // Registering CLIENT_HELLO alone makes OpenSSL reject a reply that arrives
+    // in a context with no handler, which breaks the handshake outright rather
+    // than merely looking wrong.
+    let ctx = ExtensionContext::CLIENT_HELLO
+        | ExtensionContext::TLS1_3_SERVER_HELLO
+        | ExtensionContext::TLS1_3_ENCRYPTED_EXTENSIONS
+        | ExtensionContext::TLS1_2_SERVER_HELLO;
+
+    // Which codepoints OpenSSL will cede, probed rather than assumed:
+    //
+    //   0x0005 status_request         refused for custom use, OpenSSL owns it
+    //   0x0012 signed_cert_timestamp  accepted
+    //   0x001b compress_certificate   refused, OpenSSL owns it
+    //   0x4469 application_settings   accepted
+    //   0xfe0d encrypted_client_hello accepted
+    //   0xff01 renegotiation_info     refused, OpenSSL owns it
+    //
+    // status_request is set per-connection instead, in the one place OpenSSL's
+    // own API for it works. renegotiation_info and the SCSV are handled by a
+    // patch to our OpenSSL build.
+
+    // status_request (0x0005) is handled per-connection; see the connector.
+
+    // signed_certificate_timestamp (0x0012): empty, as a client sends it.
+    let _ = builder.add_custom_ext(
+        0x0012,
+        ctx,
+        |_ssl, _ctx, _cert| Ok(Some(SignedCertTimestamp(Vec::new()))),
+        |_ssl, _ctx, _data, _cert| Ok(()),
+    );
+
+    // ── Three Chrome extensions deliberately NOT sent ─────────────
+    //
+    // Chrome sends application_settings (0x4469), encrypted_client_hello
+    // (0xfe0d) and compress_certificate (0x001b). We send none of them, which
+    // costs three extensions against Chrome's JA4. Each was tried and each
+    // broke real sites, because advertising a protocol feature is a promise to
+    // implement it and a server that takes you up on it gets a client that
+    // cannot follow through.
+    //
+    //   ALPS (0x4469): google.com negotiates it and then expects the ALPS
+    //     settings exchange inside HTTP/2. We do not implement that, so the
+    //     handshake completes and the request then fails. Needs the HTTP/2
+    //     work before it can be sent honestly.
+    //
+    //   ECH (0xfe0d): Chrome sends a GREASE ECH, a decoy shaped precisely
+    //     enough to pass a real parser. A hand-built imitation is not, and
+    //     reddit.com rejects it at the handshake. Registering the server-reply
+    //     contexts fixed cloudflare.com but not reddit.com, so the payload
+    //     itself is the problem. Needs real ECH, which arrived in OpenSSL 3.5.
+    //
+    //   compress_certificate (0x001b): our OpenSSL is built with
+    //     OPENSSL_NO_COMP_ALG, so it cannot decompress a certificate. Enabling
+    //     it means a compression library in the build, and the wheels
+    //     cross-compile to six targets.
+    //
+    // The measurement that matters: without all three, akamai.com went from a
+    // hard 403 to 200 with a real session. Exact JA4 parity turned out not to
+    // be the bar. Plausibility was enough there, and a client that connects is
+    // worth more than one that matches a hash and cannot.
+
+    Ok(())
+}
+
+/// Layers of a profile that can be disabled independently, for working out
+/// which one a particular detector is reacting to.
+///
+/// Driven by `BLASTHTTP_BISECT`, a comma-separated list of layers to leave
+/// off: `tls`, `headers`, `http2`. This exists because "we are blocked" does
+/// not say which part of the imitation is failing, and the alternative is
+/// rebuilding between every experiment.
+///
+/// ```text
+/// BLASTHTTP_BISECT=headers,http2   # profile TLS only
+/// BLASTHTTP_BISECT=tls             # everything but TLS
+/// ```
+pub(crate) fn bisect_disabled(layer: &str) -> bool {
+    match std::env::var("BLASTHTTP_BISECT") {
+        Ok(v) => v.split(',').any(|p| p.trim().eq_ignore_ascii_case(layer)),
+        Err(_) => false,
+    }
+}
+
+/// Apply the cipher, signature-algorithm, group and version settings to a
+/// connector builder.
+///
+/// Shared because there are two places that build an SSL context, the pooled
+/// connector and `connect_stream`, and they have historically been
+/// copy-pasted siblings. Anything applied in only one of them silently gives
+/// `raw_connect`, `resolve_ip` and `request_target` requests a different
+/// fingerprint from ordinary ones.
+///
+/// Precedence is: an explicit setting beats the profile, and the profile beats
+/// the default. A caller who names a cipher string means it, and several
+/// existing tests depend on that still being true.
+/// The cipher list to offer: `base` untouched when verification is off, with
+/// `!aNULL` appended when it is on.
+///
+/// An anonymous suite sends no certificate, and OpenSSL skips verify-peer (and
+/// the hostname check with it) when none arrives, so offering one to a caller
+/// who set `verify_certs` would report a verified handshake that checked
+/// nothing. This applies to a caller's own `cipher_string` too.
+fn verified_cipher_list(base: &str, verify: bool) -> Cow<'_, str> {
+    if verify {
+        Cow::Owned(format!("{base}:!aNULL"))
+    } else {
+        Cow::Borrowed(base)
+    }
+}
+
+fn apply_tls_settings(
+    builder: &mut openssl::ssl::SslConnectorBuilder,
+    config: &RequestConfig,
+) -> Result<(), ClientError> {
+    use openssl::ssl::SslOptions;
+
+    // A bisect of the TLS layer means "what the default would have sent",
+    // which is now a named profile rather than an absence.
+    let profile = if bisect_disabled("tls") {
+        crate::profile::default_profile()
+    } else {
+        config.resolved_profile()
+    };
+
+    // Security level 0: allow all ciphers including RC4 and DES. This is an
+    // offensive-first tool and needs to connect to anything.
+    builder.set_security_level(0);
+
+    // `SslConnector::builder` sets NO_SSLV3. Clear it, or a server that speaks
+    // nothing newer stays unreachable even when asked for by name. Clearing
+    // the option only permits the protocol; what is actually offered is
+    // decided by the min/max version below, and a browser profile pins that
+    // floor at 1.2 so this never widens a profile's offer.
+    builder.clear_options(SslOptions::NO_SSLV3);
+
+    if profile.tls.browser_extensions {
+        // Removing two extensions a browser does not send.
+        //
+        // encrypt_then_mac (0x0016) goes away by disabling the feature.
+        // padding (0x0015) is added by SSL_OP_TLSEXT_PADDING, which arrives
+        // switched on inside SSL_OP_ALL, so it has to be cleared rather than
+        // set. JA4 counts extensions, so both of these move the fingerprint.
+        //
+        // The `openssl` crate exposes neither flag, so the bits are taken from
+        // ssl.h directly: SSL_OP_TLSEXT_PADDING is SSL_OP_BIT(4) and
+        // SSL_OP_NO_ENCRYPT_THEN_MAC is SSL_OP_BIT(19). Both are stable parts
+        // of the public ABI.
+        const SSL_OP_TLSEXT_PADDING: u64 = 1 << 4;
+        const SSL_OP_NO_ENCRYPT_THEN_MAC: u64 = 1 << 19;
+        builder.set_options(SslOptions::from_bits_retain(SSL_OP_NO_ENCRYPT_THEN_MAC));
+        builder.clear_options(SslOptions::from_bits_retain(SSL_OP_TLSEXT_PADDING));
+
+        add_browser_extensions(builder)?;
+    }
+
+    // Each of these is optional: leaving one unset keeps OpenSSL's own list
+    // and order, which is what a profile imitating an ordinary OpenSSL client
+    // wants.
+    if let Some(suites) = profile.tls.ciphersuites {
+        builder.set_ciphersuites(suites).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid TLS 1.3 suite list: {}",
+                profile.name, e
+            ))
+        })?;
+    }
+    if let Some(sigalgs) = profile.tls.sigalgs {
+        builder.set_sigalgs_list(sigalgs).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid signature algorithm list: {}",
+                profile.name, e
+            ))
+        })?;
+    }
+    if let Some(groups) = profile.tls.groups {
+        builder.set_groups_list(groups).map_err(|e| {
+            ClientError::tls(format!(
+                "profile '{}' has an invalid group list: {}",
+                profile.name, e
+            ))
+        })?;
+    }
+
+    // Always set the cipher list, never leave it alone.
+    //
+    // `SslConnector::builder` installs its own first,
+    // `DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`, and
+    // `set_security_level(0)` does NOT undo it. The security level governs how
+    // weak a negotiated cipher may be; the cipher list governs which ones are
+    // offered at all. Leaving it alone means RC4, DES, 3DES and SEED never
+    // reach the wire whatever the security level says, so a server speaking
+    // only one of them is unreachable, which is the whole reason this project
+    // builds its own OpenSSL.
+    let ciphers = verified_cipher_list(
+        config
+            .cipher_string
+            .as_deref()
+            .unwrap_or(profile.tls.cipher_list),
+        config.should_verify_certs(),
+    );
+    builder
+        .set_cipher_list(&ciphers)
+        .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
+
+    let min_version = config
+        .min_tls_version
+        .as_deref()
+        .or(profile.tls.min_version);
+    if let Some(v) = min_version {
+        let version = parse_tls_version(v)?;
+        builder
+            .set_min_proto_version(Some(version))
+            .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
+    }
+
+    let max_version = config
+        .max_tls_version
+        .as_deref()
+        .or(profile.tls.max_version);
+    if let Some(v) = max_version {
+        let version = parse_tls_version(v)?;
+        builder
+            .set_max_proto_version(Some(version))
+            .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
+    }
+
+    Ok(())
+}
+
 // Load the OpenSSL legacy provider once (for RC4, DES, etc.).
 // The provider is statically compiled into libcrypto via `no-module` build flag.
 // `Once` ensures this runs exactly once even across threads.
@@ -89,6 +358,30 @@ type CertSlot = Arc<Mutex<Option<CertInfo>>>;
 /// new connections to the same host overwrite it (DNS round-robin
 /// will lag, but the value will always be an IP that *was* used).
 type PeerSlot = Arc<Mutex<HashMap<String, IpAddr>>>;
+
+/// A failed TLS handshake, as the connector hands it to hyper-util.
+///
+/// hyper-util wraps it in an error whose `Display` is just "client error
+/// (Connect)", but keeps it as that error's `source()`, so
+/// `classify_dispatch_error` finds it again by walking the chain. The reason
+/// travels with the error of the request it belongs to.
+#[derive(Debug)]
+struct TlsHandshakeError {
+    failure: TlsFailure,
+    inner: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for TlsHandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl std::error::Error for TlsHandshakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.inner)
+    }
+}
 
 /// Build the lookup key for `PeerSlot` from a URI's host and port.
 /// HTTPS defaults to 443, everything else to 80 — matches what
@@ -197,6 +490,9 @@ fn extract_cert_info(ssl: &openssl::ssl::SslRef) -> Option<CertInfo> {
 // Wraps HttpConnector with TLS handshake via openssl + tokio-openssl.
 #[derive(Clone)]
 struct OpenSslConnector {
+    /// Whether a browser profile is active. Needed in `call()` because
+    /// status_request can only be set once an `Ssl` exists.
+    profile_active: bool,
     http: HttpConnector,
     ssl: openssl::ssl::SslConnector,
     // Shared slot for cert info — written during handshake, read after response
@@ -275,12 +571,13 @@ fn encode_alpn_protocols(protos: &[String]) -> Result<Vec<u8>, ClientError> {
 
 fn parse_tls_version(s: &str) -> Result<openssl::ssl::SslVersion, ClientError> {
     match s.to_lowercase().as_str() {
+        "3.0" | "ssl3" | "sslv3" | "ssl3.0" => Ok(openssl::ssl::SslVersion::SSL3),
         "1.0" | "tls1.0" | "tlsv1.0" => Ok(openssl::ssl::SslVersion::TLS1),
         "1.1" | "tls1.1" | "tlsv1.1" => Ok(openssl::ssl::SslVersion::TLS1_1),
         "1.2" | "tls1.2" | "tlsv1.2" => Ok(openssl::ssl::SslVersion::TLS1_2),
         "1.3" | "tls1.3" | "tlsv1.3" => Ok(openssl::ssl::SslVersion::TLS1_3),
         _ => Err(ClientError::other(format!(
-            "unknown TLS version '{}' (use 1.0, 1.1, 1.2, 1.3)",
+            "unknown TLS version '{}' (use 3.0 for SSLv3, or 1.0, 1.1, 1.2, 1.3)",
             s
         ))),
     }
@@ -374,35 +671,13 @@ impl OpenSslConnector {
             openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
                 .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
-        // Security level 0: allow all ciphers including RC4, DES, export.
-        // This is an offensive-first tool — we need to connect to anything.
-        builder.set_security_level(0);
-
         if !config.should_verify_certs() {
             builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
         } else {
             load_system_ca_certs(&mut builder)?;
         }
 
-        if let Some(ref ciphers) = config.cipher_string {
-            builder.set_cipher_list(ciphers).map_err(|e| {
-                ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e))
-            })?;
-        }
-
-        if let Some(ref min_ver) = config.min_tls_version {
-            let version = parse_tls_version(min_ver)?;
-            builder
-                .set_min_proto_version(Some(version))
-                .map_err(|e| ClientError::tls(format!("failed to set min TLS version: {}", e)))?;
-        }
-
-        if let Some(ref max_ver) = config.max_tls_version {
-            let version = parse_tls_version(max_ver)?;
-            builder
-                .set_max_proto_version(Some(version))
-                .map_err(|e| ClientError::tls(format!("failed to set max TLS version: {}", e)))?;
-        }
+        apply_tls_settings(&mut builder, config)?;
 
         // ALPN: advertise HTTP/2 and HTTP/1.1 support during TLS handshake.
         // The wire format is length-prefixed: [2, b'h', b'2', 8, b'h', b't', ...].
@@ -429,6 +704,7 @@ impl OpenSslConnector {
         http.set_connect_timeout(Some(connect_timeout));
 
         Ok(OpenSslConnector {
+            profile_active: config.resolved_profile().tls.browser_extensions,
             http,
             ssl,
             cert_slot,
@@ -559,6 +835,7 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
             None => self.http.call(uri),
         };
         let ssl_connector = self.ssl.clone();
+        let profile_active = self.profile_active;
         let cert_slot = self.cert_slot.clone();
         let peer_slot = self.peer_slot.clone();
         let connect_timeout = self.connect_timeout;
@@ -569,7 +846,7 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 
             // Record peer IP for this fresh connection. Best-effort —
             // failure to read peer_addr (vanishingly rare) is not fatal.
-            if let (Some(key), Ok(peer)) = (slot_key, tcp_stream.peer_addr())
+            if let (Some(key), Ok(peer)) = (slot_key.clone(), tcp_stream.peer_addr())
                 && let Ok(mut map) = peer_slot.lock()
             {
                 map.insert(key, peer.ip());
@@ -621,6 +898,15 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
 
             let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            // status_request (0x0005). OpenSSL keeps this codepoint for itself
+            // and refuses a custom extension for it, and its own API,
+            // SSL_set_tlsext_status_type, is per-connection rather than
+            // per-context. So it has to be set here, where an Ssl finally
+            // exists, rather than alongside the other profile extensions.
+            if profile_active {
+                let _ = ssl_conf.set_status_type(openssl::ssl::StatusType::OCSP);
+            }
             // Only set SNI for hostnames, not IP addresses (SNI with IPs is invalid per RFC)
             if host.parse::<std::net::IpAddr>().is_err() {
                 ssl_conf
@@ -644,19 +930,28 @@ impl tower_service::Service<http::Uri> for OpenSslConnector {
             let mut stream = tokio_openssl::SslStream::new(ssl_conf, tcp_stream)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
+            // Attach why, so it survives being boxed away as hyper-util requires.
             tokio::time::timeout(connect_timeout, Pin::new(&mut stream).connect())
                 .await
                 .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "TLS handshake with {} timed out after {}s",
-                            host,
-                            connect_timeout.as_secs()
-                        ),
-                    ))
+                    Box::new(TlsHandshakeError {
+                        failure: TlsFailure::Timeout,
+                        inner: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "TLS handshake with {} timed out after {}s",
+                                host,
+                                connect_timeout.as_secs()
+                            ),
+                        )),
+                    })
                 })?
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(TlsHandshakeError {
+                        failure: TlsFailure::from_openssl(&e),
+                        inner: Box::new(e),
+                    })
+                })?;
 
             // Extract cert info after successful handshake
             let cert_info = extract_cert_info(stream.ssl());
@@ -703,6 +998,12 @@ struct CachedClient {
 #[derive(Clone, Hash, Eq, PartialEq)]
 struct TlsKey {
     verify_certs: bool,
+    /// Part of the key because a profile changes the cipher list, the
+    /// signature algorithms, the groups and the version floor. Leaving it out
+    /// means the first request to a host fixes the TLS configuration for every
+    /// later one, so an impersonated request and a plain one would quietly
+    /// share a connection.
+    profile: Option<String>,
     cipher_string: Option<String>,
     min_tls_version: Option<String>,
     max_tls_version: Option<String>,
@@ -713,6 +1014,7 @@ impl TlsKey {
     fn from_config(config: &RequestConfig) -> Self {
         TlsKey {
             verify_certs: config.should_verify_certs(),
+            profile: config.profile.clone(),
             cipher_string: config.cipher_string.clone(),
             min_tls_version: config.min_tls_version.clone(),
             max_tls_version: config.max_tls_version.clone(),
@@ -734,11 +1036,24 @@ enum ConnMode {
     Socks5 { proxy_url: String, tls: TlsKey },
 }
 
+/// How long a host that refused every rung keeps getting one request instead of
+/// the whole ladder. Long enough to stop doubling a scan's requests to it, short
+/// enough that a host which relents is noticed. See `ladder_exhausted`.
+const EXHAUSTED_TTL: Duration = Duration::from_secs(600);
+
 pub struct HyperClient {
     // Clients cached by connection mode. A scan using an HTTP proxy may need
     // both a ForwardProxy client (for HTTP targets) and a Tunnel client (for
     // HTTPS targets), so we cache per-mode rather than a single client.
     cached: Mutex<std::collections::HashMap<ConnMode, CachedClient>>,
+    // Which profile last got through to each host, so a scan does not re-walk
+    // the ladder on every request. Written only on success; see
+    // `remember_profile`.
+    host_profiles: Mutex<HashMap<String, &'static crate::profile::ConnectionProfile>>,
+    // When each host last refused every rung of the ladder. For a while after,
+    // a refusal from it is taken as the answer instead of walking the ladder
+    // again; see `ladder_exhausted`.
+    host_exhausted: Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for HyperClient {
@@ -751,6 +1066,8 @@ impl HyperClient {
     pub fn new() -> Self {
         HyperClient {
             cached: Mutex::new(std::collections::HashMap::new()),
+            host_profiles: Mutex::new(HashMap::new()),
+            host_exhausted: Mutex::new(HashMap::new()),
         }
     }
 
@@ -818,7 +1135,34 @@ impl HyperClient {
         let cert_slot: CertSlot = Arc::new(Mutex::new(None));
         let peer_slot: PeerSlot = Arc::new(Mutex::new(HashMap::new()));
         let connector = OpenSslConnector::new(config, cert_slot.clone(), peer_slot.clone())?;
-        let builder = Client::builder(TokioExecutor::new());
+        let mut builder = Client::builder(TokioExecutor::new());
+
+        // Shape the HTTP/2 SETTINGS and connection window to the profile.
+        //
+        // Nothing here was being set at all before, so the values on the wire
+        // were hyper-util's defaults, which match no browser. These four are
+        // everything hyper-util exposes of the Akamai HTTP/2 fingerprint; the
+        // remaining two fields, HEADER_TABLE_SIZE and the pseudo-header order,
+        // need forks of hyper-util and h2 respectively and are left alone.
+        let http2_profile = if bisect_disabled("http2") {
+            None
+        } else {
+            config.resolved_profile().http2
+        };
+        if let Some(p) = http2_profile {
+            builder
+                .http2_initial_stream_window_size(p.initial_stream_window)
+                .http2_initial_connection_window_size(p.initial_connection_window)
+                .http2_max_header_list_size(p.max_header_list_size)
+                // `None` omits MAX_FRAME_SIZE entirely, which is what Chrome
+                // does. Our default announces 16384 and Chrome announces
+                // nothing, so leaving this unset is itself part of the match.
+                .http2_max_frame_size(p.max_frame_size)
+                // Adaptive window resizes the connection window as traffic
+                // flows, which would emit WINDOW_UPDATE frames no browser
+                // sends and undo the fixed value set above.
+                .http2_adaptive_window(false);
+        }
 
         let connector = match mode {
             ConnMode::Direct(_) => connector,
@@ -872,28 +1216,200 @@ async fn dispatch_request(
     }
     debug_record(log, v, 1, "   Sending request...");
 
-    let hyper_response = client.request(request).await.map_err(|e| {
-        let msg = format!("request failed: {}", e);
-        let err_str = e.to_string().to_lowercase();
-        if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
-            ClientError::tls(msg)
-        } else {
-            ClientError::connection(msg)
-        }
-    })?;
+    // dev collapsed the three client variants into one pooled client when it
+    // moved the target handshake inside the proxy tunnel, so there is nothing
+    // left to match on. The classifier stays: it reads back why the handshake
+    // actually failed instead of guessing from the error text.
+    let hyper_response = client
+        .request(request)
+        .await
+        .map_err(|e| classify_dispatch_error(&e))?;
 
     parse_response(hyper_response, config, log).await
 }
 
+/// Turn a hyper-util client error into something that says what went wrong.
+///
+/// The error itself carries almost nothing: its `Display` is the literal
+/// `"client error (Connect)"` for every connect-time failure, so the substring
+/// test this replaces could never match and classified every TLS failure as a
+/// connection error. That also meant TLS failures were being retried, which
+/// `test_tls_error_is_not_retryable` says they should not be.
+///
+/// The connector attaches a failed handshake's reason as a `TlsHandshakeError`
+/// somewhere down the `source()` chain. Without one, the failure happened
+/// before TLS, and `error_from_chain` reports the cause.
+fn classify_dispatch_error(e: &hyper_util::client::legacy::Error) -> ClientError {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(tls) = err.downcast_ref::<TlsHandshakeError>() {
+            return ClientError::tls_detailed(
+                format!(
+                    "TLS handshake failed: {}",
+                    describe_tls_failure(&tls.failure)
+                ),
+                tls.failure.clone(),
+            );
+        }
+        current = err.source();
+    }
+    error_from_chain("request failed", e)
+}
+
+/// Build a `ClientError` from every error in `e`'s `source()` chain.
+///
+/// hyper and hyper-util keep the cause below the top-level error. hyper-util's
+/// top level reads "client error (Connect)" whatever went wrong, the
+/// connector's error under it says "tcp connect error", and only the
+/// `io::Error` under that says "Connection refused". So the message is the
+/// whole chain, and a timeout anywhere in it makes this a timeout rather than
+/// a connection error, which is what the direct path reports for the same
+/// failure.
+fn error_from_chain(context: &str, e: &(dyn std::error::Error + 'static)) -> ClientError {
+    let mut parts = Vec::new();
+    let mut timed_out = false;
+    let mut current = Some(e);
+    while let Some(err) = current {
+        if let Some(io) = err.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::TimedOut
+        {
+            timed_out = true;
+        }
+        parts.push(err.to_string());
+        current = err.source();
+    }
+
+    let message = format!("{}: {}", context, parts.join(": "));
+    if timed_out {
+        ClientError::timeout(message)
+    } else {
+        ClientError::connection(message)
+    }
+}
+
+/// A human-readable one-liner for a `TlsFailure`.
+fn describe_tls_failure(failure: &TlsFailure) -> String {
+    match failure {
+        TlsFailure::NoSharedCipher => "no cipher suite in common".to_string(),
+        TlsFailure::UnsupportedProtocol => "no protocol version in common".to_string(),
+        TlsFailure::Alert { description } => format!("peer sent an alert: {}", description),
+        TlsFailure::CertificateVerify { detail } => {
+            format!("certificate verification failed: {}", detail)
+        }
+        TlsFailure::Reset => "connection closed during the handshake".to_string(),
+        TlsFailure::Timeout => "handshake timed out".to_string(),
+        TlsFailure::Other { detail } => detail.clone(),
+    }
+}
+
+/// A connection that was established, and what it took to establish it.
+pub(crate) struct Connected {
+    pub stream: Box<dyn IoReadWrite + Send + Unpin>,
+    pub cert_info: Option<CertInfo>,
+    pub alpn: Option<String>,
+    pub peer_ip: Option<IpAddr>,
+    /// The profile the handshake finally succeeded under, which is not
+    /// necessarily the one asked for. `dispatch_direct` builds its request
+    /// from this so the headers cannot drift away from the TLS underneath
+    /// them, which is the failure mode a half-applied profile produces.
+    pub profile: &'static crate::profile::ConnectionProfile,
+    pub attempts: Vec<crate::report::Attempt>,
+}
+
 /// Opens a fresh TCP connection (optionally to a resolved IP instead of DNS)
 /// and performs TLS if HTTPS (with SNI set to the original hostname).
-/// Returns the connected stream and any certificate info collected during
-/// the TLS handshake.
 ///
 /// Shared setup used by `dispatch_direct` (one-shot hyper requests over an
 /// un-pooled socket) and by callers that need a long-lived, unframed handle
 /// to a TCP or TLS stream.
+///
+/// Widens the offer and tries again when a handshake fails in a way that says
+/// the peer could not negotiate, which is the same breadth rung the pooled
+/// path climbs. Reaching a server too old for the default is the reason this
+/// library carries its own OpenSSL, and without this these callers lost it
+/// when the default narrowed: a virtualhost sweep across an estate with one
+/// legacy appliance in it would simply not see the appliance.
+///
+/// It stops there. The pooled ladder has a second rung that reacts to a
+/// *refusal* by changing what the client claims to be, and that one would be
+/// wrong here. `resolve_ip` and `request_target` exist for probes whose point
+/// is how one exact request is answered, so re-sending a probe dressed
+/// differently answers a question nobody asked, doubles the requests, and
+/// muddies the result. A raw connection has no response to classify at all.
 pub(crate) async fn connect_stream(
+    target_uri: &http::Uri,
+    config: &RequestConfig,
+    log: &DebugLog,
+) -> Result<Connected, ClientError> {
+    let mut rung = config.resolved_profile();
+    let mut tried: Vec<&'static str> = Vec::new();
+    let mut attempts: Vec<crate::report::Attempt> = Vec::new();
+
+    loop {
+        tried.push(rung.name);
+        let rung_config = config.with_profile(rung.name);
+
+        match connect_once(target_uri, &rung_config, log).await {
+            Ok((stream, cert_info, alpn, peer_ip)) => {
+                return Ok(Connected {
+                    stream,
+                    cert_info,
+                    alpn,
+                    peer_ip,
+                    profile: rung,
+                    attempts,
+                });
+            }
+            Err(e) => {
+                attempts.push(crate::report::Attempt::new(
+                    rung.name,
+                    crate::report::AttemptOutcome::HandshakeFailed {
+                        reason: e.message.clone(),
+                    },
+                ));
+
+                // A pinned config ends where the caller put it. Naming a
+                // cipher string, a TLS version or a profile means they meant
+                // it, and on this path more than any other: these are the
+                // callers who asked for exact control.
+                let widen = !config.tls_is_pinned()
+                    && tried.len() < crate::profile::MAX_RUNGS
+                    && e.tls_failure
+                        .as_ref()
+                        .is_some_and(|f| f.suggests_wider_offer());
+
+                match widen
+                    .then(|| {
+                        crate::profile::next_rung(rung, RungFailure::CouldNotNegotiate, &tried)
+                    })
+                    .flatten()
+                {
+                    Some(next) => {
+                        debug_record(
+                            log,
+                            config.verbosity,
+                            1,
+                            &format!(
+                                "   handshake failed under '{}', widening to '{}'",
+                                rung.name, next.name
+                            ),
+                        );
+                        rung = next;
+                    }
+                    None => {
+                        let mut e = e;
+                        e.attempts = attempts;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One connection attempt under one profile. The retrying lives in
+/// `connect_stream`; this just does as it is told.
+async fn connect_once(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
@@ -1047,18 +1563,13 @@ pub(crate) async fn connect_stream(
         openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
             .map_err(|e| ClientError::tls(format!("SSL setup failed: {}", e)))?;
 
-    ssl_builder.set_security_level(0);
-
     if !config.should_verify_certs() {
         ssl_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
     } else {
         load_system_ca_certs(&mut ssl_builder)?;
     }
-    if let Some(ref ciphers) = config.cipher_string {
-        ssl_builder
-            .set_cipher_list(ciphers)
-            .map_err(|e| ClientError::tls(format!("invalid cipher string '{}': {}", ciphers, e)))?;
-    }
+
+    apply_tls_settings(&mut ssl_builder, config)?;
     if let Some(ref min_ver) = config.min_tls_version {
         let version = parse_tls_version(min_ver)?;
         ssl_builder
@@ -1085,8 +1596,15 @@ pub(crate) async fn connect_stream(
         .map_err(|e| ClientError::tls(format!("failed to set ALPN: {}", e)))?;
 
     let ssl_connector = ssl_builder.build();
+    let profile_active = config.resolved_profile().tls.browser_extensions;
     let mut ssl_conf = openssl::ssl::Ssl::new(ssl_connector.context())
         .map_err(|e| ClientError::tls(format!("SSL conf failed: {}", e)))?;
+
+    // See the pooled path: OpenSSL keeps status_request for itself and its API
+    // for it is per-connection, so it can only be set once an Ssl exists.
+    if profile_active {
+        let _ = ssl_conf.set_status_type(openssl::ssl::StatusType::OCSP);
+    }
 
     // SNI = original hostname, NOT the resolved IP
     if host.parse::<std::net::IpAddr>().is_err() {
@@ -1120,7 +1638,13 @@ pub(crate) async fn connect_stream(
                 config.timeout()
             ))
         })?
-        .map_err(|e| ClientError::tls(format!("TLS handshake failed: {}", e)))?;
+        .map_err(|e| {
+            let failure = TlsFailure::from_openssl(&e);
+            ClientError::tls_detailed(
+                format!("TLS handshake failed: {}", describe_tls_failure(&failure)),
+                failure,
+            )
+        })?;
 
     let cert_info = extract_cert_info(tls_stream.ssl());
     let negotiated_alpn = tls_stream
@@ -1145,11 +1669,27 @@ async fn dispatch_direct(
     target_uri: &http::Uri,
     config: &RequestConfig,
     log: &DebugLog,
-) -> Result<(SingleResponse, Option<CertInfo>, Option<IpAddr>), ClientError> {
+) -> Result<
+    (
+        SingleResponse,
+        Option<CertInfo>,
+        Option<IpAddr>,
+        Vec<crate::report::Attempt>,
+    ),
+    ClientError,
+> {
     let v = config.verbosity;
-    let (stream, cert_info, alpn, peer_ip) = connect_stream(target_uri, config, log).await?;
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let h2 = alpn.as_deref() == Some("h2");
+    let conn = connect_stream(target_uri, config, log).await?;
+    let (cert_info, peer_ip) = (conn.cert_info, conn.peer_ip);
+
+    // Build the request under whatever profile the handshake settled on, not
+    // whatever was asked for. If `connect_stream` widened to `compatibility`
+    // to reach an old server, the headers have to widen with it, or the
+    // request states something the connection underneath it contradicts.
+    let config = &config.with_profile(conn.profile.name);
+
+    let io = hyper_util::rt::TokioIo::new(conn.stream);
+    let h2 = conn.alpn.as_deref() == Some("h2");
 
     // HTTP/2 carries the target in `:path`, which hyper derives from the
     // request URI, so there is no request-line for `request_target` to
@@ -1221,18 +1761,32 @@ async fn dispatch_direct(
     }
     debug_record(log, v, 1, "   Sending request via dispatch_direct...");
 
-    let hyper_response = sender.send_request(request).await.map_err(|e| {
-        let msg = format!("dispatch_direct request failed: {}", e);
-        let err_str = e.to_string().to_lowercase();
-        if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
-            ClientError::tls(msg)
-        } else {
-            ClientError::connection(msg)
-        }
-    })?;
+    // TLS is already done by this point, and a failure there was reported
+    // with its reason by `connect_stream`, so whatever fails here is the
+    // connection.
+    let hyper_response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| error_from_chain("dispatch_direct request failed", &e))?;
 
     let resp = parse_response(hyper_response, config, log).await?;
-    Ok((resp, cert_info, peer_ip))
+
+    // `conn.attempts` holds the handshakes that failed on the way here. The
+    // one that worked is this response, and it can only be classified now
+    // that there is a body, so it is recorded here rather than in
+    // `connect_stream`, which never sees one.
+    let mut attempts = conn.attempts;
+    attempts.push(crate::report::Attempt::from_outcome(
+        conn.profile.name,
+        resp.status,
+        &crate::antibot::classify(&crate::antibot::ResponseFacts {
+            status: resp.status,
+            headers: &resp.headers,
+            body: &String::from_utf8_lossy(&resp.body_bytes),
+        }),
+    ));
+
+    Ok((resp, cert_info, peer_ip, attempts))
 }
 
 /// The two one-shot senders `dispatch_direct` can end up holding, picked by
@@ -1331,6 +1885,14 @@ async fn dispatch_forward_proxy(
     parse_response(hyper_response, config, log).await
 }
 
+/// Headers that say which browser a request claims to be.
+const IDENTITY_HEADERS: [&str; 4] = [
+    "user-agent",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+];
+
 fn build_request(
     uri: &http::Uri,
     config: &RequestConfig,
@@ -1391,11 +1953,55 @@ fn build_request(
         builder = builder.header("Host", authority.as_str());
     }
 
-    if !has_custom_ua {
-        builder = builder.header("User-Agent", "blasthttp/0.1.0");
-    }
-    if !has_custom_ae {
-        builder = builder.header("Accept-Encoding", "gzip, deflate, br");
+    // With a profile active, send its full header set in the browser's order
+    // rather than this client's two defaults.
+    //
+    // This has to travel with the TLS half or it makes matters worse. Browser
+    // headers over a non-browser handshake state something checkably false,
+    // and a contradiction is easier to act on than unfamiliarity: udemy.com
+    // answers an honest curl with 200 and the same client wearing only a
+    // Chrome User-Agent with 403.
+    //
+    // A caller's own header wins over the profile's, since naming one
+    // explicitly means it, except the browser identity once the ladder has
+    // switched profile (below).
+    // A profile with no headers of its own means the client's own minimal
+    // defaults, which is what `compatibility` and `modern` both want.
+    let header_profile = if bisect_disabled("headers") {
+        crate::profile::default_profile()
+    } else {
+        config.resolved_profile()
+    };
+    // When the ladder chose the profile, its browser identity replaces the
+    // caller's; every other header the caller set still wins.
+    let profile_owns = |name: &str| {
+        config.profile_from_ladder
+            && IDENTITY_HEADERS
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(name))
+            && header_profile
+                .headers
+                .iter()
+                .any(|(p, _)| p.eq_ignore_ascii_case(name))
+    };
+    if !header_profile.headers.is_empty() {
+        for (name, value) in header_profile.headers {
+            let already_set =
+                !profile_owns(name) && custom.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+            if !already_set {
+                builder = builder.header(*name, *value);
+            }
+        }
+    } else {
+        if !has_custom_ua {
+            builder = builder.header(
+                "User-Agent",
+                concat!("blasthttp/", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        if !has_custom_ae {
+            builder = builder.header("Accept-Encoding", "gzip, deflate, br");
+        }
     }
 
     // Emit the caller's headers, folding any redirect-chain cookies into the
@@ -1428,6 +2034,9 @@ fn build_request(
                     format!("{}; {}", caller, extra)
                 };
                 builder = builder.header(name.as_str(), merged);
+                continue;
+            }
+            if profile_owns(name) {
                 continue;
             }
             builder = builder.header(name.as_str(), value.as_str());
@@ -1687,6 +2296,12 @@ fn retry_backoff(attempt: u32, min_wait: Duration, max_wait: Duration) -> Durati
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
         config.validate_proxy().map_err(ClientError::other)?;
+        // Checked once, at the edge. `resolved_profile` deliberately falls
+        // back rather than erroring, because it is called from deep inside the
+        // connector where there is nothing useful to do with a failure; this
+        // is the place that turns a typo into a message instead of silently
+        // giving the caller a profile they did not ask for.
+        config.validate_profile().map_err(ClientError::other)?;
         let timeout_duration = Duration::from_secs(config.timeout());
         let max_retries = config.max_retries();
         let min_wait = config.retry_wait_min();
@@ -1712,8 +2327,10 @@ impl HttpClient for HyperClient {
                 tokio::time::sleep(backoff).await;
             }
 
-            match tokio::time::timeout(timeout_duration, self.send_inner(config, &log)).await {
-                Ok(Ok(response)) => {
+            // One deadline for the whole request, redirects and ladder included.
+            let deadline = tokio::time::Instant::now() + timeout_duration;
+            match self.send_inner(config, &log, deadline).await {
+                Ok(response) => {
                     let status = response.status;
                     if super::ErrorKind::Status(status).is_retryable() && attempt < max_retries {
                         debug_record(
@@ -1730,7 +2347,7 @@ impl HttpClient for HyperClient {
                     }
                     return Ok(response);
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if e.kind.is_retryable() && attempt < max_retries {
                         debug_record(
                             &log,
@@ -1743,12 +2360,6 @@ impl HttpClient for HyperClient {
                     }
                     return Err(e);
                 }
-                Err(_) => {
-                    return Err(ClientError::timeout(format!(
-                        "request timed out after {}s",
-                        config.timeout()
-                    )));
-                }
             }
         }
 
@@ -1757,13 +2368,187 @@ impl HttpClient for HyperClient {
 }
 
 impl HyperClient {
+    /// One attempt at one hop with one profile.
+    ///
+    /// Everything that used to sit inline in the redirect loop, extracted so
+    /// the ladder can call it more than once. The `?` operators that used to
+    /// short-circuit out of `send_inner` now surface here as an `Err` the
+    /// ladder can decide about, which is the substance of the change rather
+    /// than the extraction itself.
+    async fn attempt_hop(
+        &self,
+        config: &RequestConfig,
+        uri: &http::Uri,
+        log: &DebugLog,
+        hop_cookies: Option<&str>,
+    ) -> Result<(SingleResponse, Option<CachedClient>), ClientError> {
+        // Decide the connection mode for the *current* target host on every
+        // hop, not just the first. A redirect can send the request to a
+        // different host, and the proxy / no_proxy decision has to follow it.
+        // Freezing the first hop's choice would otherwise let a request that
+        // started direct keep connecting directly after a redirect onto a
+        // proxied host (leaking traffic past the proxy), and let a request
+        // that started proxied keep using the proxy after a redirect onto a
+        // no_proxy host. Clients are cached by mode, so hops that share a mode
+        // reuse the same client.
+        let mode = Self::conn_mode(config, uri)?;
+
+        // Forward proxy: dispatch directly via TCP + http1::SendRequest
+        // (bypasses hyper Client's URI normalization to preserve absolute-form)
+        let proxy_url_for_fwd = if let ConnMode::ForwardProxy(ref url) = mode {
+            Some(url.clone())
+        } else {
+            None
+        };
+
+        let cached = if proxy_url_for_fwd.is_some() {
+            None
+        } else {
+            Some(self.get_or_build(config, &mode)?)
+        };
+
+        let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
+            dispatch_forward_proxy(proxy_url, uri, config, log, hop_cookies).await?
+        } else {
+            dispatch_request(
+                &cached.as_ref().unwrap().inner,
+                uri,
+                config,
+                log,
+                hop_cookies,
+            )
+            .await?
+        };
+
+        Ok((resp, cached))
+    }
+
+    /// Which profile this hop starts on.
+    ///
+    /// A pinned config starts and ends on what the caller asked for. Otherwise
+    /// a host we have succeeded against before starts on whatever worked,
+    /// which is the whole point of remembering: the ladder costs a wasted
+    /// request every time it walks, and a scan hits the same host repeatedly.
+    fn starting_profile(
+        &self,
+        config: &RequestConfig,
+        uri: &http::Uri,
+    ) -> &'static crate::profile::ConnectionProfile {
+        if config.tls_is_pinned() {
+            return config.resolved_profile();
+        }
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(map) = self.host_profiles.lock()
+            && let Some(p) = map.get(&key)
+        {
+            return p;
+        }
+        config.resolved_profile()
+    }
+
+    /// The next rung, or `None` to stop.
+    ///
+    /// Returns `None` immediately for a pinned config: naming a cipher string,
+    /// a TLS version or a profile means the caller meant it, and quietly
+    /// substituting another profile would put something on the wire they did
+    /// not ask for.
+    fn next_rung_for(
+        &self,
+        config: &RequestConfig,
+        current: &crate::profile::ConnectionProfile,
+        failure: RungFailure,
+        tried: &[&'static str],
+    ) -> Option<&'static crate::profile::ConnectionProfile> {
+        if config.tls_is_pinned() || tried.len() >= crate::profile::MAX_RUNGS {
+            return None;
+        }
+        crate::profile::next_rung(current, failure, tried)
+    }
+
+    /// Whether this host recently refused every rung, so a refusal from it now
+    /// should be taken as the answer rather than spending another request on
+    /// the next rung.
+    ///
+    /// Without this, only success was remembered, so a host that refuses
+    /// everything had the whole ladder walked again for every request to it:
+    /// two requests where one tells you the same thing, on exactly the hosts
+    /// most likely to rate-limit or ban. It expires, unlike the success memory,
+    /// because a refusal is a judgement the product makes from things that
+    /// change (rate, reputation, its own rules), and what it refused ten minutes
+    /// ago it may let through now.
+    fn ladder_exhausted(&self, config: &RequestConfig, uri: &http::Uri) -> bool {
+        if config.tls_is_pinned() {
+            return false;
+        }
+        peer_slot_key(uri).is_some_and(|key| self.exhausted_within_ttl(&key))
+    }
+
+    fn exhausted_within_ttl(&self, key: &str) -> bool {
+        self.host_exhausted
+            .lock()
+            .ok()
+            .and_then(|map| map.get(key).copied())
+            .is_some_and(|at| at.elapsed() < EXHAUSTED_TTL)
+    }
+
+    /// Record that a host refused every rung of the ladder.
+    fn remember_exhausted(&self, config: &RequestConfig, uri: &http::Uri) {
+        if config.tls_is_pinned() {
+            return;
+        }
+        if let Some(key) = peer_slot_key(uri)
+            && let Ok(mut map) = self.host_exhausted.lock()
+        {
+            map.insert(key, Instant::now());
+        }
+    }
+
+    /// Record that a profile worked against a host.
+    ///
+    /// Only ever called after an attempt got through. A failure alone is a
+    /// hypothesis and could be the host having a bad minute; a success is
+    /// evidence. Recording failures would let one flake pin a host to a worse
+    /// profile for the rest of a scan.
+    ///
+    /// A pinned request records nothing, which matches `starting_profile`
+    /// refusing to read the memory when pinned. The memory is a cache of what
+    /// the ladder found out, and a caller naming a profile is not the ladder
+    /// finding anything out. Recording it would mean one deliberate
+    /// `profile="chrome"` request quietly turned every later request to that
+    /// host into a browser claim, which is the change most likely to make
+    /// things worse: PerimeterX passes an honest client and refuses a
+    /// half-convincing browser. It would also make the result depend on the
+    /// order two independent requests happened to run in.
+    fn remember_profile(
+        &self,
+        config: &RequestConfig,
+        uri: &http::Uri,
+        profile: &'static crate::profile::ConnectionProfile,
+    ) {
+        if config.tls_is_pinned() {
+            return;
+        }
+        if let Some(key) = peer_slot_key(uri) {
+            if let Ok(mut map) = self.host_profiles.lock() {
+                map.insert(key.clone(), profile);
+            }
+            // whatever it refused before, it lets us through now
+            if let Ok(mut map) = self.host_exhausted.lock() {
+                map.remove(&key);
+            }
+        }
+    }
+
     async fn send_inner(
         &self,
         config: &RequestConfig,
         log: &DebugLog,
+        deadline: tokio::time::Instant,
     ) -> Result<Response, ClientError> {
         let v = config.verbosity;
         let start = Instant::now();
+        let timed_out =
+            || ClientError::timeout(format!("request timed out after {}s", config.timeout()));
 
         let sanitized_url = sanitize_uri(&config.url);
         let mut uri: http::Uri = sanitized_url.parse().map(normalize_empty_path).map_err(
@@ -1797,7 +2582,10 @@ impl HyperClient {
         // Bypasses the cached connection pool — opens a fresh TCP connection.
         if config.resolve_ip.is_some() || config.request_target.is_some() {
             let redirect_chain: Vec<RedirectHop> = Vec::new();
-            let (resp, cert_info, peer_ip) = dispatch_direct(&uri, config, log).await?;
+            let (resp, cert_info, peer_ip, attempts) =
+                tokio::time::timeout_at(deadline, dispatch_direct(&uri, config, log))
+                    .await
+                    .map_err(|_| timed_out())??;
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
 
@@ -1811,6 +2599,7 @@ impl HyperClient {
                 status: resp.status,
                 headers: resp.headers,
                 body_bytes: resp.body_bytes,
+                attempts,
                 elapsed_ms,
                 redirect_chain,
                 cert_info,
@@ -1854,35 +2643,140 @@ impl HyperClient {
             // that started proxied keep using the proxy after a redirect onto a
             // no_proxy host. Clients are cached by mode, so hops that share a
             // mode reuse the same client.
-            let mode = Self::conn_mode(config, &uri)?;
+            // Walk the profile ladder for this hop.
+            //
+            // Per hop rather than per request, because a redirect can land on
+            // a differently protected host. Inside `send_inner` rather than in
+            // `send`, so it does not spend the caller's retry budget: those are
+            // different questions, one being "did this flake" and the other
+            // "is this the wrong way to talk to this host".
+            let mut rung = self.starting_profile(config, &uri);
+            let mut tried: Vec<&'static str> = Vec::new();
+            let mut attempts: Vec<crate::report::Attempt> = Vec::new();
+            // The last refusal received, so an escalation that then fails
+            // outright cannot turn a real response into an error.
+            let mut refusal = None;
+            let (resp, cached) = loop {
+                tried.push(rung.name);
+                let rung_config = config.with_profile(rung.name);
 
-            // Forward proxy: dispatch directly via TCP + http1::SendRequest
-            // (bypasses hyper Client's URI normalization to preserve absolute-form)
-            let is_forward_proxy = matches!(&mode, ConnMode::ForwardProxy(_));
-            let proxy_url_for_fwd = if let ConnMode::ForwardProxy(ref url) = mode {
-                Some(url.clone())
-            } else {
-                None
-            };
+                let hop = self.attempt_hop(&rung_config, &uri, log, hop_cookies.as_deref());
+                match tokio::time::timeout_at(deadline, hop)
+                    .await
+                    .unwrap_or_else(|_| Err(timed_out()))
+                {
+                    Ok((resp, cached)) => {
+                        let outcome = crate::antibot::classify(&crate::antibot::ResponseFacts {
+                            status: resp.status,
+                            headers: &resp.headers,
+                            body: &String::from_utf8_lossy(&resp.body_bytes),
+                        });
 
-            // For non-forward-proxy modes, get the cached hyper Client.
-            let cached = if is_forward_proxy {
-                None
-            } else {
-                Some(self.get_or_build(config, &mode)?)
-            };
+                        // Only walk the ladder when something recognisable
+                        // refused us. A bare 403 with no product signature is
+                        // an ordinary refusal, and retrying it differently
+                        // just spends another request to be told the same
+                        // thing.
+                        attempts.push(crate::report::Attempt::from_outcome(
+                            rung.name,
+                            resp.status,
+                            &outcome,
+                        ));
 
-            let resp = if let Some(ref proxy_url) = proxy_url_for_fwd {
-                dispatch_forward_proxy(proxy_url, &uri, config, log, hop_cookies.as_deref()).await?
-            } else {
-                dispatch_request(
-                    &cached.as_ref().unwrap().inner,
-                    &uri,
-                    config,
-                    log,
-                    hop_cookies.as_deref(),
-                )
-                .await?
+                        if outcome.got_through() || !outcome.indicates_protection() {
+                            // Remember what worked, but only on a real
+                            // success. A failure is a hypothesis; this is
+                            // evidence.
+                            if outcome.got_through() {
+                                self.remember_profile(config, &uri, rung);
+                            }
+                            break (resp, cached);
+                        }
+
+                        // A host that recently refused every rung gets one
+                        // request, not the whole ladder again.
+                        let next = if self.ladder_exhausted(config, &uri) {
+                            None
+                        } else {
+                            self.next_rung_for(config, rung, RungFailure::Refused, &tried)
+                        };
+                        match next {
+                            Some(next) => {
+                                debug_record(
+                                    log,
+                                    v,
+                                    1,
+                                    &format!(
+                                        "   {} refused under '{}', trying '{}'",
+                                        resp.status, rung.name, next.name
+                                    ),
+                                );
+                                refusal = Some((resp, cached));
+                                rung = next;
+                            }
+                            // Out of rungs: the refusal is the answer. Hand it
+                            // back as a response rather than an error, so the
+                            // caller can read the status, the headers and
+                            // whatever the challenge page said.
+                            None => {
+                                // Only a ladder that actually ran out counts; a
+                                // single refusal while already exhausted must not
+                                // keep extending it, or the host is never re-tried.
+                                if tried.len() > 1 {
+                                    self.remember_exhausted(config, &uri);
+                                }
+                                break (resp, cached);
+                            }
+                        }
+                    }
+                    Err(mut e) => {
+                        attempts.push(crate::report::Attempt::new(
+                            rung.name,
+                            crate::report::AttemptOutcome::HandshakeFailed {
+                                reason: e.message.clone(),
+                            },
+                        ));
+
+                        let widens = e
+                            .tls_failure
+                            .as_ref()
+                            .is_some_and(|f| f.suggests_wider_offer());
+                        let next = if widens {
+                            self.next_rung_for(config, rung, RungFailure::CouldNotNegotiate, &tried)
+                        } else {
+                            None
+                        };
+                        match next {
+                            Some(next) => {
+                                debug_record(
+                                    log,
+                                    v,
+                                    1,
+                                    &format!(
+                                        "   handshake failed under '{}', widening to '{}'",
+                                        rung.name, next.name
+                                    ),
+                                );
+                                rung = next;
+                            }
+                            // Nothing else to try. An earlier rung's refusal is
+                            // still the answer; otherwise report the error,
+                            // carrying what was tried.
+                            None => {
+                                if let Some(kept) = refusal.take() {
+                                    // Running out of time says nothing about
+                                    // the host, so it doesn't count as exhausted.
+                                    if e.kind != super::ErrorKind::Timeout {
+                                        self.remember_exhausted(config, &uri);
+                                    }
+                                    break kept;
+                                }
+                                e.attempts = attempts;
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
             };
             let hop_ms = start.elapsed().as_millis();
             debug_record(log, v, 1, &format!("<- {} ({}ms)", resp.status, hop_ms));
@@ -1998,6 +2892,8 @@ impl HyperClient {
                 status: resp.status,
                 headers: resp.headers,
                 body_bytes: resp.body_bytes,
+                // What the ladder tried on this, the final, hop.
+                attempts,
                 elapsed_ms,
                 redirect_chain,
                 cert_info,
@@ -2215,6 +3111,7 @@ enum Codec {
     Gzip,
     Deflate,
     Brotli,
+    Zstd,
     Identity,
 }
 
@@ -2226,6 +3123,7 @@ impl Codec {
             "gzip" | "x-gzip" => Some(Codec::Gzip),
             "deflate" => Some(Codec::Deflate),
             "br" => Some(Codec::Brotli),
+            "zstd" => Some(Codec::Zstd),
             "identity" => Some(Codec::Identity),
             _ => None,
         }
@@ -2236,6 +3134,7 @@ impl Codec {
             Codec::Gzip => "gzip",
             Codec::Deflate => "deflate",
             Codec::Brotli => "brotli",
+            Codec::Zstd => "zstd",
             Codec::Identity => "identity",
         }
     }
@@ -2248,6 +3147,7 @@ fn decode_one(codec: Codec, data: &[u8], max_size: usize) -> Inflated {
         Codec::Gzip => read_bounded(flate2::read::GzDecoder::new(data), max_size, codec),
         Codec::Deflate => decode_deflate(data, max_size),
         Codec::Brotli => read_bounded(brotli::Decompressor::new(data, 4096), max_size, codec),
+        Codec::Zstd => decode_zstd(data, max_size),
         Codec::Identity => Inflated::Whole(data.to_vec()),
     }
 }
@@ -2296,6 +3196,56 @@ fn decode_deflate(data: &[u8], max_size: usize) -> Inflated {
         },
         settled => settled,
     }
+}
+
+/// RFC 9659's window limit for `Content-Encoding: zstd`. A frame asking for
+/// more is refused rather than allowed to make us allocate it.
+const ZSTD_MAX_WINDOW: u64 = 8 * 1024 * 1024;
+
+/// Undo `Content-Encoding: zstd`, which may hold several frames back to back,
+/// including skippable ones. The decoder reads one frame at a time, so this
+/// walks them, stopping at `max_size` bytes of output.
+fn decode_zstd(data: &[u8], max_size: usize) -> Inflated {
+    use ruzstd::decoding::StreamingDecoder;
+    use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+
+    let fail = |out: Vec<u8>, e: String| {
+        if out.is_empty() {
+            Inflated::Failed(format!("zstd decompression failed: {}", e))
+        } else {
+            Inflated::Partial(out, format!("zstd stream did not decode cleanly: {}", e))
+        }
+    };
+
+    let mut src = data;
+    let mut out = Vec::new();
+    loop {
+        let decoder = match StreamingDecoder::new_with_max_window_size(&mut src, ZSTD_MAX_WINDOW) {
+            Ok(d) => d,
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                let Some(rest) = src.get(length as usize..) else {
+                    return fail(out, "skippable frame runs past the end".to_string());
+                };
+                src = rest;
+                if src.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            Err(e) => return fail(out, e.to_string()),
+        };
+        let room = (max_size - out.len()) as u64;
+        if let Err(e) = decoder.take(room).read_to_end(&mut out) {
+            return fail(out, e.to_string());
+        }
+        if out.len() >= max_size || src.is_empty() {
+            break;
+        }
+    }
+    Inflated::Whole(out)
 }
 
 /// Whether `data` starts with something that reads as a zlib header (RFC 1950
@@ -2392,6 +3342,81 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stands in for hyper-util's errors: says nothing itself, and keeps the
+    /// cause in `source()`.
+    #[derive(Debug)]
+    struct Wrapper(&'static str, std::io::Error);
+
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.1)
+        }
+    }
+
+    #[test]
+    fn test_error_from_chain_includes_the_cause() {
+        let e = Wrapper(
+            "tcp connect error",
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        );
+        let err = error_from_chain("request failed", &e);
+        assert_eq!(err.kind, super::super::ErrorKind::Connection);
+        assert!(
+            err.message
+                .starts_with("request failed: tcp connect error: "),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.to_lowercase().contains("refused"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_error_from_chain_finds_a_timeout_below_the_top() {
+        let e = Wrapper(
+            "client error (Connect)",
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy tunnel timed out"),
+        );
+        let err = error_from_chain("request failed", &e);
+        assert_eq!(err.kind, super::super::ErrorKind::Timeout);
+        assert!(
+            err.message.contains("proxy tunnel timed out"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_exhausted_host_expires() {
+        let client = HyperClient::new();
+        assert!(!client.exhausted_within_ttl("example.com:443"));
+
+        client
+            .host_exhausted
+            .lock()
+            .unwrap()
+            .insert("example.com:443".to_string(), Instant::now());
+        assert!(client.exhausted_within_ttl("example.com:443"));
+
+        // a refusal from longer ago than the TTL no longer counts, so the ladder is walked again
+        let long_ago = Instant::now() - EXHAUSTED_TTL - Duration::from_secs(1);
+        client
+            .host_exhausted
+            .lock()
+            .unwrap()
+            .insert("example.com:443".to_string(), long_ago);
+        assert!(!client.exhausted_within_ttl("example.com:443"));
+    }
 
     #[test]
     fn test_backoff_attempt_0() {
@@ -2588,11 +3613,16 @@ mod tests {
         out
     }
 
+    fn zstd_bytes(data: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
     fn each_codec() -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("gzip", gzip_bytes(SAMPLE)),
             ("deflate", deflate_bytes(SAMPLE)),
             ("br", brotli_bytes(SAMPLE)),
+            ("zstd", zstd_bytes(SAMPLE)),
         ]
     }
 
@@ -2959,6 +3989,68 @@ mod tests {
         assert_eq!(decoded("gzip,gzip", &twice, NO_LIMIT), SAMPLE);
     }
 
+    // ── zstd ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_zstd_reads_every_frame() {
+        // A body may be several frames back to back; all of them are content.
+        let mut two = zstd_bytes(b"first ");
+        two.extend(zstd_bytes(b"second"));
+        assert_eq!(decoded("zstd", &two, NO_LIMIT), b"first second");
+    }
+
+    #[test]
+    fn test_zstd_skips_skippable_frames() {
+        // Magic 0x184D2A50, a little-endian length, then that many bytes.
+        let mut body = vec![0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, b'x', b'y', b'z'];
+        body.extend(zstd_bytes(SAMPLE));
+        assert_eq!(decoded("zstd", &body, NO_LIMIT), SAMPLE);
+    }
+
+    #[test]
+    fn test_zstd_output_is_bounded() {
+        let zeros = vec![0u8; 200_000];
+        assert_eq!(decoded("zstd", &zstd_bytes(&zeros), 4096).len(), 4096);
+        // The cap spans frames too.
+        let mut two = zstd_bytes(&zeros);
+        two.extend(zstd_bytes(&zeros));
+        assert_eq!(decoded("zstd", &two, 250_000).len(), 250_000);
+    }
+
+    #[test]
+    fn test_zstd_refuses_an_oversized_window() {
+        // A frame header asking for a 16 MiB window, over RFC 9659's 8 MiB.
+        // Refused before anything is allocated, and the body comes back raw.
+        let body = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 14 << 3];
+        let (raw, reason) = undecoded("zstd", &body, NO_LIMIT);
+        assert_eq!(raw, body);
+        assert!(
+            reason.contains("zstd"),
+            "reason should name the codec: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_zstd_flags_a_corrupt_stream() {
+        let big = SAMPLE.repeat(400);
+        let mut z = zstd_bytes(&big);
+        let mid = z.len() / 2;
+        z[mid] ^= 0xff;
+        let out = decompress("zstd", &z, NO_LIMIT);
+        assert!(
+            out.decode_error.is_some(),
+            "a corrupted zstd body must be flagged"
+        );
+        assert_ne!(out.body, big);
+    }
+
+    #[test]
+    fn test_zstd_stacks_with_other_codings() {
+        let stacked = zstd_bytes(&gzip_bytes(SAMPLE));
+        assert_eq!(decoded("gzip, zstd", &stacked, NO_LIMIT), SAMPLE);
+    }
+
     #[test]
     fn test_decompress_ignores_identity_entries_in_a_list() {
         let gz = gzip_bytes(SAMPLE);
@@ -3149,5 +4241,38 @@ mod tests {
     fn test_tunnel_proxy_rejects_what_the_parser_rejects() {
         assert!(TunnelProxy::from_url("ftp://proxy:21").is_err());
         assert!(TunnelProxy::from_url("http://:8080").is_err());
+    }
+
+    // ── verified_cipher_list ──────────────────────────────────────
+
+    #[test]
+    fn test_unverified_list_is_untouched() {
+        assert_eq!(verified_cipher_list("ALL", false), "ALL");
+        assert_eq!(verified_cipher_list("RC4-SHA", false), "RC4-SHA");
+        assert_eq!(
+            verified_cipher_list("ADH-AES128-SHA", false),
+            "ADH-AES128-SHA"
+        );
+    }
+
+    #[test]
+    fn test_unverified_list_is_borrowed() {
+        assert!(matches!(
+            verified_cipher_list("ALL", false),
+            Cow::Borrowed("ALL")
+        ));
+    }
+
+    #[test]
+    fn test_verifying_drops_anonymous_suites() {
+        assert_eq!(verified_cipher_list("ALL", true), "ALL:!aNULL");
+    }
+
+    #[test]
+    fn test_verifying_drops_them_from_a_caller_list_too() {
+        assert_eq!(
+            verified_cipher_list("ADH-AES128-SHA", true),
+            "ADH-AES128-SHA:!aNULL"
+        );
     }
 }

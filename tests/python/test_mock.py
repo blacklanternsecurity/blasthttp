@@ -333,6 +333,64 @@ async def test_batch_unmatched_url_yields_error_result():
     assert "No mock response" in results[0].error
 
 
+# ── errors match the real client ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unmatched_url_raises_transport_error():
+    """The real client raises TransportError for a host it can't reach, so the
+    mock does too. Code written as `except TransportError` that branches on
+    `kind` would otherwise crash under the mock on any URL a test didn't mock."""
+    mock = BlasthttpMock()
+    with pytest.raises(blasthttp.TransportError) as exc:
+        await mock.request("http://nothing/")
+    assert "No mock response" in str(exc.value)
+    assert exc.value.kind == "connection"
+    assert exc.value.conclusion == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_unmatched_url_is_still_a_runtime_error():
+    mock = BlasthttpMock()
+    with pytest.raises(RuntimeError):
+        await mock.request("http://nothing/")
+
+
+@pytest.mark.asyncio
+async def test_redirect_loop_raises_transport_error():
+    mock = BlasthttpMock()
+    mock.add_response(url="http://loop/", status_code=302, headers={"Location": "http://loop/"})
+    with pytest.raises(blasthttp.TransportError) as exc:
+        await mock.request("http://loop/", follow_redirects=True, max_redirects=2)
+    assert exc.value.kind == "too_many_redirects"
+    assert exc.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_batch_unmatched_url_carries_transport_error():
+    mock = BlasthttpMock()
+    results = await mock.request_batch([blasthttp.BatchConfig("http://nothing/")])
+    t = results[0].transport_error
+    assert isinstance(t, blasthttp.TransportError)
+    assert t.kind == "connection"
+    assert results[0].error == str(t)
+
+
+@pytest.mark.asyncio
+async def test_batch_callback_error_has_no_transport_error():
+    """An exception from a test's own callback is not a transport failure, so
+    it keeps the plain error string and nothing more."""
+    mock = BlasthttpMock()
+
+    def boom(request):
+        raise ValueError("callback broke")
+
+    mock.add_callback(boom, url="http://cb/")
+    results = await mock.request_batch([blasthttp.BatchConfig("http://cb/")])
+    assert "callback broke" in results[0].error
+    assert results[0].transport_error is None
+
+
 # ── should_intercept + pass-through ──────────────────────────────
 
 
@@ -388,3 +446,52 @@ async def test_passthrough_to_real_client():
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_forwards_the_kwargs_it_ignores():
+    """A mocked URL can ignore `profile` because nothing is dialled. A
+    passed-through one cannot: it is a real connection, and dropping the
+    kwarg silently gives it different TLS and different headers from what
+    the caller asked for. BBOT runs its whole local-target suite through
+    this path, so a dropped kwarg there is a test that passes while
+    exercising the wrong thing."""
+
+    async def handler(reader, writer):
+        received = []
+        await reader.readuntil(b"\r\n")
+        while (line := await reader.readuntil(b"\r\n")) != b"\r\n":
+            received.append(line.decode("latin1").rstrip("\r\n"))
+        body = "\n".join(received).encode()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    addr = server.sockets[0].getsockname()
+    base = f"http://{addr[0]}:{addr[1]}/"
+    try:
+        real = blasthttp.BlastHTTP()
+        mock = BlasthttpMock(real_client=real, should_mock_fn=lambda host: host != "127.0.0.1")
+
+        r = await mock.request(base, profile="chrome")
+        assert "Mozilla/5.0" in r.text, f"profile was dropped on the way through: {r.text}"
+
+        # And the default still arrives as itself, so the test above is
+        # measuring the kwarg rather than a client that always sends Chrome.
+        r2 = await mock.request(base)
+        assert "blasthttp/" in r2.text
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_rejects_a_kwarg_the_real_client_does_not_take():
+    """The flip side of forwarding. An intercepted URL swallows anything,
+    which is right when nothing is dialled, but on the way through the real
+    client's signature is the one that counts and a typo should be audible."""
+    real = blasthttp.BlastHTTP()
+    mock = BlasthttpMock(real_client=real, should_mock_fn=lambda host: host != "127.0.0.1")
+    with pytest.raises(TypeError):
+        await mock.request("http://127.0.0.1:1/", not_a_real_kwarg=1)
