@@ -81,6 +81,26 @@ fn test_header_contains_ignores_case() {
 }
 
 #[test]
+fn test_cookie_names_ignore_case() {
+    let rules = Rules::from_json(CUSTOM).unwrap();
+    let cookie = header("Set-Cookie", "EXWAF_Session=abc; Path=/");
+    assert_eq!(
+        rules.classify(&facts(200, &cookie, "")),
+        Outcome::Present(Vendor::new("examplewaf"))
+    );
+
+    let rules = Rules::default();
+    let cookie = header("SET-COOKIE", " DataDome=abc; Path=/");
+    assert_eq!(
+        rules.classify(&facts(200, &cookie, "")),
+        Outcome::Present(Vendor::new("datadome"))
+    );
+    // a cookie_set names the whole cookie, not a prefix of it
+    let cookie = header("set-cookie", "datadome2=abc");
+    assert_eq!(rules.classify(&facts(200, &cookie, "")), Outcome::Ok);
+}
+
+#[test]
 fn test_a_rules_file_replaces_the_built_in_rules() {
     let rules = Rules::from_json(CUSTOM).unwrap();
     let mitigated = header("cf-mitigated", "challenge");

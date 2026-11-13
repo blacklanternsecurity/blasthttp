@@ -127,7 +127,7 @@ impl ResponseFacts<'_> {
     fn header_matches(&self, name: &str, needle: &str) -> bool {
         self.headers
             .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case(name) && v.to_ascii_lowercase().contains(needle))
+            .any(|(k, v)| k.eq_ignore_ascii_case(name) && contains_ignore_ascii_case(v, needle))
     }
 
     fn has_header(&self, name: &str) -> bool {
@@ -138,23 +138,25 @@ impl ResponseFacts<'_> {
 
     /// Cookie names set by this response. Only the name is examined; values
     /// are session data and carry nothing we want to match on.
-    fn set_cookie_names(&self) -> Vec<String> {
+    fn set_cookie_names(&self) -> impl Iterator<Item = &str> {
         self.headers
             .iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
             .filter_map(|(_, v)| v.split('=').next())
-            .map(|n| n.trim().to_ascii_lowercase())
-            .collect()
+            .map(str::trim)
     }
 
     fn sets_cookie(&self, name: &str) -> bool {
-        let want = name.to_ascii_lowercase();
-        self.set_cookie_names().contains(&want)
+        self.set_cookie_names()
+            .any(|n| n.eq_ignore_ascii_case(name))
     }
 
     fn sets_cookie_prefixed(&self, prefix: &str) -> bool {
-        let want = prefix.to_ascii_lowercase();
-        self.set_cookie_names().iter().any(|n| n.starts_with(&want))
+        self.set_cookie_names().any(|n| {
+            n.as_bytes()
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+        })
     }
 
     fn body_contains(&self, needle: &str) -> bool {
@@ -168,6 +170,12 @@ impl ResponseFacts<'_> {
         }
         self.body[..end].contains(needle)
     }
+}
+
+/// `needle` in `haystack`, ignoring ASCII case, without lowercasing either.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    n.is_empty() || h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// The rules a classification runs, as loaded from `antibot_rules.json`.
@@ -282,9 +290,7 @@ impl Rules {
                 self.is_refusal(facts.status)
             }
             Condition::HeaderPresent(name) => facts.has_header(name),
-            Condition::HeaderContains { name, value } => {
-                facts.header_matches(name, &value.to_ascii_lowercase())
-            }
+            Condition::HeaderContains { name, value } => facts.header_matches(name, value),
             Condition::CookieSet(name) => facts.sets_cookie(name),
             Condition::CookiePrefix(prefix) => facts.sets_cookie_prefixed(prefix),
             Condition::BodyContains(needle) => facts.body_contains(needle),
