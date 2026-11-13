@@ -57,7 +57,6 @@ pub struct TlsProfile {
     /// security level 0 with NO_SSLV3 cleared means SSLv3 through TLS 1.3.
     pub min_version: Option<&'static str>,
     pub max_version: Option<&'static str>,
-    pub alpn: &'static [&'static str],
     /// Send the extensions a browser sends and suppress the two it does not.
     ///
     /// An explicit field rather than "is a profile set", which is how this
@@ -165,7 +164,6 @@ pub const CHROME_131: ConnectionProfile = ConnectionProfile {
         groups: Some("X25519:P-256:P-384"),
         min_version: Some("1.2"),
         max_version: Some("1.3"),
-        alpn: &["h2", "http/1.1"],
         browser_extensions: true,
     },
     // Chrome's Akamai fingerprint is
@@ -234,7 +232,6 @@ pub const COMPATIBILITY: ConnectionProfile = ConnectionProfile {
         groups: None,
         min_version: None,
         max_version: None,
-        alpn: &["h2", "http/1.1"],
         browser_extensions: false,
     },
     http2: None,
@@ -294,7 +291,6 @@ pub const MODERN: ConnectionProfile = ConnectionProfile {
         // the old default did.
         min_version: Some("1.2"),
         max_version: Some("1.3"),
-        alpn: &["h2", "http/1.1"],
         browser_extensions: false,
     },
     http2: None,
