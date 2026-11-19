@@ -158,18 +158,21 @@ fn merge_limiters(
 /// holds up faster ones behind it, which is the entire promise of
 /// `send_batch_stream`.
 ///
-/// What works instead is to not wait. A request whose host is already being
-/// worked out steps aside and lets a request for a *different* host have its
-/// slot, then goes once there is an answer. Nothing idles, so the saving
-/// costs no time.
+/// What works instead is to step aside rather than wait. A request whose host
+/// is already being worked out lets a request for a *different* host have its
+/// slot, then goes once there is an answer. In a batch deeper than its
+/// concurrency limit that slot is always taken, so nothing idles. In a
+/// shallower one every request already has a slot, so the one that steps
+/// aside does wait, and the batch pays one round trip for the handshakes it
+/// saves.
 ///
 /// The condition is the whole design, and it comes straight from the test
 /// that killed the lock: six requests, one host, concurrency six. Step aside
 /// there and you are standing in the street, because every other request
 /// wants the same host. So: **only step aside when there is undispatched work
 /// for a different host.** When there is not, go and discover it yourself and
-/// accept the duplicate. That makes this strictly better or equal to having
-/// no scheduler at all, never worse, which is what the lock failed to be.
+/// accept the duplicate. A batch that is all one host, the case the lock made
+/// slower, never waits at all.
 struct HostGate {
     /// Someone is making the first request to this host, so an answer is
     /// coming.
