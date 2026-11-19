@@ -1,6 +1,8 @@
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+# TEMPORARY: restore `build-backend = "maturin"` and drop backend-path before merging into dev.
+build-backend = "openssl_build_backend"
+backend-path = ["scripts"]
 
 [project]
 name = "blasthttp"

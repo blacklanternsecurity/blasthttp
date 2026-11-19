@@ -4,8 +4,7 @@
 //! a URL with no path (`https://host?q=1`) has to be given one before it gets
 //! there. Servers reject `:path: ?q=1` with a 400.
 
-#[allow(dead_code)]
-mod tls_server;
+mod support;
 
 use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
@@ -15,7 +14,7 @@ use hyper::body::Bytes;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tls_server::{TlsServerConfig, build_h2_acceptor};
+use support::tls_server::{TlsServerConfig, build_h2_acceptor};
 use tokio::net::TcpListener;
 
 /// Serve HTTP/2 over TLS until the test ends, recording every `:path` that
