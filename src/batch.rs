@@ -159,12 +159,11 @@ fn merge_limiters(
 /// `send_batch_stream`.
 ///
 /// What works instead is to step aside rather than wait. A request whose host
-/// is already being worked out lets a request for a *different* host have its
-/// slot, then goes once there is an answer. In a batch deeper than its
-/// concurrency limit that slot is always taken, so nothing idles. In a
-/// shallower one every request already has a slot, so the one that steps
-/// aside does wait, and the batch pays one round trip for the handshakes it
-/// saves.
+/// is already being worked out gives its slot to a request for a *different*
+/// host, then goes once there is an answer. While there is other work to fill
+/// the slots handed back, that costs nothing. When there is not enough, which
+/// is always so in a batch no deeper than its concurrency limit, those slots
+/// idle and the requests standing aside go up to one request later.
 ///
 /// The condition is the whole design, and it comes straight from the test
 /// that killed the lock: six requests, one host, concurrency six. Step aside
@@ -206,10 +205,9 @@ struct SchedulerState {
     ///
     /// `send_batch` spawns every task up front regardless. Standing aside
     /// creates nothing, so a ceiling protects nothing, and setting one only
-    /// throws the benefit away: measured over a grid of batch shapes, the
-    /// duplicate handshakes went to zero exactly when the ceiling was not
-    /// binding and were left completely untouched when it was. There the
-    /// limit is the batch size, which is to say no limit at all.
+    /// throws the benefit away: every request it turns away goes and repeats
+    /// the discovery. There the limit is the batch size, which is to say no
+    /// limit at all.
     aside: usize,
     aside_limit: usize,
 }
@@ -1215,10 +1213,8 @@ mod scheduler_tests {
         // What `send_batch` passes, and why it differs from the stream. Its
         // tasks are all spawned up front, so standing aside creates nothing
         // and a ceiling protects nothing. Setting one anyway only throws the
-        // saving away: measured across a grid of batch shapes, a ceiling of
-        // the concurrency limit left the duplicate handshakes completely
-        // untouched wherever a batch was bigger than that limit, which is
-        // every batch worth scheduling.
+        // saving away, since every request it turns away repeats the
+        // discovery.
         let mut urls = vec!["https://a.test/"; 40];
         urls.push("https://b.test/");
         let configs = cfgs(&urls);

@@ -85,17 +85,16 @@ the ladder falling back to `compatibility` on the second handshake.
   ClientHello is the default profile's, extensions included
 - Batches no longer have every request in an opening burst work out the same
   host's profile separately. A request whose host is already being discovered
-  stands aside and lets a request for a *different* host take its slot, then
-  goes once there is an answer. Six requests to a host needing a shift went
-  from twelve handshakes to seven, with nothing idling: standing aside only
-  happens when there is undispatched work elsewhere, so when a batch is all
-  one host every request goes immediately and discovers it again, which is the
-  cheaper mistake. A slow request still never holds up faster ones behind it.
-  Measured over a grid of batch shapes, the duplicate handshakes go to zero in
-  every one: a scan of 2000 URLs across 20 hosts drops 62 handshakes, 500 URLs
-  across 10 hosts drops 139, and wall time is unchanged. A batch no deeper than
-  its own concurrency limit pays one extra round trip for it, since there the
-  discovery cannot be overlapped with anything
+  stands aside and gives its slot to a request for a *different* host, then
+  goes once there is an answer. It only does so while there is undispatched
+  work for another host. With that, six requests to a host that needs a shift
+  can cost as few as seven handshakes rather than twelve; without it, as in a
+  batch that is all one host, every request goes at once and discovers the
+  host again, which is the cheaper mistake. Results still stream in the order
+  they complete. Standing aside costs time when the work for other hosts is
+  not enough to fill the slots handed back, which is always so in a batch no
+  deeper than its concurrency limit: those slots idle, and the requests
+  standing aside go up to one request later than they otherwise would
 - `raw_connect`, and requests using `resolve_ip` or `request_target`, widen
   their cipher offer and retry on a handshake the peer could not negotiate,
   the same as an ordinary request. They stop at that rung: the other one
