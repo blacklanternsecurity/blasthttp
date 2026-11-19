@@ -95,6 +95,26 @@ async def server():
         yield f"http://127.0.0.1:{port}"
 
 
+async def _refuse_handshake(reader, writer):
+    """Answers any ClientHello with a fatal handshake_failure alert, so every
+    handshake fails however wide the offer."""
+    try:
+        await reader.read(16384)
+        # alert record, TLS 1.2, length 2: fatal (2), handshake_failure (40)
+        writer.write(bytes([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]))
+        await writer.drain()
+    finally:
+        writer.close()
+
+
+@pytest_asyncio.fixture
+async def refusing_tls_server():
+    srv = await asyncio.start_server(_refuse_handshake, "127.0.0.1", 0)
+    port = srv.sockets[0].getsockname()[1]
+    async with srv:
+        yield f"https://127.0.0.1:{port}"
+
+
 @pytest.fixture
 def client():
     return blasthttp.BlastHTTP()
@@ -228,7 +248,24 @@ async def test_a_refused_connection_is_legible(client):
     assert e.kind == "connection"
     assert e.tls_failure is None
     assert e.retryable is True
-    assert e.conclusion == "unreachable"
+    assert e.conclusion == ("unreachable", "-")
+
+
+async def test_a_failed_handshake_reports_what_the_ladder_tried(client, refusing_tls_server):
+    """`TransportError` reports `conclusion` and `attempts` in the shapes
+    `Response` uses, so a caller reads them the same way whether or not a
+    response came back."""
+    with pytest.raises(blasthttp.TransportError) as exc:
+        await client.request(f"{refusing_tls_server}/", timeout=5, verify_certs=False)
+
+    e = exc.value
+    assert e.kind == "tls"
+    assert e.tls_failure == "alert"
+    assert e.conclusion == ("unreachable", "-")
+    assert e.attempts == [
+        ("modern", "handshake_failed", None),
+        ("compatibility", "handshake_failed", None),
+    ]
 
 
 async def test_transport_error_is_still_a_runtime_error(client):
@@ -246,7 +283,7 @@ async def test_a_failed_batch_request_carries_the_transport_error(client):
     assert isinstance(r.transport_error, blasthttp.TransportError)
     assert r.transport_error.kind == "connection"
     assert r.transport_error.retryable is True
-    assert r.transport_error.conclusion == "unreachable"
+    assert r.transport_error.conclusion == ("unreachable", "-")
     assert r.error == str(r.transport_error)
 
 

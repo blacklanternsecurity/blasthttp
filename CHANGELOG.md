@@ -59,8 +59,9 @@ the ladder falling back to `compatibility` on the second handshake.
   connect-time failure, so a cipher mismatch, a rejected certificate, a DNS
   failure and a refused connection were indistinguishable. Failures now raise
   `TransportError` carrying `kind`, `tls_failure`, `retryable`, `conclusion`
-  and `attempts`. `TransportError` subclasses `RuntimeError`, so existing
-  handlers keep working
+  and `attempts`, the last two in the same shapes as on `Response`.
+  `TransportError` subclasses `RuntimeError`, so existing handlers keep
+  working
 - Fixes a consequence of that: TLS failures were being retried, because they
   were misclassified as connection errors, contradicting the rule that says
   they should not be

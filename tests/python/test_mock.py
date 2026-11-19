@@ -346,7 +346,7 @@ async def test_unmatched_url_raises_transport_error():
         await mock.request("http://nothing/")
     assert "No mock response" in str(exc.value)
     assert exc.value.kind == "connection"
-    assert exc.value.conclusion == "unreachable"
+    assert exc.value.conclusion == ("unreachable", "-")
 
 
 @pytest.mark.asyncio

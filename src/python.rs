@@ -391,6 +391,36 @@ pyo3::create_exception!(
     "Raised when a request never produced a response: DNS, TCP, TLS or timeout."
 );
 
+/// Render a `Conclusion` as the `(name, vendor)` pair Python sees.
+fn conclusion_to_py(c: &crate::report::Conclusion) -> (String, String) {
+    use crate::report::Conclusion;
+    let (name, vendor) = match c {
+        Conclusion::Reached => ("reached", None),
+        Conclusion::Blocked { vendor } => ("blocked", vendor.clone()),
+        Conclusion::NeedsBrowser { vendor } => ("needs_browser", vendor.clone()),
+        Conclusion::NeedsLegacyTls { .. } => ("needs_legacy_tls", None),
+        Conclusion::Unreachable { .. } => ("unreachable", None),
+    };
+    (name.to_string(), vendor.unwrap_or_else(|| "-".to_string()))
+}
+
+/// Render what the ladder tried as `(profile, outcome, status)` tuples.
+fn attempts_to_py(attempts: &[crate::report::Attempt]) -> Vec<(String, String, Option<u16>)> {
+    use crate::report::AttemptOutcome;
+    attempts
+        .iter()
+        .map(|a| {
+            let (kind, status) = match &a.outcome {
+                AttemptOutcome::Reached { status } => ("reached", Some(*status)),
+                AttemptOutcome::Refused { status, .. } => ("refused", Some(*status)),
+                AttemptOutcome::Challenged { status, .. } => ("challenged", Some(*status)),
+                AttemptOutcome::HandshakeFailed { .. } => ("handshake_failed", None),
+            };
+            (a.profile.clone(), kind.to_string(), status)
+        })
+        .collect()
+}
+
 /// Convert a `ClientError` into a Python exception that keeps what we know.
 ///
 /// Every call site used to do `PyRuntimeError::new_err(e.message)`, which threw
@@ -406,19 +436,8 @@ pyo3::create_exception!(
 ///                  unsupported_protocol, alert, certificate_verify, reset,
 ///                  timeout, other. `None` otherwise.
 ///   `retryable`    whether trying the same request again might help.
-/// Render a `Conclusion` as the `(name, vendor)` pair Python sees.
-fn conclusion_to_py(c: &crate::report::Conclusion) -> (String, String) {
-    use crate::report::Conclusion;
-    let (name, vendor) = match c {
-        Conclusion::Reached => ("reached", None),
-        Conclusion::Blocked { vendor } => ("blocked", vendor.clone()),
-        Conclusion::NeedsBrowser { vendor } => ("needs_browser", vendor.clone()),
-        Conclusion::NeedsLegacyTls { .. } => ("needs_legacy_tls", None),
-        Conclusion::Unreachable { .. } => ("unreachable", None),
-    };
-    (name.to_string(), vendor.unwrap_or_else(|| "-".to_string()))
-}
-
+///   `conclusion`   `(name, vendor)`, as on `Response`.
+///   `attempts`     `(profile, outcome, status)` tuples, as on `Response`.
 pub(crate) fn client_error_to_py(e: ClientError) -> PyErr {
     let kind = match &e.kind {
         ErrorKind::Connection => "connection",
@@ -439,13 +458,8 @@ pub(crate) fn client_error_to_py(e: ClientError) -> PyErr {
         TlsFailure::Other { .. } => "other",
     });
     let retryable = e.kind.is_retryable();
-
-    let (conclusion, conclusion_vendor) = conclusion_to_py(&e.conclusion());
-    let attempts: Vec<(String, String)> = e
-        .attempts
-        .iter()
-        .map(|a| (a.profile.clone(), format!("{:?}", a.outcome)))
-        .collect();
+    let conclusion = conclusion_to_py(&e.conclusion());
+    let attempts = attempts_to_py(&e.attempts);
 
     let err = TransportError::new_err(e.message);
     Python::attach(|py| {
@@ -454,7 +468,6 @@ pub(crate) fn client_error_to_py(e: ClientError) -> PyErr {
         let _ = v.setattr("tls_failure", tls_failure);
         let _ = v.setattr("retryable", retryable);
         let _ = v.setattr("conclusion", conclusion);
-        let _ = v.setattr("conclusion_vendor", conclusion_vendor);
         let _ = v.setattr("attempts", attempts);
     });
     err
@@ -776,20 +789,7 @@ impl PyResponse {
     /// not work and the client moved.
     #[getter]
     fn attempts(&self) -> Vec<(String, String, Option<u16>)> {
-        use crate::report::AttemptOutcome;
-        self.inner
-            .attempts
-            .iter()
-            .map(|a| {
-                let (kind, status) = match &a.outcome {
-                    AttemptOutcome::Reached { status } => ("reached", Some(*status)),
-                    AttemptOutcome::Refused { status, .. } => ("refused", Some(*status)),
-                    AttemptOutcome::Challenged { status, .. } => ("challenged", Some(*status)),
-                    AttemptOutcome::HandshakeFailed { .. } => ("handshake_failed", None),
-                };
-                (a.profile.clone(), kind.to_string(), status)
-            })
-            .collect()
+        attempts_to_py(&self.inner.attempts)
     }
 
     #[getter]
