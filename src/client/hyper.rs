@@ -2518,7 +2518,7 @@ impl HyperClient {
         config: &RequestConfig,
         uri: &http::Uri,
     ) -> &'static crate::profile::ConnectionProfile {
-        if config.tls_is_pinned() {
+        if !config.uses_host_memory() {
             return config.resolved_profile();
         }
         if let Some(key) = host_port_key(uri)
@@ -2561,7 +2561,7 @@ impl HyperClient {
     /// change (rate, reputation, its own rules), and what it refused ten minutes
     /// ago it may let through now.
     fn ladder_exhausted(&self, config: &RequestConfig, uri: &http::Uri) -> bool {
-        if config.tls_is_pinned() {
+        if !config.uses_host_memory() {
             return false;
         }
         host_port_key(uri).is_some_and(|key| self.exhausted_within_ttl(&key))
@@ -2575,7 +2575,7 @@ impl HyperClient {
 
     /// Record that a host refused every rung of the ladder.
     fn remember_exhausted(&self, config: &RequestConfig, uri: &http::Uri) {
-        if config.tls_is_pinned() {
+        if !config.uses_host_memory() {
             return;
         }
         if let Some(key) = host_port_key(uri)
@@ -2607,7 +2607,7 @@ impl HyperClient {
         uri: &http::Uri,
         profile: &'static crate::profile::ConnectionProfile,
     ) {
-        if config.tls_is_pinned() {
+        if !config.uses_host_memory() {
             return;
         }
         // The default is where an unremembered host starts anyway.
@@ -2660,7 +2660,7 @@ impl HyperClient {
 
         // dispatch_direct: used when resolve_ip or request_target is set.
         // Bypasses the cached connection pool — opens a fresh TCP connection.
-        if config.resolve_ip.is_some() || config.request_target.is_some() {
+        if config.goes_direct() {
             let redirect_chain: Vec<RedirectHop> = Vec::new();
             let (resp, cert_info, peer_ip, attempts) =
                 tokio::time::timeout_at(deadline, dispatch_direct(&uri, config, log))

@@ -280,12 +280,13 @@ impl Scheduler {
     /// field: the stream driver needs the concurrency limit, `send_batch`
     /// needs no limit and passes the batch size.
     fn new(configs: &[RequestConfig], aside_limit: usize) -> Arc<Self> {
-        // Pinned requests never consult the per-host memory, so they take no
-        // part in discovering it and `await_turn` lets them straight through.
+        // Pinned and direct requests never use the per-host memory, so they
+        // take no part in discovering it and `await_turn` lets them straight
+        // through.
         let mut remaining_by_host: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut remaining_total = 0;
-        for c in configs.iter().filter(|c| !c.tls_is_pinned()) {
+        for c in configs.iter().filter(|c| c.uses_host_memory()) {
             *remaining_by_host.entry(host_key(&c.url)).or_insert(0) += 1;
             remaining_total += 1;
         }
@@ -382,7 +383,7 @@ async fn await_turn(
     Option<LeaderGuard>,
     Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
-    if config.tls_is_pinned() {
+    if !config.uses_host_memory() {
         return (None, permit);
     }
     match sched.dispatch(host, true) {

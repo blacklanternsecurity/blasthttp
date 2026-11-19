@@ -183,6 +183,19 @@ impl RequestConfig {
             || self.max_tls_version.is_some()
     }
 
+    /// Whether this request skips the connection pool and goes out on its own
+    /// connection, which is what `resolve_ip` and `request_target` need.
+    pub fn goes_direct(&self) -> bool {
+        self.resolve_ip.is_some() || self.request_target.is_some()
+    }
+
+    /// Whether this request reads and writes the per-host ladder memory. A
+    /// pinned request never moves the ladder, and a direct one never consults
+    /// it, so neither learns anything another request could use.
+    pub fn uses_host_memory(&self) -> bool {
+        !self.tls_is_pinned() && !self.goes_direct()
+    }
+
     /// Reject an unknown profile name.
     pub fn validate_profile(&self) -> Result<(), String> {
         match self.profile.as_deref() {

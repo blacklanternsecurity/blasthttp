@@ -154,3 +154,45 @@ async fn test_a_host_that_cannot_be_reached_does_not_strand_the_rest() {
 
     modern.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_a_direct_request_does_not_lead_a_host() {
+    // A request sent direct, with resolve_ip or request_target, never writes
+    // the per-host memory. Leading a host, it would hold the requests behind
+    // it until it finished and then tell them nothing, so each would discover
+    // the host anyway.
+    let directs: [fn(&mut RequestConfig); 2] = [
+        |c| c.resolve_ip = Some("127.0.0.1".to_string()),
+        |c| c.request_target = Some("/direct".to_string()),
+    ];
+    for make_direct in directs {
+        let legacy = legacy_server().await;
+        let modern = modern_server().await;
+
+        // First in the batch, so it is the one that would lead.
+        let mut direct = config(&format!("{}/direct", legacy.url()));
+        make_direct(&mut direct);
+        let pooled = format!("{}/pooled", legacy.url());
+        let mut configs = vec![direct];
+        configs.extend((0..4).map(|_| config(&pooled)));
+        configs.extend((0..4).map(|_| config(&modern.url())));
+
+        let client = Arc::new(HyperClient::new());
+        let results = send_batch(client, configs, 9, None, None).await;
+
+        assert_eq!(
+            reached(&results),
+            9,
+            "every request should still get through"
+        );
+        // Waiting on a leader that records nothing, all four discover: 4 x 2.
+        let a = attempts(&results, &pooled);
+        assert!(
+            a < 8,
+            "the pooled requests learned nothing from one another, got {a} attempts for 4"
+        );
+
+        legacy.shutdown().await;
+        modern.shutdown().await;
+    }
+}
