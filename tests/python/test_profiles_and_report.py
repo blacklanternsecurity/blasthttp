@@ -247,7 +247,7 @@ async def test_a_bare_403_names_no_vendor(server, client):
     product refused us would invite a caller to act on nothing, and internally
     it is what stops the ladder spending a second request on every one."""
     r = await client.request(f"{server}/plain-403")
-    assert r.protection == ("blocked", "unknown")
+    assert r.protection == ("blocked", "-")
     assert r.conclusion == ("blocked", "-")
 
 

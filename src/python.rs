@@ -802,8 +802,11 @@ impl PyResponse {
             blasthttp_antibot::Outcome::Blocked(_) => "blocked",
             blasthttp_antibot::Outcome::Error => "error",
         };
+        // An unnamed vendor is `-`, as in `conclusion`, not a name a caller
+        // could mistake for a product and branch on.
         let vendor = outcome
             .vendor()
+            .filter(|v| !v.is_unknown())
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string());
         (name.to_string(), vendor)
