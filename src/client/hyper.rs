@@ -226,7 +226,7 @@ fn apply_tls_settings(
 
     let profile = tls_profile(config);
 
-    // Security level 0: allow all ciphers including RC4 and DES. This is an
+    // Security level 0: allow all ciphers including RC4 and 3DES. This is an
     // offensive-first tool and needs to connect to anything.
     builder.set_security_level(0);
 
@@ -291,7 +291,7 @@ fn apply_tls_settings(
     // `DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:...`, and
     // `set_security_level(0)` does NOT undo it. The security level governs how
     // weak a negotiated cipher may be; the cipher list governs which ones are
-    // offered at all. Leaving it alone means RC4, DES, 3DES and SEED never
+    // offered at all. Leaving it alone means RC4, 3DES, IDEA and SEED never
     // reach the wire whatever the security level says, so a server speaking
     // only one of them is unreachable, which is the whole reason this project
     // builds its own OpenSSL.
@@ -331,7 +331,7 @@ fn apply_tls_settings(
     Ok(())
 }
 
-// Load the OpenSSL legacy provider once (for RC4, DES, etc.).
+// Load the OpenSSL legacy provider once, for the RC4, SEED and IDEA suites.
 // The provider is statically compiled into libcrypto via `no-module` build flag.
 // `Once` ensures this runs exactly once even across threads.
 static INIT_LEGACY: Once = Once::new();
@@ -668,7 +668,7 @@ impl OpenSslConnector {
         cert_slot: CertSlot,
         peer_slot: PeerSlot,
     ) -> Result<Self, ClientError> {
-        // Ensure legacy ciphers (RC4, DES, etc.) are available
+        // Ensure legacy ciphers (RC4, SEED, IDEA) are available
         ensure_legacy_provider();
 
         let mut builder =

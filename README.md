@@ -592,9 +592,9 @@ def http_mock():
 
 ### 1. Build custom OpenSSL
 
-blasthttp ships a script that downloads OpenSSL 3.3.2, compiles it with weak cipher support (`RC4`, `DES`, `3DES`, `SEED`) and `SSLv3`, and installs it to `vendor/openssl/install/`. The result is cached, keyed on the OpenSSL version, the target, and the feature flags, so changing any of those triggers a rebuild on the next run.
+blasthttp ships a script that downloads OpenSSL 3.3.2, compiles it with weak cipher support (`RC4`, `3DES`, `SEED`) and `SSLv3`, and installs it to `vendor/openssl/install/`. The result is cached, keyed on the OpenSSL version, the target, and the feature flags, so changing any of those triggers a rebuild on the next run.
 
-Export ciphers are the one thing the build cannot provide: OpenSSL removed them outright in 1.1.0, so no build flag brings them back.
+Export and single-DES suites are what the build cannot provide: OpenSSL removed every 40- and 56-bit suite outright in 1.1.0, so no build flag brings them back.
 
 ```bash
 ./scripts/build-openssl.sh

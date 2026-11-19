@@ -5,7 +5,8 @@
 # Usage: ./scripts/build-openssl.sh
 #
 # This builds OpenSSL with:
-#   - enable-weak-ssl-ciphers: RC4, DES, export ciphers
+#   - enable-weak-ssl-ciphers: RC4 suites (40- and 56-bit suites, export
+#     included, are gone from OpenSSL since 1.1.0; no flag brings them back)
 #   - enable-ssl3: SSLv3 protocol support
 #   - no-shared: static linking
 #   - no-module: bake legacy provider into libcrypto (no runtime .so needed)
