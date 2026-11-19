@@ -24,6 +24,13 @@ the ladder falling back to `compatibility` on the second handshake.
   any refusal. Most 403s are ordinary authorization failures, and retrying each
   one with different TLS settings would double the request count of any scan
   that touches one
+- A rate limit never moves the ladder. No profile gets past one, and trying
+  another only spends a request on a host that is already counting them. A 429
+  still concludes `blocked`, but a product's block markers on it, such as
+  Cloudflare's error page, no longer count as that product refusing. The rules
+  file lists such statuses under `rate_limit_statuses`, which a `{"status":
+  "refusal"}` condition does not match; a rule that means a product refuses bots
+  with one names the status itself, as Kasada's does with 429
 - A host that refuses every rung is remembered too, for ten minutes: during
   that time a refusal from it is taken as the answer after one request, rather
   than walking the ladder again. Only success used to be remembered, so a host

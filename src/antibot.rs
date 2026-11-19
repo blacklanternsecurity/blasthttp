@@ -186,9 +186,16 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rules {
-    /// Statuses a protection product uses to refuse. 429 belongs because a rate
-    /// limit and a bot block are the same outcome for a scan, whoever sent it.
+    /// Statuses a protection product uses to refuse.
     refusal_statuses: Vec<u16>,
+    /// Statuses that refuse for rate rather than identity, i.e. 429. They
+    /// classify as refusals, since a rate limit and a block are the same
+    /// outcome for a scan, but `{"status": "refusal"}` does not match them: no
+    /// profile gets past a rate limit, so a product's block markers on one are
+    /// not a reason to move the ladder. A rule for a product that refuses bots
+    /// with one of these names the status itself, as Kasada's does.
+    #[serde(default)]
+    rate_limit_statuses: Vec<u16>,
     rules: Vec<Rule>,
 }
 
@@ -277,7 +284,7 @@ impl Rules {
     }
 
     fn is_refusal(&self, status: u16) -> bool {
-        self.refusal_statuses.contains(&status)
+        self.refusal_statuses.contains(&status) || self.rate_limit_statuses.contains(&status)
     }
 
     fn matches(&self, condition: &Condition, facts: &ResponseFacts) -> bool {
@@ -287,7 +294,7 @@ impl Rules {
             Condition::Not(condition) => !self.matches(condition, facts),
             Condition::Status(Statuses::Codes(codes)) => codes.contains(&facts.status),
             Condition::Status(Statuses::Named(NamedStatuses::Refusal)) => {
-                self.is_refusal(facts.status)
+                self.refusal_statuses.contains(&facts.status)
             }
             Condition::HeaderPresent(name) => facts.has_header(name),
             Condition::HeaderContains { name, value } => facts.header_matches(name, value),

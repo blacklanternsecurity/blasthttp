@@ -32,6 +32,7 @@ async def _handler(reader, writer):
     /cf-challenge  403 shaped like a Cloudflare managed challenge, unless the
                    request carries the cookie pass=1
     /akamai-block  403 shaped like an Akamai edge refusal
+    /cf-rate-limit 429 shaped like Cloudflare's rate-limit page
     /plain-403     403 with no product signature at all
     """
     try:
@@ -74,6 +75,12 @@ async def _handler(reader, writer):
                 403,
                 [("akamai-grn", "0.6d551702.1790644996.315f62a4")],
                 b"<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD></HTML>",
+            )
+        elif path == "/cf-rate-limit":
+            respond(
+                429,
+                [("server", "cloudflare")],
+                b'<html><div id="cf-error-details"><h1>Error 1015</h1><p>You are being rate limited</p></div></html>',
             )
         elif path == "/plain-403":
             respond(403, [("server", "nginx")], b"forbidden")
@@ -223,6 +230,16 @@ async def test_a_block_is_not_a_challenge(server, client):
     assert conclusion == "blocked"
     assert vendor == "akamai"
     assert conclusion != "needs_browser"
+
+
+async def test_a_rate_limit_does_not_move_the_ladder(server, client):
+    """No profile gets past a rate limit, so trying another only spends a
+    request on a host that is already counting them. It is still a refusal.
+    No retries, since `attempts` only shows the last of them."""
+    r = await client.request(f"{server}/cf-rate-limit", retries=0)
+    assert r.status == 429
+    assert r.attempts == [("modern", "refused", 429)]
+    assert r.conclusion == ("blocked", "-")
 
 
 async def test_a_bare_403_names_no_vendor(server, client):

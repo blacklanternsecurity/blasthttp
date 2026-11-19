@@ -1,5 +1,6 @@
 {
-  "refusal_statuses": [401, 403, 405, 406, 429, 503],
+  "refusal_statuses": [401, 403, 405, 406, 503],
+  "rate_limit_statuses": [429],
   "rules": [
     {
       "vendor": "cloudflare",

@@ -70,6 +70,37 @@ fn test_on_refusal_changes_the_outcome_on_a_refusal_only() {
 }
 
 #[test]
+fn test_a_rate_limit_status_is_a_refusal_only_a_rule_naming_it_matches() {
+    let rules = Rules::from_json(
+        r#"{
+            "refusal_statuses": [403],
+            "rate_limit_statuses": [429],
+            "rules": [
+                {"vendor": "named", "outcome": "blocked",
+                 "when": {"all": [{"status": [429]}, {"body_contains": "named"}]}},
+                {"vendor": "generic", "outcome": "blocked",
+                 "when": {"all": [{"status": "refusal"}, {"body_contains": "generic"}]}}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let none = header("x", "y");
+    assert_eq!(
+        rules.classify(&facts(403, &none, "generic")),
+        Outcome::Blocked(Vendor::new("generic"))
+    );
+    // A 429 is still a refusal, but `"status": "refusal"` does not match it.
+    assert_eq!(
+        rules.classify(&facts(429, &none, "generic")),
+        Outcome::Blocked(Vendor::unknown())
+    );
+    assert_eq!(
+        rules.classify(&facts(429, &none, "named")),
+        Outcome::Blocked(Vendor::new("named"))
+    );
+}
+
+#[test]
 fn test_header_contains_ignores_case() {
     let rules = Rules::from_json(CUSTOM).unwrap();
     let edge = header("x-edge", "otherwaf-7");

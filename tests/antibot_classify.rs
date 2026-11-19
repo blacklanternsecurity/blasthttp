@@ -258,6 +258,36 @@ fn test_cloudflare_error_page_is_a_cloudflare_block() {
 }
 
 #[test]
+fn test_a_rate_limit_is_not_a_product_block() {
+    // Still a refusal, but no profile gets past a rate limit, so a product's
+    // block markers on a 429 are not the evidence that moves the ladder.
+    let cloudflare = hdrs(&[("server", "cloudflare")]);
+    let rate_limited = r#"<html><div id="cf-error-details" class="cf-error-details-wrapper"><h1>Error 1015</h1><p>You are being rate limited</p></div></html>"#;
+    for (h, body) in [
+        (cloudflare, rate_limited),
+        (
+            hdrs(&[("akamai-grn", "0.6d551702.1790644996.315f62a4")]),
+            AKAMAI_DENIED,
+        ),
+        (hdrs(&[]), "Too Many Requests"),
+    ] {
+        let outcome = classify(&facts(429, &h, body));
+        assert_eq!(outcome, Outcome::Blocked(Vendor::unknown()), "{body}");
+        assert!(!outcome.indicates_protection());
+    }
+}
+
+#[test]
+fn test_kasada_refusing_with_a_429_is_a_kasada_block() {
+    // Kasada answers 429 to refuse a bot, and its rule names that status, so
+    // it still counts as the product refusing.
+    let h = hdrs(&[("x-kpsdk-ct", "0abc")]);
+    let outcome = classify(&facts(429, &h, ""));
+    assert_eq!(outcome, Outcome::Blocked(Vendor::new("kasada")));
+    assert!(outcome.indicates_protection());
+}
+
+#[test]
 fn test_origin_refusal_behind_a_bot_product_is_not_vendor_evidence() {
     // Bot products set their cookies and inject their scripts on every
     // response, the origin's own refusals included. Those alone must not name
