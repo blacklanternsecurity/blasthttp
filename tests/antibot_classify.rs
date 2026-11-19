@@ -171,6 +171,45 @@ fn test_cloudflare_javascript_detections_page_is_not_a_challenge() {
     );
 }
 
+/// DataDome's and PerimeterX's captcha markers.
+const CAPTCHA_MARKERS: [(&str, &str); 3] = [
+    (
+        "datadome",
+        r#"<html><script>var dd={'host':'geo.captcha-delivery.com'}</script></html>"#,
+    ),
+    ("perimeterx", r#"<html><div id="px-captcha"></div></html>"#),
+    (
+        "perimeterx",
+        r#"<html><script src="/px/captcha/main.min.js"></script></html>"#,
+    ),
+];
+
+#[test]
+fn test_captcha_markers_on_a_refusal_are_a_challenge() {
+    let h = hdrs(&[("content-type", "text/html")]);
+    for (vendor, body) in CAPTCHA_MARKERS {
+        assert_eq!(
+            classify(&facts(403, &h, body)),
+            Outcome::Challenge(Vendor::new(vendor)),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn test_captcha_markers_on_a_200_are_not_a_challenge() {
+    // A page that got through can name them too. Read as a challenge, it
+    // walks the ladder, remembers nothing, and concludes needs_browser.
+    let h = hdrs(&[("content-type", "text/html")]);
+    for (vendor, body) in CAPTCHA_MARKERS {
+        assert_ne!(
+            classify(&facts(200, &h, body)),
+            Outcome::Challenge(Vendor::new(vendor)),
+            "{body}"
+        );
+    }
+}
+
 #[test]
 fn test_cloudflare_challenge_body_on_a_refusal_is_a_challenge() {
     // Without cf-mitigated, the markers still identify the challenge page.

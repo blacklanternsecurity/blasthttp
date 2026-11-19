@@ -61,12 +61,20 @@
     {
       "vendor": "datadome",
       "outcome": "challenge",
-      "when": {"body_contains": "geo.captcha-delivery.com"}
+      "when": {"all": [
+        {"status": "refusal"},
+        {"body_contains": "geo.captcha-delivery.com"}
+      ]},
+      "why": "The captcha page's own host. Only on a refusal, as with Cloudflare's markers: a page that got through can name it too, and taking a 200 for a challenge sends a reachable page to a browser."
     },
     {
       "vendor": "perimeterx",
       "outcome": "challenge",
-      "when": {"any": [{"body_contains": "/px/captcha"}, {"body_contains": "px-captcha"}]}
+      "when": {"all": [
+        {"status": "refusal"},
+        {"any": [{"body_contains": "/px/captcha"}, {"body_contains": "px-captcha"}]}
+      ]},
+      "why": "The block page's captcha markers. Only on a refusal, for the same reason as DataDome's."
     },
     {
       "vendor": "imperva",
