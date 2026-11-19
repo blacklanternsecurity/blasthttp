@@ -1434,6 +1434,9 @@ pub(crate) async fn connect_stream(
     config: &RequestConfig,
     log: &DebugLog,
 ) -> Result<Connected, ClientError> {
+    // `send` checks this too, but `raw_connect` reaches here directly, and
+    // `resolved_profile` would quietly turn a typo into the default.
+    config.validate_profile().map_err(ClientError::other)?;
     let mut rung = config.resolved_profile();
     let mut tried: Vec<&'static str> = Vec::new();
     let mut attempts: Vec<crate::report::Attempt> = Vec::new();

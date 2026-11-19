@@ -59,6 +59,15 @@ async def test_raw_connect_returns_raw_connection(client, echo_server):
     await conn.close()
 
 
+async def test_raw_connect_rejects_an_unknown_profile(client, echo_server):
+    """An unknown profile name is an error here too, not a connection made
+    as the default."""
+    _server, port = echo_server
+    with pytest.raises(Exception) as exc:
+        await client.raw_connect(f"http://127.0.0.1:{port}", profile="chrmoe")
+    assert "chrmoe" in str(exc.value).lower()
+
+
 async def test_send_bytes_read_raw_roundtrip(client, echo_server):
     _server, port = echo_server
     conn = await client.raw_connect(f"http://127.0.0.1:{port}")
