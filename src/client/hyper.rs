@@ -2377,6 +2377,25 @@ fn retry_backoff(attempt: u32, min_wait: Duration, max_wait: Duration) -> Durati
     std::cmp::min(backoff, max_wait)
 }
 
+/// How long a response's `Retry-After` asks the client to wait, given as
+/// seconds or as an HTTP date (RFC 9110 10.2.3). `None` when it has none, or
+/// none that parses. A date already past asks for no wait at all.
+fn retry_after(response: &Response) -> Option<Duration> {
+    let (_, value) = response
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))?;
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        at.duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
 impl HttpClient for HyperClient {
     async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
         config.validate_proxy().map_err(ClientError::other)?;
@@ -2393,10 +2412,15 @@ impl HttpClient for HyperClient {
         let log = new_debug_log();
 
         let mut last_err = None;
+        // What the last response's Retry-After asked for, which replaces the
+        // backoff before the next attempt.
+        let mut asked_wait: Option<Duration> = None;
 
         for attempt in 0..=max_retries {
             if attempt > 0 {
-                let backoff = retry_backoff(attempt - 1, min_wait, max_wait);
+                let wait = asked_wait
+                    .take()
+                    .unwrap_or_else(|| retry_backoff(attempt - 1, min_wait, max_wait));
                 debug_record(
                     &log,
                     config.verbosity,
@@ -2405,10 +2429,10 @@ impl HttpClient for HyperClient {
                         "   Retry {}/{} after {}ms",
                         attempt,
                         max_retries,
-                        backoff.as_millis(),
+                        wait.as_millis(),
                     ),
                 );
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(wait).await;
             }
 
             // One deadline for the whole request, redirects and ladder included.
@@ -2416,7 +2440,27 @@ impl HttpClient for HyperClient {
             match self.send_inner(config, &log, deadline).await {
                 Ok(response) => {
                     let status = response.status;
-                    if super::ErrorKind::Status(status).is_retryable() && attempt < max_retries {
+                    if attempt < max_retries && config.retries_status(status) {
+                        match retry_after(&response) {
+                            // Longer than the caller allows a retry to wait, so
+                            // the response goes back and the caller decides.
+                            Some(asked) if asked > max_wait => {
+                                debug_record(
+                                    &log,
+                                    config.verbosity,
+                                    1,
+                                    &format!(
+                                        "   {} asked for {}s, over the {}ms retry_wait_max; not retrying",
+                                        status,
+                                        asked.as_secs(),
+                                        max_wait.as_millis(),
+                                    ),
+                                );
+                                return Ok(response);
+                            }
+                            Some(asked) => asked_wait = Some(asked.max(min_wait)),
+                            None => {}
+                        }
                         debug_record(
                             &log,
                             config.verbosity,

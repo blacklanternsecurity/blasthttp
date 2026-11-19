@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Statuses a request retries when the caller names none: a rate limit, which
+/// says to try again later and usually says when.
+pub const DEFAULT_RETRY_STATUSES: &[u16] = &[429];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestConfig {
     pub url: String,
@@ -48,6 +52,12 @@ pub struct RequestConfig {
     pub retry_wait_min_ms: Option<u64>,
     /// Maximum backoff between retries in milliseconds (default: 30000)
     pub retry_wait_max_ms: Option<u64>,
+    /// Response statuses retried within `retries`, like a dropped connection.
+    /// `None` means [`DEFAULT_RETRY_STATUSES`]; empty hands every status back.
+    /// The wait before such a retry is the response's `Retry-After` when it
+    /// has one, never less than `retry_wait_min_ms`. One asking for more than
+    /// `retry_wait_max_ms` is not retried.
+    pub retry_statuses: Option<Vec<u16>>,
     /// No-op — paths are already sent raw. Kept for API compat with curl --path-as-is.
     pub raw_path: Option<bool>,
     /// Override the HTTP request-line target (like curl --request-target).
@@ -93,6 +103,7 @@ impl RequestConfig {
             retries: None,
             retry_wait_min_ms: None,
             retry_wait_max_ms: None,
+            retry_statuses: None,
             raw_path: None,
             request_target: None,
             resolve_ip: None,
@@ -276,6 +287,14 @@ impl RequestConfig {
 
     pub fn retry_wait_max(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.retry_wait_max_ms.unwrap_or(30000))
+    }
+
+    /// Whether a response with this status is retried within `retries`.
+    pub fn retries_status(&self, status: u16) -> bool {
+        self.retry_statuses
+            .as_deref()
+            .unwrap_or(DEFAULT_RETRY_STATUSES)
+            .contains(&status)
     }
 }
 

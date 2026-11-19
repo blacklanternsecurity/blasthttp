@@ -97,6 +97,7 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "murmur3",

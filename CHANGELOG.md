@@ -24,6 +24,12 @@ the ladder falling back to `compatibility` on the second handshake.
   any refusal. Most 403s are ordinary authorization failures, and retrying each
   one with different TLS settings would double the request count of any scan
   that touches one
+- Retrying a 429 waits as long as its `Retry-After` asks, given as seconds or
+  an HTTP date, and never less than `retry_wait_min_ms`. One asking for more
+  than `retry_wait_max_ms` comes back to the caller instead of being waited on.
+  `retry_statuses` on `request()`, `download()` and `BatchConfig` says which
+  statuses are retried at all: it defaults to `[429]`, and `[]` leaves every
+  status to the caller, for one that handles rate limits itself
 - A rate limit never moves the ladder. No profile gets past one, and trying
   another only spends a request on a host that is already counting them. A 429
   still concludes `blocked`, but a product's block markers on it, such as

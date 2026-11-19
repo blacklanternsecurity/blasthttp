@@ -41,6 +41,8 @@ tower-service = "0.3"
 
 # HTTP types (Uri, etc.)
 http = "1"
+# Retry-After as an HTTP date. Already in the tree through hyper.
+httpdate = "1"
 
 # Decompression
 flate2 = "1"

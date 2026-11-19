@@ -22,7 +22,8 @@ pub enum ErrorKind {
     InvalidUrl,
     /// Too many redirects — NOT retryable
     TooManyRedirects,
-    /// Got an HTTP response but status indicates server error — retryable for 429, 500-599 (except 501)
+    /// Got a response with a status the request retries; see
+    /// `RequestConfig::retry_statuses`
     Status(u16),
     /// Anything else — NOT retryable by default
     Other,
@@ -32,11 +33,9 @@ impl ErrorKind {
     pub fn is_retryable(&self) -> bool {
         match self {
             ErrorKind::Connection => true,
-            // 429 = rate limited, retry makes sense
-            ErrorKind::Status(429) => true,
-            // 5xx: don't retry at the transport level — let the caller decide.
-            // This matches httpx behavior and avoids double-retries when
-            // Python-level retry logic (e.g. API key cycling) is in play.
+            // A status is retried or not by the request's `retry_statuses`,
+            // which a caller with its own handling empties. Nothing about the
+            // status alone says another try will help.
             _ => false,
         }
     }
@@ -460,8 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn test_status_429_is_retryable() {
-        assert!(ErrorKind::Status(429).is_retryable());
+    fn test_status_429_is_left_to_retry_statuses() {
+        assert!(!ErrorKind::Status(429).is_retryable());
     }
 
     #[test]

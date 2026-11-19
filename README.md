@@ -251,6 +251,7 @@ All parameters except `url` are optional:
 | `retries` | `int` | Number of retries on failure |
 | `retry_wait_min_ms` | `int` | Minimum backoff between retries (ms) |
 | `retry_wait_max_ms` | `int` | Maximum backoff between retries (ms) |
+| `retry_statuses` | `list[int]` | Statuses retried within `retries`, after their `Retry-After` (default `[429]`; `[]` hands every status back) |
 | `max_body_size` | `int` | Max response body bytes to read; stops the read, not just what's kept |
 | `request_target` | `str` | Override the HTTP request-line URI |
 | `resolve_ip` | `str` | Connect to this IP (DNS pinning / `curl --resolve`) |
@@ -276,7 +277,7 @@ The `Content-Type: multipart/form-data` boundary header is set automatically.
 
 ### Retries
 
-`request()`, `download()`, and `BatchConfig` support automatic retries with exponential backoff:
+`request()`, `download()`, and `BatchConfig` support automatic retries with exponential backoff. A dropped connection is retried, and so is a status in `retry_statuses`, which defaults to `[429]`. A status is retried after its `Retry-After` when it has one, never sooner than `retry_wait_min_ms`; one asking for more than `retry_wait_max_ms` comes back to the caller instead of being waited on. Pass `retry_statuses=[]` if you handle rate limits yourself.
 
 ```python
 r = await client.request(
@@ -302,6 +303,7 @@ r = await client.request(
 | `no_proxy` | `list[str]` | Hosts that bypass the proxy |
 | `headers` | `list[tuple[str, str]]` | Request headers |
 | `retries` | `int` | Number of retries on failure |
+| `retry_statuses` | `list[int]` | Statuses retried within `retries`, as on `request()` |
 | `redirect_cookies` | `bool` | Carry `Set-Cookie` across redirect hops |
 | `profile` | `str` | Connection profile, as on `request()` |
 | `cipher_string` | `str` | OpenSSL cipher string |
