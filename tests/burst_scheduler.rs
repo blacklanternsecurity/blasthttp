@@ -9,7 +9,7 @@
 
 mod support;
 
-use blasthttp::batch::send_batch;
+use blasthttp::batch::{ConcurrencyLimit, send_batch};
 use blasthttp::client::hyper::HyperClient;
 use blasthttp::config::RequestConfig;
 use openssl::ssl::SslVersion;
@@ -71,7 +71,7 @@ async fn test_a_burst_discovers_a_host_once_when_there_is_other_work() {
     }
 
     let client = Arc::new(HyperClient::new());
-    let results = send_batch(client, configs, 8, None, None).await;
+    let results = send_batch(client, configs, ConcurrencyLimit::new(8), None, None).await;
 
     assert_eq!(
         reached(&results),
@@ -112,7 +112,7 @@ async fn test_a_burst_with_nothing_else_to_do_does_not_wait() {
     let client = Arc::new(HyperClient::new());
 
     let started = std::time::Instant::now();
-    let results = send_batch(client, configs, 4, None, None).await;
+    let results = send_batch(client, configs, ConcurrencyLimit::new(4), None, None).await;
     let elapsed = started.elapsed();
 
     assert_eq!(reached(&results), 4);
@@ -142,7 +142,7 @@ async fn test_a_host_that_cannot_be_reached_does_not_strand_the_rest() {
 
     let client = Arc::new(HyperClient::new());
     let started = std::time::Instant::now();
-    let results = send_batch(client, configs, 5, None, None).await;
+    let results = send_batch(client, configs, ConcurrencyLimit::new(5), None, None).await;
     let elapsed = started.elapsed();
 
     assert_eq!(results.len(), 5);
@@ -178,7 +178,7 @@ async fn test_a_direct_request_does_not_lead_a_host() {
         configs.extend((0..4).map(|_| config(&modern.url())));
 
         let client = Arc::new(HyperClient::new());
-        let results = send_batch(client, configs, 9, None, None).await;
+        let results = send_batch(client, configs, ConcurrencyLimit::new(9), None, None).await;
 
         assert_eq!(
             reached(&results),

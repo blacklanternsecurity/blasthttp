@@ -30,6 +30,10 @@ the ladder falling back to `compatibility` on the second handshake.
   `retry_statuses` on `request()`, `download()` and `BatchConfig` says which
   statuses are retried at all: it defaults to `[429]`, and `[]` leaves every
   status to the caller, for one that handles rate limits itself
+- `blasthttp.ConcurrencyLimit(n)` passed as `concurrency` to `request_batch()`
+  or `request_batch_stream()` caps every call it is passed to, together, so a
+  caller running several batches at once keeps one limit on what it sends. A
+  plain number still caps one call
 - A rate limit never moves the ladder. No profile gets past one, and trying
   another only spends a request on a host that is already counting them. A 429
   still concludes `blocked`, but a product's block markers on it, such as

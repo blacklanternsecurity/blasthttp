@@ -111,6 +111,29 @@ impl RateLimiter {
 
 // ── Batch dispatch ────────────────────────────────────────────────
 
+/// A cap on requests in flight. Made from a number, it caps one batch. Cloned
+/// into several, it caps them together, which is how a caller running more than
+/// one batch at a time keeps a single limit on what it sends.
+#[derive(Clone)]
+pub struct ConcurrencyLimit {
+    permits: Arc<tokio::sync::Semaphore>,
+    size: usize,
+}
+
+impl ConcurrencyLimit {
+    pub fn new(size: usize) -> Self {
+        ConcurrencyLimit {
+            permits: Arc::new(tokio::sync::Semaphore::new(size)),
+            size,
+        }
+    }
+
+    /// The most requests it lets be in flight at once.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
 /// Pick the effective rate limiter for a batch call.
 ///
 /// When both a client-level and per-call rate limit are set, use the more
@@ -408,11 +431,11 @@ async fn await_turn(
 pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
     client: Arc<C>,
     configs: Vec<RequestConfig>,
-    concurrency: usize,
+    concurrency: ConcurrencyLimit,
     rate_limit: Option<f64>,
     shared_limiter: Option<Arc<RateLimiter>>,
 ) -> Vec<BatchResult> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let semaphore = concurrency.permits;
     let limiter = merge_limiters(shared_limiter, rate_limit);
     // No ceiling here: the tasks all exist either way, so standing aside
     // costs nothing that going would not have cost anyway.
@@ -483,22 +506,23 @@ pub async fn send_batch<C: HttpClient + Send + Sync + 'static>(
 /// `__anext__` (a `future_into_py` block running on the tokio runtime).
 ///
 /// Concurrency is gated *before* spawn by a semaphore acquire on the driver,
-/// so at most `concurrency` requests are in-flight at any time. The rate
+/// so at most `concurrency.size()` requests are in-flight at any time, across
+/// every batch sharing that limit. The rate
 /// limit is taken just before each send, as in `send_batch`. In-flight tasks are NOT cancelled if the consumer drops
 /// the stream — they run to completion and their sends fail silently. This
 /// also matches `send_batch`.
 pub fn send_batch_stream<C: HttpClient + Send + Sync + 'static>(
     client: Arc<C>,
     configs: Vec<RequestConfig>,
-    concurrency: usize,
+    concurrency: ConcurrencyLimit,
     rate_limit: Option<f64>,
     shared_limiter: Option<Arc<RateLimiter>>,
 ) -> impl Stream<Item = BatchResult> + Send + 'static {
     let limiter = merge_limiters(shared_limiter, rate_limit);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let semaphore = concurrency.permits;
     // Ceiling here, because this driver spawns lazily and a request that
     // stands aside gives its permit back for the driver to spawn against.
-    let sched = Scheduler::new(&configs, concurrency);
+    let sched = Scheduler::new(&configs, concurrency.size);
 
     stream::once(async move {
         let (tx, rx) = futures::channel::mpsc::unbounded::<BatchResult>();
@@ -563,7 +587,7 @@ mod tests {
             RequestConfig::new("https://c.com".to_string()),
         ];
 
-        let results = send_batch(client, configs, 10, None, None).await;
+        let results = send_batch(client, configs, ConcurrencyLimit::new(10), None, None).await;
         assert_eq!(results.len(), 3);
         for r in &results {
             assert!(r.result.is_ok());
@@ -579,7 +603,7 @@ mod tests {
             RequestConfig::new("https://second.com".to_string()),
         ];
 
-        let results = send_batch(client, configs, 10, None, None).await;
+        let results = send_batch(client, configs, ConcurrencyLimit::new(10), None, None).await;
         let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
         assert!(urls.contains(&"https://first.com"));
         assert!(urls.contains(&"https://second.com"));
@@ -588,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_empty_input() {
         let client = Arc::new(MockClient::new(200, "ok".to_string()));
-        let results = send_batch(client, Vec::new(), 10, None, None).await;
+        let results = send_batch(client, Vec::new(), ConcurrencyLimit::new(10), None, None).await;
         assert!(results.is_empty());
     }
 
@@ -600,7 +624,7 @@ mod tests {
             RequestConfig::new("https://b.com".to_string()),
         ];
 
-        let results = send_batch(client, configs, 10, None, None).await;
+        let results = send_batch(client, configs, ConcurrencyLimit::new(10), None, None).await;
         assert_eq!(results.len(), 2);
         for r in &results {
             assert!(r.result.is_err());
@@ -617,7 +641,14 @@ mod tests {
             .collect();
 
         let start = Instant::now();
-        let results = send_batch(client.clone(), configs, 5, None, None).await;
+        let results = send_batch(
+            client.clone(),
+            configs,
+            ConcurrencyLimit::new(5),
+            None,
+            None,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
@@ -638,7 +669,14 @@ mod tests {
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
             .collect();
 
-        let results = send_batch(client.clone(), configs, 2, None, None).await;
+        let results = send_batch(
+            client.clone(),
+            configs,
+            ConcurrencyLimit::new(2),
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(results.len(), 10);
         assert!(
@@ -658,7 +696,14 @@ mod tests {
             .collect();
 
         let start = Instant::now();
-        let results = send_batch(client.clone(), configs, 1, None, None).await;
+        let results = send_batch(
+            client.clone(),
+            configs,
+            ConcurrencyLimit::new(1),
+            None,
+            None,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 4);
@@ -680,7 +725,7 @@ mod tests {
             .collect();
 
         let start = Instant::now();
-        let results = send_batch(client, configs, 50, None, None).await;
+        let results = send_batch(client, configs, ConcurrencyLimit::new(50), None, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
@@ -701,7 +746,8 @@ mod tests {
             .collect();
 
         let start = Instant::now();
-        let results = send_batch(client, configs, 50, Some(10.0), None).await;
+        let results =
+            send_batch(client, configs, ConcurrencyLimit::new(50), Some(10.0), None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
@@ -728,7 +774,7 @@ mod tests {
             .collect();
 
         let start = Instant::now();
-        let results = send_batch(client, configs, 50, Some(1.0), None).await;
+        let results = send_batch(client, configs, ConcurrencyLimit::new(50), Some(1.0), None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 3);
@@ -775,6 +821,55 @@ mod tests {
         }
     }
 
+    /// Counts requests in flight, and the most there ever were at once.
+    struct InFlight {
+        inner: MockClient,
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HttpClient for InFlight {
+        async fn send(&self, config: &RequestConfig) -> Result<Response, ClientError> {
+            let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(n, Ordering::SeqCst);
+            let result = self.inner.send(config).await;
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_shared_limit_caps_every_batch_it_is_passed_to() {
+        // Two streams of four, each host its own so no one stands aside. With
+        // a limit each they run four at once; sharing one, two.
+        for (shared, most) in [(true, 2), (false, 4)] {
+            let client = Arc::new(InFlight {
+                inner: MockClient::new(200, "ok".to_string())
+                    .with_delay(Duration::from_millis(100)),
+                now: Default::default(),
+                most: Default::default(),
+            });
+            let one = ConcurrencyLimit::new(2);
+            let limit = || {
+                if shared {
+                    one.clone()
+                } else {
+                    ConcurrencyLimit::new(2)
+                }
+            };
+            let configs = |batch: &str| -> Vec<RequestConfig> {
+                (0..4)
+                    .map(|i| RequestConfig::new(format!("https://{batch}{i}.test/")))
+                    .collect()
+            };
+            let a = send_batch_stream(client.clone(), configs("a"), limit(), None, None);
+            let b = send_batch_stream(client.clone(), configs("b"), limit(), None, None);
+            let (a, b) = tokio::join!(a.collect::<Vec<_>>(), b.collect::<Vec<_>>());
+            assert_eq!(a.len() + b.len(), 8);
+            assert_eq!(client.most.load(Ordering::SeqCst), most, "shared={shared}");
+        }
+    }
+
     #[tokio::test]
     async fn test_requests_that_stood_aside_still_keep_the_rate() {
         // Followers of a slow host stand aside while its first request runs.
@@ -786,7 +881,14 @@ mod tests {
             .map(RequestConfig::new)
             .collect();
 
-        send_batch(client.clone(), configs, 50, Some(5.0), None).await;
+        send_batch(
+            client.clone(),
+            configs,
+            ConcurrencyLimit::new(50),
+            Some(5.0),
+            None,
+        )
+        .await;
 
         let sends: Vec<Instant> = client.sends.lock().unwrap().iter().map(|s| s.1).collect();
         assert_eq!(sends.len(), 16);
@@ -824,7 +926,14 @@ mod tests {
             .map(|(i, h)| pinned(&format!("https://{h}.com/{i}")))
             .collect();
 
-        send_batch(client.clone(), configs, 50, None, None).await;
+        send_batch(
+            client.clone(),
+            configs,
+            ConcurrencyLimit::new(50),
+            None,
+            None,
+        )
+        .await;
 
         let sends: Vec<Instant> = client.sends.lock().unwrap().iter().map(|s| s.1).collect();
         let spread = *sends.iter().max().unwrap() - *sends.iter().min().unwrap();
@@ -845,7 +954,14 @@ mod tests {
             RequestConfig::new("https://b.com/other".to_string()),
         ];
 
-        send_batch(client.clone(), configs, 50, None, None).await;
+        send_batch(
+            client.clone(),
+            configs,
+            ConcurrencyLimit::new(50),
+            None,
+            None,
+        )
+        .await;
 
         let waited = client.sent_at("https://a.com/open") - client.sent_at("https://a.com/pinned");
         assert!(
@@ -865,7 +981,14 @@ mod tests {
             .map(|i| RequestConfig::new(format!("https://{}.com", i)))
             .collect();
 
-        let results = send_batch(client.clone(), configs, 2, Some(20.0), None).await;
+        let results = send_batch(
+            client.clone(),
+            configs,
+            ConcurrencyLimit::new(2),
+            Some(20.0),
+            None,
+        )
+        .await;
         assert_eq!(results.len(), 4);
         // All should succeed
         for r in &results {
@@ -883,7 +1006,14 @@ mod tests {
 
         let shared = Arc::new(RateLimiter::new(10.0));
         let start = Instant::now();
-        let results = send_batch(client, configs, 50, None, Some(shared)).await;
+        let results = send_batch(
+            client,
+            configs,
+            ConcurrencyLimit::new(50),
+            None,
+            Some(shared),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
@@ -906,7 +1036,14 @@ mod tests {
 
         let shared = Arc::new(RateLimiter::new(100.0));
         let start = Instant::now();
-        let results = send_batch(client, configs, 50, Some(10.0), Some(shared)).await;
+        let results = send_batch(
+            client,
+            configs,
+            ConcurrencyLimit::new(50),
+            Some(10.0),
+            Some(shared),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
@@ -929,7 +1066,14 @@ mod tests {
 
         let shared = Arc::new(RateLimiter::new(10.0));
         let start = Instant::now();
-        let results = send_batch(client, configs, 50, Some(100.0), Some(shared)).await;
+        let results = send_batch(
+            client,
+            configs,
+            ConcurrencyLimit::new(50),
+            Some(100.0),
+            Some(shared),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
@@ -962,8 +1106,8 @@ mod tests {
 
         let start = Instant::now();
         let (r1, r2) = tokio::join!(
-            send_batch(c1, configs1, 50, None, Some(s1)),
-            send_batch(c2, configs2, 50, None, Some(s2)),
+            send_batch(c1, configs1, ConcurrencyLimit::new(50), None, Some(s1)),
+            send_batch(c2, configs2, ConcurrencyLimit::new(50), None, Some(s2)),
         );
         let elapsed = start.elapsed();
 
@@ -1029,14 +1173,35 @@ mod tests {
 
         // Warm-up so the first timing isn't dominated by one-time
         // allocations / cache-warming.
-        let _ = send_batch(client.clone(), make_configs(), 100, None, None).await;
+        let _ = send_batch(
+            client.clone(),
+            make_configs(),
+            ConcurrencyLimit::new(100),
+            None,
+            None,
+        )
+        .await;
 
         let start = Instant::now();
-        let unlimited = send_batch(client.clone(), make_configs(), 100, None, None).await;
+        let unlimited = send_batch(
+            client.clone(),
+            make_configs(),
+            ConcurrencyLimit::new(100),
+            None,
+            None,
+        )
+        .await;
         let unlimited_elapsed = start.elapsed();
 
         let start = Instant::now();
-        let limited = send_batch(client.clone(), make_configs(), 100, Some(100_000.0), None).await;
+        let limited = send_batch(
+            client.clone(),
+            make_configs(),
+            ConcurrencyLimit::new(100),
+            Some(100_000.0),
+            None,
+        )
+        .await;
         let limited_elapsed = start.elapsed();
 
         assert_eq!(unlimited.len(), n);

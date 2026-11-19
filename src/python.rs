@@ -1232,18 +1232,21 @@ impl BlastHTTP {
     ///
     /// Args:
     ///   configs: List of `BatchConfig` objects describing each request.
-    ///   concurrency: Maximum simultaneous in-flight requests. Default 50.
+    ///   concurrency: Maximum simultaneous in-flight requests, default 50.
+    ///     A number caps this call alone. A `ConcurrencyLimit` caps every
+    ///     call it is passed to, together.
     ///   rate_limit: Optional cap on dispatch rate (requests/sec). `None`
     ///     means no per-call cap. If `set_rate_limit()` is also active on
     ///     the client, the more restrictive (lower RPS) limit wins.
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=Concurrency::Size(50), rate_limit=None))]
     fn request_batch<'py>(
         &self,
         py: Python<'py>,
         configs: Vec<PyBatchConfig>,
-        concurrency: usize,
+        concurrency: Concurrency,
         rate_limit: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let concurrency = concurrency.into_limit();
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
             .map(|c| c.into_request_config(py))
@@ -1297,18 +1300,21 @@ impl BlastHTTP {
     ///
     /// Args:
     ///   configs: List of `BatchConfig` objects describing each request.
-    ///   concurrency: Maximum simultaneous in-flight requests. Default 50.
+    ///   concurrency: Maximum simultaneous in-flight requests, default 50.
+    ///     A number caps this call alone. A `ConcurrencyLimit` caps every
+    ///     call it is passed to, together.
     ///   rate_limit: Optional cap on dispatch rate (requests/sec). `None`
     ///     means no per-call cap. If `set_rate_limit()` is also active on
     ///     the client, the more restrictive (lower RPS) limit wins.
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=Concurrency::Size(50), rate_limit=None))]
     fn request_batch_stream(
         &self,
         py: Python<'_>,
         configs: Vec<PyBatchConfig>,
-        concurrency: usize,
+        concurrency: Concurrency,
         rate_limit: Option<f64>,
     ) -> PyResult<PyBatchResultIterator> {
+        let concurrency = concurrency.into_limit();
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
             .map(|c| c.into_request_config(py))
@@ -1581,6 +1587,56 @@ impl PyRawConnection {
     #[getter]
     fn peer_ip(&self) -> Option<String> {
         self.inner.peer_ip()
+    }
+}
+
+// ── Concurrency limit ─────────────────────────────────────────────
+
+/// A cap on requests in flight, shared by every batch call it is passed to as
+/// `concurrency`. A plain number caps one call alone.
+#[pyclass(name = "ConcurrencyLimit", from_py_object)]
+#[derive(Clone)]
+struct PyConcurrencyLimit {
+    inner: batch::ConcurrencyLimit,
+}
+
+#[pymethods]
+impl PyConcurrencyLimit {
+    #[new]
+    fn new(size: usize) -> PyResult<Self> {
+        if size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "a concurrency limit of 0 would never send anything",
+            ));
+        }
+        Ok(PyConcurrencyLimit {
+            inner: batch::ConcurrencyLimit::new(size),
+        })
+    }
+
+    #[getter]
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ConcurrencyLimit({})", self.inner.size())
+    }
+}
+
+/// `concurrency` as a batch call takes it.
+#[derive(FromPyObject)]
+enum Concurrency {
+    Shared(PyConcurrencyLimit),
+    Size(usize),
+}
+
+impl Concurrency {
+    fn into_limit(self) -> batch::ConcurrencyLimit {
+        match self {
+            Concurrency::Shared(limit) => limit.inner,
+            Concurrency::Size(size) => batch::ConcurrencyLimit::new(size),
+        }
     }
 }
 
@@ -2283,6 +2339,7 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<BlastHTTP>()?;
     m.add_class::<PyBatchConfig>()?;
+    m.add_class::<PyConcurrencyLimit>()?;
     // Response types are returned by methods, but register them
     // so Python can reference them for type hints / isinstance checks
     m.add_class::<PyResponse>()?;

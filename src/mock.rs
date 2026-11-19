@@ -821,12 +821,12 @@ impl PyBlasthttpMock {
     /// Streaming batch — yields `BatchResult` objects one at a time.
     /// Mock results stream first (in input order), then passthrough
     /// results follow (in completion order from the real client).
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=None, rate_limit=None))]
     fn request_batch_stream(
         &self,
         py: Python<'_>,
         configs: Vec<Py<PyAny>>,
-        concurrency: usize,
+        concurrency: Option<Py<PyAny>>,
         rate_limit: Option<f64>,
     ) -> PyResult<PyMockBatchIterator> {
         // Split into mock-bound and passthrough configs.
@@ -867,7 +867,11 @@ impl PyBlasthttpMock {
         let passthrough_iter: Option<Py<PyAny>> =
             if let (Some(client), false) = (&self.real_client, passthrough_configs.is_empty()) {
                 let kwargs = PyDict::new(py);
-                kwargs.set_item("concurrency", concurrency)?;
+                // A number or a shared ConcurrencyLimit, as the caller passed
+                // it; left out, the real client applies its own default.
+                if let Some(c) = concurrency {
+                    kwargs.set_item("concurrency", c)?;
+                }
                 if let Some(rl) = rate_limit {
                     kwargs.set_item("rate_limit", rl)?;
                 }
@@ -895,11 +899,11 @@ impl PyBlasthttpMock {
 
     /// Convenience non-streaming batch. Drains the stream and returns
     /// a `list[BatchResult]`.
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=None, rate_limit=None))]
     fn request_batch<'py>(
         slf: PyRef<'py, Self>,
         configs: Vec<Py<PyAny>>,
-        concurrency: usize,
+        concurrency: Option<Py<PyAny>>,
         rate_limit: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();

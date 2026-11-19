@@ -226,6 +226,16 @@ Two ways to issue the same workload — pick whichever matches how you want to c
 
 `request_batch_stream` yields up to 1000 results per chunk, or whatever has accumulated after ~200ms — the timeout flushes partial chunks so the consumer is never starved when results trickle in slowly. Both functions accept the same `(configs, concurrency=50, rate_limit=None)` arguments and respect `set_rate_limit()` identically.
 
+`concurrency` is a number, which caps that one call, or a `blasthttp.ConcurrencyLimit`, which caps every call it is passed to, together. Share one when several batches run at once and should count against a single limit:
+
+```python
+limit = blasthttp.ConcurrencyLimit(50)
+await asyncio.gather(
+    client.request_batch(first, concurrency=limit),
+    client.request_batch(second, concurrency=limit),
+)  # at most 50 requests in flight between them
+```
+
 ### `request()` parameters
 
 All parameters except `url` are optional:
