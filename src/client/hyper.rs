@@ -2714,41 +2714,26 @@ mod tests {
     }
 
     #[test]
-    fn test_our_decoder_reads_a_cut_deflate_stream_as_a_short_one() {
-        // The limit of the flag, pinned so its absence doesn't get read as a
-        // guarantee. This is a property of the decoder, not of the format.
-        // zlib (RFC 1950 §2.2) does carry an integrity trailer, a 4-byte
-        // adler32, but `flate2`'s `ZlibDecoder` doesn't require it to be
-        // present, so a truncated stream reads as a clean short one:
-        //
-        //   zlib, full                  Ok,  135000 bytes, matches
-        //   zlib, trailer stripped (-4) Ok,  135000 bytes, matches
-        //   zlib, adler32 corrupted     Err("corrupt deflate stream")
-        //
-        // Raw deflate (RFC 1951) has no trailer at all, so the same read is
-        // the only one available to it. Damage mid-stream is still caught in
-        // both flavors, since that produces an invalid block rather than a
-        // tidy ending, and gzip catches truncation via its trailer.
+    fn test_a_cut_deflate_stream_is_flagged() {
+        // flate2 >= 1.1.11 reports an incomplete stream instead of a clean
+        // short read, so truncation is caught in both deflate flavors.
         let big = SAMPLE.repeat(400);
-        for (encoding, compressed) in [
-            ("deflate", deflate_bytes(&big)),
-            ("deflate", zlib_bytes(&big)),
-        ] {
+        for compressed in [deflate_bytes(&big), zlib_bytes(&big)] {
             let cut = &compressed[..compressed.len() / 2];
-            let out = decoded(encoding, cut, NO_LIMIT);
-            assert!(!out.is_empty());
+            let (out, reason) = undecoded("deflate", cut, NO_LIMIT);
+            assert!(!out.is_empty(), "recovered nothing");
             assert!(big.starts_with(&out));
             assert!(out.len() < big.len());
+            assert!(
+                reason.contains("did not decode cleanly"),
+                "unexpected reason: {}",
+                reason
+            );
         }
     }
 
     #[test]
     fn test_a_corrupted_zlib_trailer_is_flagged() {
-        // The other side of the test above: zlib's adler32 is checked when it
-        // is present, so damage to it is caught even though truncation past
-        // it is not. Without this, the pair above reads as "deflate has no
-        // integrity check", which is a property of neither flavor.
-        //
         // Whether the flag arrives as a failed or partial decode depends on
         // how much output cleared the decoder's buffer before the trailer was
         // reached, so this asserts that it is flagged and what the decoder
