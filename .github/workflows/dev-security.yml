@@ -1,0 +1,11 @@
+name: dev-security
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dev-security:
+    uses: blacklanternsecurity/release-workflows/.github/workflows/dev-security.yml@b697b5ee082318796a6c52f98fac775ddfd37f33 # v1.2.0
