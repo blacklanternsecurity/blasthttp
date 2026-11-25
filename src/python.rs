@@ -15,10 +15,12 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant;
 
+use crate::antibot as blasthttp_antibot;
 use crate::batch::{self, BatchResult, RateLimiter};
 use crate::client::HttpClient;
 use crate::client::hyper::HyperClient;
 use crate::client::raw;
+use crate::client::{ClientError, ErrorKind, TlsFailure};
 use crate::config::RequestConfig;
 use crate::multipart;
 use crate::response::{CertInfo, RedirectHop, Response, ResponseHash};
@@ -380,6 +382,97 @@ pyo3::create_exception!(
     "Raised by Response.raise_for_status() when the response status is 4xx or 5xx."
 );
 
+// ── Turning a ClientError into a Python exception ─────────────────
+
+pyo3::create_exception!(
+    blasthttp,
+    TransportError,
+    pyo3::exceptions::PyRuntimeError,
+    "Raised when a request never produced a response: DNS, TCP, TLS or timeout."
+);
+
+/// Render a `Conclusion` as the `(name, vendor)` pair Python sees.
+fn conclusion_to_py(c: &crate::report::Conclusion) -> (String, String) {
+    use crate::report::Conclusion;
+    let (name, vendor) = match c {
+        Conclusion::Reached => ("reached", None),
+        Conclusion::Blocked { vendor } => ("blocked", vendor.clone()),
+        Conclusion::NeedsBrowser { vendor } => ("needs_browser", vendor.clone()),
+        Conclusion::NeedsLegacyTls { .. } => ("needs_legacy_tls", None),
+        Conclusion::Unreachable { .. } => ("unreachable", None),
+    };
+    (name.to_string(), vendor.unwrap_or_else(|| "-".to_string()))
+}
+
+/// Render what the ladder tried as `(profile, outcome, status)` tuples.
+fn attempts_to_py(attempts: &[crate::report::Attempt]) -> Vec<(String, String, Option<u16>)> {
+    use crate::report::AttemptOutcome;
+    attempts
+        .iter()
+        .map(|a| {
+            let (kind, status) = match &a.outcome {
+                AttemptOutcome::Reached { status } => ("reached", Some(*status)),
+                AttemptOutcome::Refused { status, .. } => ("refused", Some(*status)),
+                AttemptOutcome::Challenged { status, .. } => ("challenged", Some(*status)),
+                AttemptOutcome::HandshakeFailed { .. } => ("handshake_failed", None),
+            };
+            (a.profile.clone(), kind.to_string(), status)
+        })
+        .collect()
+}
+
+/// Convert a `ClientError` into a Python exception that keeps what we know.
+///
+/// Every call site used to do `PyRuntimeError::new_err(e.message)`, which threw
+/// away `kind` and left Python to substring-match a sentence to find out
+/// whether a host was unreachable, timed out, or refused our ciphers. The
+/// message stays the same so existing `except RuntimeError` keeps working
+/// (TransportError subclasses it), but the detail is now attached as
+/// attributes:
+///
+///   `kind`         one of connection, timeout, tls, invalid_url,
+///                  too_many_redirects, status, other
+///   `tls_failure`  when the handshake failed, why: no_shared_cipher,
+///                  unsupported_protocol, alert, certificate_verify, reset,
+///                  timeout, other. `None` otherwise.
+///   `retryable`    whether trying the same request again might help.
+///   `conclusion`   `(name, vendor)`, as on `Response`.
+///   `attempts`     `(profile, outcome, status)` tuples, as on `Response`.
+pub(crate) fn client_error_to_py(e: ClientError) -> PyErr {
+    let kind = match &e.kind {
+        ErrorKind::Connection => "connection",
+        ErrorKind::Timeout => "timeout",
+        ErrorKind::Tls => "tls",
+        ErrorKind::InvalidUrl => "invalid_url",
+        ErrorKind::TooManyRedirects => "too_many_redirects",
+        ErrorKind::Status(_) => "status",
+        ErrorKind::Other => "other",
+    };
+    let tls_failure = e.tls_failure.as_ref().map(|f| match f {
+        TlsFailure::NoSharedCipher => "no_shared_cipher",
+        TlsFailure::UnsupportedProtocol => "unsupported_protocol",
+        TlsFailure::Alert { .. } => "alert",
+        TlsFailure::CertificateVerify { .. } => "certificate_verify",
+        TlsFailure::Reset => "reset",
+        TlsFailure::Timeout => "timeout",
+        TlsFailure::Other { .. } => "other",
+    });
+    let retryable = e.kind.is_retryable();
+    let conclusion = conclusion_to_py(&e.conclusion());
+    let attempts = attempts_to_py(&e.attempts);
+
+    let err = TransportError::new_err(e.message);
+    Python::attach(|py| {
+        let v = err.value(py);
+        let _ = v.setattr("kind", kind);
+        let _ = v.setattr("tls_failure", tls_failure);
+        let _ = v.setattr("retryable", retryable);
+        let _ = v.setattr("conclusion", conclusion);
+        let _ = v.setattr("attempts", attempts);
+    });
+    err
+}
+
 // ── Response wrapper ──────────────────────────────────────────────
 
 #[pyclass(name = "Response")]
@@ -468,6 +561,9 @@ impl PyResponse {
             status,
             headers: headers.unwrap_or_default(),
             body_bytes,
+            // A response built from Python was not produced by the ladder, so
+            // it has nothing to report about what was tried.
+            attempts: Vec::new(),
             elapsed_ms,
             redirect_chain: redirect_chain
                 .map(|hops| hops.into_iter().map(|h| h.inner.clone()).collect())
@@ -649,6 +745,73 @@ impl PyResponse {
 
     /// Debug messages collected during the request.
     /// Always populated — Python side can log/display as needed.
+    /// What a bot-management product did to this request, if anything.
+    ///
+    /// Returns a tuple of `(outcome, vendor)`, both lowercase strings:
+    ///
+    ///   outcome  ok | present | challenge | blocked
+    ///   vendor   cloudflare | akamai | datadome | perimeterx | imperva |
+    ///            f5 | kasada | unknown | "-" when nothing was detected
+    ///
+    /// `present` means a product is in front of the host and let us through,
+    /// usually having issued a session cookie. That is a more useful answer
+    /// than a bare 200: it says we passed something that was actively looking.
+    ///
+    /// `challenge` is the one to branch on. A blocked request might succeed
+    /// with different settings; a challenge will not, because answering it
+    /// means running the page's JavaScript. It is the signal to hand the URL
+    /// to a real browser rather than retry.
+    /// What this request amounts to, as a single verdict a caller can branch
+    /// on. Returns `(conclusion, vendor)`:
+    ///
+    ///   reached          got the page, or the server's own answer such as
+    ///                    a 404 or a 500
+    ///   blocked          refused. vendor names the product when one was
+    ///                    recognised; "-" is an ordinary refusal (auth,
+    ///                    forbidden path, method not allowed) that a
+    ///                    different connection shape won't change
+    ///   needs_browser    a JavaScript challenge; hand this URL to a real
+    ///                    browser, because no HTTP client passes this tier
+    ///   needs_legacy_tls the peer wants cryptography we declined or cannot do
+    ///   unreachable      never got a response
+    ///
+    /// `needs_browser` is the one worth acting on. It means retrying with
+    /// different settings cannot help. A `blocked` with a named vendor is
+    /// the only refusal the ladder tries other settings against, so by the
+    /// time it is reported they have been tried.
+    #[getter]
+    fn conclusion(&self) -> (String, String) {
+        conclusion_to_py(&self.inner.conclusion())
+    }
+
+    /// What the profile ladder tried, in order, as `(profile, outcome, status)`
+    /// tuples. Usually one entry; more than one means the first approach did
+    /// not work and the client moved.
+    #[getter]
+    fn attempts(&self) -> Vec<(String, String, Option<u16>)> {
+        attempts_to_py(&self.inner.attempts)
+    }
+
+    #[getter]
+    fn protection(&self) -> (String, String) {
+        let outcome = self.inner.protection();
+        let name = match &outcome {
+            blasthttp_antibot::Outcome::Ok => "ok",
+            blasthttp_antibot::Outcome::Present(_) => "present",
+            blasthttp_antibot::Outcome::Challenge(_) => "challenge",
+            blasthttp_antibot::Outcome::Blocked(_) => "blocked",
+            blasthttp_antibot::Outcome::Error => "error",
+        };
+        // An unnamed vendor is `-`, as in `conclusion`, not a name a caller
+        // could mistake for a product and branch on.
+        let vendor = outcome
+            .vendor()
+            .filter(|v| !v.is_unknown())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        (name.to_string(), vendor)
+    }
+
     #[getter]
     fn debug_log(&self) -> Vec<String> {
         self.inner.debug_log.clone()
@@ -703,6 +866,13 @@ struct PyBatchResult {
     url: String,
     response: Option<Response>,
     error: Option<String>,
+    /// The failure behind `error`, kept so `transport_error` can say more
+    /// than the message. Turned into a Python object only when asked for, so
+    /// a batch doesn't take the GIL for every failed request.
+    client_error: Option<ClientError>,
+    /// A `TransportError` handed to the constructor, which wins over
+    /// `client_error`.
+    transport_error: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -711,15 +881,30 @@ impl PyBatchResult {
     /// fixture mocks. Provide either `response` (a Response instance)
     /// for success, or `error` (a string) for failure. Both default to
     /// None; passing neither yields a degenerate "no response, no error"
-    /// result that `success` reports as False.
+    /// result that `success` reports as False. `transport_error`, if
+    /// given, must be a `TransportError`.
     #[new]
-    #[pyo3(signature = (url, response=None, error=None))]
-    fn new(url: String, response: Option<PyRef<'_, PyResponse>>, error: Option<String>) -> Self {
-        PyBatchResult {
+    #[pyo3(signature = (url, response=None, error=None, transport_error=None))]
+    fn new(
+        url: String,
+        response: Option<PyRef<'_, PyResponse>>,
+        error: Option<String>,
+        transport_error: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if let Some(ref t) = transport_error
+            && !t.is_instance_of::<TransportError>()
+        {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "transport_error must be a TransportError",
+            ));
+        }
+        Ok(PyBatchResult {
             url,
             response: response.map(|r| r.inner.clone()),
             error,
-        }
+            client_error: None,
+            transport_error: transport_error.map(Bound::unbind),
+        })
     }
 
     #[getter]
@@ -743,6 +928,19 @@ impl PyBatchResult {
         self.error.clone()
     }
 
+    /// The `TransportError` that `request()` would have raised for this
+    /// failure, with `kind`, `tls_failure`, `retryable`, `conclusion` and
+    /// `attempts`. None if the request succeeded.
+    #[getter]
+    fn transport_error(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        if let Some(ref t) = self.transport_error {
+            return Some(t.clone_ref(py));
+        }
+        self.client_error
+            .clone()
+            .map(|e| client_error_to_py(e).into_value(py).into_any())
+    }
+
     /// True if the request succeeded
     #[getter]
     fn success(&self) -> bool {
@@ -759,14 +957,16 @@ impl PyBatchResult {
 }
 
 fn to_py_batch_result(r: BatchResult) -> PyBatchResult {
-    let (response, error) = match r.result {
-        Ok(resp) => (Some(resp), None),
-        Err(e) => (None, Some(e.message)),
+    let (response, error, client_error) = match r.result {
+        Ok(resp) => (Some(resp), None, None),
+        Err(e) => (None, Some(e.message.clone()), Some(e)),
     };
     PyBatchResult {
         url: r.url,
         response,
         error,
+        client_error,
+        transport_error: None,
     }
 }
 
@@ -919,12 +1119,14 @@ impl BlastHTTP {
         verify_certs=None,
         proxy=None,
         no_proxy=None,
+        profile=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
         retries=None,
         retry_wait_min_ms=None,
         retry_wait_max_ms=None,
+        retry_statuses=None,
         max_body_size=None,
         raw_path=None,
         request_target=None,
@@ -947,12 +1149,14 @@ impl BlastHTTP {
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
+        profile: Option<String>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
         retries: Option<u32>,
         retry_wait_min_ms: Option<u64>,
         retry_wait_max_ms: Option<u64>,
+        retry_statuses: Option<Vec<u16>>,
         max_body_size: Option<usize>,
         raw_path: Option<bool>,
         request_target: Option<String>,
@@ -973,17 +1177,20 @@ impl BlastHTTP {
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
+            profile,
             cipher_string,
             min_tls_version,
             max_tls_version,
             retries,
             retry_wait_min_ms,
             retry_wait_max_ms,
+            retry_statuses,
             raw_path,
             request_target,
             resolve_ip,
             alpn_protocols,
             verbosity: 0,
+            profile_from_ladder: false,
         };
 
         let limiter = self.rate_limiter.clone();
@@ -993,10 +1200,7 @@ impl BlastHTTP {
             if let Some(ref limiter) = limiter {
                 limiter.acquire().await;
             }
-            let response = client
-                .send(&config)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            let response = client.send(&config).await.map_err(client_error_to_py)?;
             Ok(PyResponse {
                 inner: response,
                 headers_cache: OnceLock::new(),
@@ -1028,18 +1232,21 @@ impl BlastHTTP {
     ///
     /// Args:
     ///   configs: List of `BatchConfig` objects describing each request.
-    ///   concurrency: Maximum simultaneous in-flight requests. Default 50.
+    ///   concurrency: Maximum simultaneous in-flight requests, default 50.
+    ///     A number caps this call alone. A `ConcurrencyLimit` caps every
+    ///     call it is passed to, together.
     ///   rate_limit: Optional cap on dispatch rate (requests/sec). `None`
     ///     means no per-call cap. If `set_rate_limit()` is also active on
     ///     the client, the more restrictive (lower RPS) limit wins.
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=Concurrency::Size(50), rate_limit=None))]
     fn request_batch<'py>(
         &self,
         py: Python<'py>,
         configs: Vec<PyBatchConfig>,
-        concurrency: usize,
+        concurrency: Concurrency,
         rate_limit: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let concurrency = concurrency.into_limit();
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
             .map(|c| c.into_request_config(py))
@@ -1093,18 +1300,21 @@ impl BlastHTTP {
     ///
     /// Args:
     ///   configs: List of `BatchConfig` objects describing each request.
-    ///   concurrency: Maximum simultaneous in-flight requests. Default 50.
+    ///   concurrency: Maximum simultaneous in-flight requests, default 50.
+    ///     A number caps this call alone. A `ConcurrencyLimit` caps every
+    ///     call it is passed to, together.
     ///   rate_limit: Optional cap on dispatch rate (requests/sec). `None`
     ///     means no per-call cap. If `set_rate_limit()` is also active on
     ///     the client, the more restrictive (lower RPS) limit wins.
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=Concurrency::Size(50), rate_limit=None))]
     fn request_batch_stream(
         &self,
         py: Python<'_>,
         configs: Vec<PyBatchConfig>,
-        concurrency: usize,
+        concurrency: Concurrency,
         rate_limit: Option<f64>,
     ) -> PyResult<PyBatchResultIterator> {
+        let concurrency = concurrency.into_limit();
         let request_configs: Vec<RequestConfig> = configs
             .into_iter()
             .map(|c| c.into_request_config(py))
@@ -1126,6 +1336,10 @@ impl BlastHTTP {
     /// Download a URL directly to a local file.
     /// Returns the file path on success.
     /// max_size: maximum bytes to download (None = no limit, uses default 10MB)
+    ///
+    /// Takes the same connection knobs as `request`. Without them the profile
+    /// ladder runs as usual, so a download from a host that needs legacy TLS
+    /// or a browser profile reaches it the same way an ordinary request does.
     #[pyo3(signature = (
         url,
         path,
@@ -1136,7 +1350,12 @@ impl BlastHTTP {
         no_proxy=None,
         headers=None,
         retries=None,
+        retry_statuses=None,
         redirect_cookies=None,
+        profile=None,
+        cipher_string=None,
+        min_tls_version=None,
+        max_tls_version=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn download<'py>(
@@ -1151,7 +1370,12 @@ impl BlastHTTP {
         no_proxy: Option<Vec<String>>,
         headers: Option<Vec<(String, String)>>,
         retries: Option<u32>,
+        retry_statuses: Option<Vec<u16>>,
         redirect_cookies: Option<bool>,
+        profile: Option<String>,
+        cipher_string: Option<String>,
+        min_tls_version: Option<String>,
+        max_tls_version: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let config = RequestConfig {
             url,
@@ -1166,17 +1390,20 @@ impl BlastHTTP {
             verify_certs,
             proxy,
             no_proxy: no_proxy.unwrap_or_default(),
-            cipher_string: None,
-            min_tls_version: None,
-            max_tls_version: None,
+            profile,
+            cipher_string,
+            min_tls_version,
+            max_tls_version,
             retries,
             retry_wait_min_ms: None,
             retry_wait_max_ms: None,
+            retry_statuses,
             raw_path: None,
             request_target: None,
             resolve_ip: None,
             alpn_protocols: None,
             verbosity: 0,
+            profile_from_ladder: false,
         };
 
         let limiter = self.rate_limiter.clone();
@@ -1186,10 +1413,7 @@ impl BlastHTTP {
             if let Some(ref limiter) = limiter {
                 limiter.acquire().await;
             }
-            let response = client
-                .send(&config)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            let response = client.send(&config).await.map_err(client_error_to_py)?;
 
             // Write body bytes to file
             let mut file = std::fs::File::create(&path).map_err(|e| {
@@ -1218,6 +1442,7 @@ impl BlastHTTP {
     #[pyo3(signature = (
         url,
         verify_certs=None,
+        profile=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
@@ -1233,6 +1458,7 @@ impl BlastHTTP {
         py: Python<'py>,
         url: String,
         verify_certs: Option<bool>,
+        profile: Option<String>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
@@ -1244,6 +1470,7 @@ impl BlastHTTP {
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut config = RequestConfig::new(url.clone());
         config.verify_certs = verify_certs;
+        config.profile = profile;
         config.cipher_string = cipher_string;
         config.min_tls_version = min_tls_version;
         config.max_tls_version = max_tls_version;
@@ -1264,7 +1491,7 @@ impl BlastHTTP {
             }
             let conn = raw::RawConnection::connect(&url, &config)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+                .map_err(client_error_to_py)?;
             Ok(PyRawConnection {
                 inner: Arc::new(conn),
                 rate_limiter: limiter_for_conn,
@@ -1299,10 +1526,7 @@ impl PyRawConnection {
             if let Some(ref limiter) = limiter {
                 limiter.acquire().await;
             }
-            inner
-                .send_bytes(&data)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            inner.send_bytes(&data).await.map_err(client_error_to_py)?;
             Ok(())
         })
     }
@@ -1330,7 +1554,7 @@ impl PyRawConnection {
             let data = inner
                 .read_raw(max_bytes, timeout_ms)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+                .map_err(client_error_to_py)?;
             Ok(data)
         })
     }
@@ -1339,10 +1563,7 @@ impl PyRawConnection {
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
-                .close()
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.message))?;
+            inner.close().await.map_err(client_error_to_py)?;
             Ok(())
         })
     }
@@ -1366,6 +1587,56 @@ impl PyRawConnection {
     #[getter]
     fn peer_ip(&self) -> Option<String> {
         self.inner.peer_ip()
+    }
+}
+
+// ── Concurrency limit ─────────────────────────────────────────────
+
+/// A cap on requests in flight, shared by every batch call it is passed to as
+/// `concurrency`. A plain number caps one call alone.
+#[pyclass(name = "ConcurrencyLimit", from_py_object)]
+#[derive(Clone)]
+struct PyConcurrencyLimit {
+    inner: batch::ConcurrencyLimit,
+}
+
+#[pymethods]
+impl PyConcurrencyLimit {
+    #[new]
+    fn new(size: usize) -> PyResult<Self> {
+        if size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "a concurrency limit of 0 would never send anything",
+            ));
+        }
+        Ok(PyConcurrencyLimit {
+            inner: batch::ConcurrencyLimit::new(size),
+        })
+    }
+
+    #[getter]
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ConcurrencyLimit({})", self.inner.size())
+    }
+}
+
+/// `concurrency` as a batch call takes it.
+#[derive(FromPyObject)]
+enum Concurrency {
+    Shared(PyConcurrencyLimit),
+    Size(usize),
+}
+
+impl Concurrency {
+    fn into_limit(self) -> batch::ConcurrencyLimit {
+        match self {
+            Concurrency::Shared(limit) => limit.inner,
+            Concurrency::Size(size) => batch::ConcurrencyLimit::new(size),
+        }
     }
 }
 
@@ -1404,6 +1675,8 @@ struct PyBatchConfig {
     #[pyo3(get, set)]
     no_proxy: Option<Vec<String>>,
     #[pyo3(get, set)]
+    profile: Option<String>,
+    #[pyo3(get, set)]
     cipher_string: Option<String>,
     #[pyo3(get, set)]
     min_tls_version: Option<String>,
@@ -1415,6 +1688,8 @@ struct PyBatchConfig {
     retry_wait_min_ms: Option<u64>,
     #[pyo3(get, set)]
     retry_wait_max_ms: Option<u64>,
+    #[pyo3(get, set)]
+    retry_statuses: Option<Vec<u16>>,
     #[pyo3(get, set)]
     raw_path: Option<bool>,
     #[pyo3(get, set)]
@@ -1439,12 +1714,14 @@ impl PyBatchConfig {
         verify_certs=None,
         proxy=None,
         no_proxy=None,
+        profile=None,
         cipher_string=None,
         min_tls_version=None,
         max_tls_version=None,
         retries=None,
         retry_wait_min_ms=None,
         retry_wait_max_ms=None,
+        retry_statuses=None,
         raw_path=None,
         request_target=None,
         resolve_ip=None,
@@ -1465,12 +1742,14 @@ impl PyBatchConfig {
         verify_certs: Option<bool>,
         proxy: Option<String>,
         no_proxy: Option<Vec<String>>,
+        profile: Option<String>,
         cipher_string: Option<String>,
         min_tls_version: Option<String>,
         max_tls_version: Option<String>,
         retries: Option<u32>,
         retry_wait_min_ms: Option<u64>,
         retry_wait_max_ms: Option<u64>,
+        retry_statuses: Option<Vec<u16>>,
         raw_path: Option<bool>,
         request_target: Option<String>,
         resolve_ip: Option<String>,
@@ -1490,12 +1769,14 @@ impl PyBatchConfig {
             verify_certs,
             proxy,
             no_proxy,
+            profile,
             cipher_string,
             min_tls_version,
             max_tls_version,
             retries,
             retry_wait_min_ms,
             retry_wait_max_ms,
+            retry_statuses,
             raw_path,
             request_target,
             resolve_ip,
@@ -1520,12 +1801,14 @@ impl Clone for PyBatchConfig {
             verify_certs: self.verify_certs,
             proxy: self.proxy.clone(),
             no_proxy: self.no_proxy.clone(),
+            profile: self.profile.clone(),
             cipher_string: self.cipher_string.clone(),
             min_tls_version: self.min_tls_version.clone(),
             max_tls_version: self.max_tls_version.clone(),
             retries: self.retries,
             retry_wait_min_ms: self.retry_wait_min_ms,
             retry_wait_max_ms: self.retry_wait_max_ms,
+            retry_statuses: self.retry_statuses.clone(),
             raw_path: self.raw_path,
             request_target: self.request_target.clone(),
             resolve_ip: self.resolve_ip.clone(),
@@ -1553,17 +1836,20 @@ impl PyBatchConfig {
             verify_certs: self.verify_certs,
             proxy: self.proxy,
             no_proxy: self.no_proxy.unwrap_or_default(),
+            profile: self.profile,
             cipher_string: self.cipher_string,
             min_tls_version: self.min_tls_version,
             max_tls_version: self.max_tls_version,
             retries: self.retries,
             retry_wait_min_ms: self.retry_wait_min_ms,
             retry_wait_max_ms: self.retry_wait_max_ms,
+            retry_statuses: self.retry_statuses,
             raw_path: self.raw_path,
             request_target: self.request_target,
             resolve_ip: self.resolve_ip,
             alpn_protocols: self.alpn_protocols,
             verbosity: 0,
+            profile_from_ladder: false,
         })
     }
 }
@@ -2025,6 +2311,27 @@ fn register_h2_submodule<'py>(parent: &Bound<'py, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Replace the anti-bot rules every response in this process is classified
+/// with, from a JSON file shaped like the built-in `antibot_rules.json`.
+/// `None` restores the built-in rules. Raises ValueError on a bad file.
+#[pyfunction]
+#[pyo3(signature = (path=None))]
+fn set_antibot_rules(path: Option<std::path::PathBuf>) -> PyResult<()> {
+    let rules = match path {
+        None => crate::antibot::Rules::default(),
+        Some(path) => {
+            let json = std::fs::read_to_string(&path).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("{}: {e}", path.display()))
+            })?;
+            crate::antibot::Rules::from_json(&json).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("{}: {e}", path.display()))
+            })?
+        }
+    };
+    crate::antibot::set_rules(rules);
+    Ok(())
+}
+
 // ── Module registration ───────────────────────────────────────────
 
 #[pymodule]
@@ -2032,6 +2339,7 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<BlastHTTP>()?;
     m.add_class::<PyBatchConfig>()?;
+    m.add_class::<PyConcurrencyLimit>()?;
     // Response types are returned by methods, but register them
     // so Python can reference them for type hints / isinstance checks
     m.add_class::<PyResponse>()?;
@@ -2043,7 +2351,9 @@ fn blasthttp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHeaders>()?;
     m.add_class::<PyRequest>()?;
     m.add_class::<PyRawConnection>()?;
+    m.add_function(wrap_pyfunction!(set_antibot_rules, m)?)?;
     m.add("HTTPStatusError", m.py().get_type::<HTTPStatusError>())?;
+    m.add("TransportError", m.py().get_type::<TransportError>())?;
     register_h2_submodule(m)?;
     crate::mock::register_mock_submodule(m)?;
     register_headers_as_mapping(m)?;

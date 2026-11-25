@@ -15,7 +15,8 @@
 //   (auth tuple → header, cookies dict → header, raise_error, etc.)
 //   is the consumer's responsibility, not ours.
 
-use crate::python::PyResponse;
+use crate::client::ClientError;
+use crate::python::{PyResponse, TransportError, client_error_to_py};
 use crate::response::Response;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyTypeError};
 use pyo3::prelude::*;
@@ -276,6 +277,7 @@ fn make_response(
         status: status_code,
         headers,
         body_bytes: body,
+        attempts: Vec::new(),
         elapsed_ms: 0,
         redirect_chain: Vec::new(),
         cert_info: None,
@@ -438,10 +440,12 @@ fn plan_dispatch(
     }
 
     let Some(handler) = pick_handler(py, state, url, method, &req_headers_dict, body)? else {
-        return Err(PyRuntimeError::new_err(format!(
+        // A TransportError like the real client's for an unreachable host,
+        // so `except TransportError` handles both the same way.
+        return Err(client_error_to_py(ClientError::connection(format!(
             "No mock response registered for {} {}",
             method, url
-        )));
+        ))));
     };
 
     match handler.kind {
@@ -668,9 +672,12 @@ impl PyBlasthttpMock {
     }
 
     /// Dispatch a single request through the mock. Mirrors the
-    /// `BlastHTTP.request` shape — most kwargs (timeout, verify_certs,
-    /// retries, etc.) are accepted but ignored, since they don't apply
-    /// to a mock.
+    /// `BlastHTTP.request` shape. Kwargs the mock has no use for (timeout,
+    /// verify_certs, profile, retries and the rest) are accepted and ignored
+    /// when the URL is intercepted, since nothing is dialled. When the URL is
+    /// excluded and the call goes to the real client they are forwarded
+    /// verbatim, because then they describe a connection that actually
+    /// happens.
     #[pyo3(signature = (
         url,
         method=None,
@@ -704,6 +711,7 @@ impl PyBlasthttpMock {
                 files,
                 follow_redirects,
                 max_redirects,
+                _kwargs,
             );
         }
 
@@ -796,9 +804,11 @@ impl PyBlasthttpMock {
                     Some(loc) => {
                         hops += 1;
                         if hops > max_hops {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "exceeded {} redirects starting from mock dispatch",
-                                max_hops
+                            return Err(client_error_to_py(ClientError::too_many_redirects(
+                                format!(
+                                    "exceeded {} redirects starting from mock dispatch",
+                                    max_hops
+                                ),
                             )));
                         }
                         current_url = loc;
@@ -811,12 +821,12 @@ impl PyBlasthttpMock {
     /// Streaming batch — yields `BatchResult` objects one at a time.
     /// Mock results stream first (in input order), then passthrough
     /// results follow (in completion order from the real client).
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=None, rate_limit=None))]
     fn request_batch_stream(
         &self,
         py: Python<'_>,
         configs: Vec<Py<PyAny>>,
-        concurrency: usize,
+        concurrency: Option<Py<PyAny>>,
         rate_limit: Option<f64>,
     ) -> PyResult<PyMockBatchIterator> {
         // Split into mock-bound and passthrough configs.
@@ -857,7 +867,11 @@ impl PyBlasthttpMock {
         let passthrough_iter: Option<Py<PyAny>> =
             if let (Some(client), false) = (&self.real_client, passthrough_configs.is_empty()) {
                 let kwargs = PyDict::new(py);
-                kwargs.set_item("concurrency", concurrency)?;
+                // A number or a shared ConcurrencyLimit, as the caller passed
+                // it; left out, the real client applies its own default.
+                if let Some(c) = concurrency {
+                    kwargs.set_item("concurrency", c)?;
+                }
                 if let Some(rl) = rate_limit {
                     kwargs.set_item("rate_limit", rl)?;
                 }
@@ -885,11 +899,11 @@ impl PyBlasthttpMock {
 
     /// Convenience non-streaming batch. Drains the stream and returns
     /// a `list[BatchResult]`.
-    #[pyo3(signature = (configs, concurrency=50, rate_limit=None))]
+    #[pyo3(signature = (configs, concurrency=None, rate_limit=None))]
     fn request_batch<'py>(
         slf: PyRef<'py, Self>,
         configs: Vec<Py<PyAny>>,
-        concurrency: usize,
+        concurrency: Option<Py<PyAny>>,
         rate_limit: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
@@ -950,6 +964,7 @@ impl PyBlasthttpMock {
         files: Option<Bound<'py, PyAny>>,
         follow_redirects: Option<bool>,
         max_redirects: Option<u32>,
+        rest: Option<Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let Some(ref client) = self.real_client else {
             return Err(PyRuntimeError::new_err(format!(
@@ -957,6 +972,18 @@ impl PyBlasthttpMock {
             )));
         };
         let kwargs = PyDict::new(py);
+        // Everything the mock does not name itself goes through untouched.
+        // A mocked URL can ignore `timeout`, `profile` or `verify_certs`
+        // because nothing is dialled, but a passed-through one is a real
+        // request and dropping them here would quietly give it different
+        // TLS, a different profile and no timeout from what the caller
+        // asked for. Set first, so the named arguments below win on the
+        // (impossible from Python, but cheap to guarantee) chance of overlap.
+        if let Some(ref extra) = rest {
+            for (k, val) in extra.iter() {
+                kwargs.set_item(k, val)?;
+            }
+        }
         if let Some(m) = method {
             kwargs.set_item("method", m)?;
         }
@@ -1046,7 +1073,7 @@ impl PyMockBatchIterator {
                     return Python::attach(|py| -> PyResult<Py<PyAny>> {
                         match resp_or_err {
                             Ok(resp) => batch_result_obj(py, &entry.url, Some(resp), None),
-                            Err(e) => batch_result_obj(py, &entry.url, None, Some(e.to_string())),
+                            Err(e) => batch_error_obj(py, &entry.url, e),
                         }
                     });
                 }
@@ -1135,6 +1162,23 @@ fn batch_result_obj(
     if let Some(e) = error {
         kwargs.set_item("error", e)?;
     }
+    Ok(cls.call((url,), Some(&kwargs))?.unbind())
+}
+
+/// Build a failed `blasthttp.BatchResult` from a mock dispatch error.
+///
+/// A `TransportError` goes on `transport_error`, with its bare message as
+/// `error` the way a real batch reports it. Anything else, like an exception
+/// from a user's callback, keeps the old `"Type: message"` string.
+fn batch_error_obj(py: Python<'_>, url: &str, e: PyErr) -> PyResult<Py<PyAny>> {
+    let value = e.value(py);
+    if !value.is_instance_of::<TransportError>() {
+        return batch_result_obj(py, url, None, Some(e.to_string()));
+    }
+    let cls = py.import("blasthttp")?.getattr("BatchResult")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("error", value.str()?)?;
+    kwargs.set_item("transport_error", value)?;
     Ok(cls.call((url,), Some(&kwargs))?.unbind())
 }
 

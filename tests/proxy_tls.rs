@@ -4,14 +4,13 @@
 //! that goes through the tunnel: a TLS handshake starts with 0x16, and a
 //! plaintext request starts with the method.
 
-#[allow(dead_code)]
-mod tls_server;
+mod support;
 
 use blasthttp::client::HttpClient;
 use blasthttp::client::hyper::HyperClient;
 use blasthttp::config::RequestConfig;
 use std::sync::{Arc, Mutex};
-use tls_server::{TlsServerConfig, TlsTestServer};
+use support::tls_server::{TlsServerConfig, TlsTestServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
